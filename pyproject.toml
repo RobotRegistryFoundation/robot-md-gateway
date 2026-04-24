@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "robot-md-dispatcher"
-version = "0.1.0"
+version = "0.2.0"
 description = "BYOK dispatcher for robot-md — accepts tasks over HTTP, runs them through a local Claude Agent SDK session against a ROBOT.md-described robot."
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -27,6 +27,7 @@ dependencies = [
     "uvicorn[standard]>=0.27",
     "python-frontmatter>=1.0",
     "pydantic>=2.6",
+    "robot-md>=1.1",
 ]
 
 [project.optional-dependencies]
