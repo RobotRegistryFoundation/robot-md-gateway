@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "robot-md-dispatcher"
+version = "0.1.0"
+description = "BYOK dispatcher for robot-md — accepts tasks over HTTP, runs them through a local Claude Agent SDK session against a ROBOT.md-described robot."
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "craigm26", email = "craigm26@gmail.com" }]
+keywords = ["robotics", "claude", "anthropic", "robot-md", "agent-sdk", "dispatcher"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Hardware",
+]
+dependencies = [
+    "claude-agent-sdk>=0.1",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "python-frontmatter>=1.0",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+robot-md-dispatcher = "robot_md_dispatcher.__main__:main"
+
+[project.urls]
+Homepage = "https://robotmd.dev"
+Repository = "https://github.com/RobotRegistryFoundation/robot-md-dispatcher"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/robot_md_dispatcher"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+  # FastAPI `Depends` is idiomatic as a parameter default (same pattern as Typer
+  # in sibling robot-md projects).
+  "B008",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"

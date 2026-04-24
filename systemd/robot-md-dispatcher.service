@@ -1,0 +1,55 @@
+[Unit]
+Description=robot-md-dispatcher — BYOK Claude Agent dispatcher for a ROBOT.md-described robot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Runs the dispatcher as an unprivileged user that has access to the robot's
+# serial bus (e.g. /dev/ttyACM0 via the `dialout` group).
+User=robot
+Group=dialout
+WorkingDirectory=/opt/robot-md-dispatcher
+
+# Operator-provided config. EnvironmentFile entries:
+#   ROBOT_MD_PATH=/etc/robot-md-dispatcher/ROBOT.md
+#   ROBOT_MD_BEARERS_FILE=/etc/robot-md-dispatcher/bearers.yaml
+#   ROBOT_MD_MCP_COMMAND=robot-md-mcp
+#   ROBOT_MD_MCP_ARGS=--strict
+#   ROBOT_MD_LOG_LEVEL=INFO
+EnvironmentFile=/etc/robot-md-dispatcher/dispatcher.env
+
+ExecStart=/opt/robot-md-dispatcher/.venv/bin/robot-md-dispatcher serve \
+    --host 127.0.0.1 --port 8080
+
+Restart=on-failure
+RestartSec=3s
+
+# Hardening.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no
+DeviceAllow=/dev/ttyACM0 rw
+DeviceAllow=/dev/ttyUSB0 rw
+ReadWritePaths=/var/log/robot-md-dispatcher
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+# Resource ceilings so a runaway agent can't DoS the host.
+MemoryMax=1G
+CPUQuota=80%
+TasksMax=128
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=robot-md-dispatcher
+
+[Install]
+WantedBy=multi-user.target
