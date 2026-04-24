@@ -159,9 +159,67 @@ def run(
     """Run the init wizard. Returns a process exit code."""
     try:
         robot_md = _check_robot_md_exists(cwd)
-        robot_name = _validate_robot_md(robot_md)  # noqa: F841 — used in later tasks
+        robot_name = _validate_robot_md(robot_md)
         _check_mcp_on_path()
     except _Precondition as e:
         print(str(e), file=sys.stderr)
         return 1
+
+    cfg = WizardConfig()  # interactive-mode prompts come in later tasks
+    actuate_token, read_token = _generate_tokens(cfg)
+
+    _write_bearers_yaml(
+        cwd / "bearers.yaml",
+        actuate_token=actuate_token,
+        read_token=read_token,
+    )
+    _write_env(cwd / ".env")
+    if actuate_token:
+        _write_dispatch_test_sh(
+            cwd / "dispatch-test.sh",
+            actuate_token=actuate_token,
+            bind=cfg.bind,
+            port=cfg.port,
+        )
+
+    _print_next_steps(
+        cfg=cfg,
+        robot_name=robot_name,
+        actuate_token=actuate_token,
+        no_token_stdout=no_token_stdout,
+    )
     return 0
+
+
+def _print_next_steps(
+    *,
+    cfg: WizardConfig,
+    robot_name: str,
+    actuate_token: str,
+    no_token_stdout: bool,
+) -> None:
+    print(f"Found ROBOT.md for {robot_name!r}.")
+    print(
+        f"Writing: bind {cfg.bind}:{cfg.port}, 1 actuate token, dev-mode (./ files)."
+    )
+    print("  ./bearers.yaml")
+    print("  ./.env")
+    if actuate_token:
+        print("  ./dispatch-test.sh")
+
+    if no_token_stdout:
+        print()
+        print("Actuate token written to ./bearers.yaml (0600). Open the file to read it.")
+    else:
+        print()
+        print("Actuate token (save now — not persisted anywhere else):")
+        print(f"  {actuate_token}")
+
+    print()
+    print("Next:")
+    print(
+        f"  robot-md-dispatcher serve --bearers ./bearers.yaml "
+        f"--robot-md ./ROBOT.md"
+    )
+    print()
+    print("Tip: add bearers.yaml, .env, dispatch-test.sh to .gitignore")

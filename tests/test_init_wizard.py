@@ -174,3 +174,28 @@ def test_write_dispatch_test_sh_uses_custom_port(tmp_path: Path):
         path, actuate_token="X", bind="127.0.0.1", port=9090
     )
     assert "127.0.0.1:9090" in path.read_text()
+
+
+def test_init_yes_golden_path(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    rc = init_wizard.run(interactive=False, cwd=tmp_path, force=False, no_token_stdout=False)
+    assert rc == 0
+
+    bearers = tmp_path / "bearers.yaml"
+    env = tmp_path / ".env"
+    test_sh = tmp_path / "dispatch-test.sh"
+
+    assert bearers.exists() and oct(bearers.stat().st_mode & 0o777) == "0o600"
+    assert env.exists() and oct(env.stat().st_mode & 0o777) == "0o644"
+    assert test_sh.exists() and oct(test_sh.stat().st_mode & 0o777) == "0o700"
+
+    # Token is in bearers.yaml, printed exactly once to stdout, and baked into dispatch-test.sh
+    store = BearerStore.from_yaml(bearers)
+    actuate_entries = [e for e in store._by_token.values() if e.tier == "actuate"]
+    assert len(actuate_entries) == 1
+    token = actuate_entries[0].token
+    out = capsys.readouterr().out
+    assert out.count(token) == 1
+    assert token in test_sh.read_text()
