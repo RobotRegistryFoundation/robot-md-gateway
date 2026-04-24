@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "robot-md-dispatcher"
 version = "0.2.0"
 description = "BYOK dispatcher for robot-md — accepts tasks over HTTP, runs them through a local Claude Agent SDK session against a ROBOT.md-described robot."
+readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "craigm26", email = "craigm26@gmail.com" }]
