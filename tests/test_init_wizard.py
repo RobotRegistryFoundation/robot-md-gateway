@@ -215,3 +215,39 @@ def test_no_token_stdout_suppresses_token(
     out = capsys.readouterr().out
     assert token not in out
     assert "Open the file" in out
+
+
+def test_refuses_on_existing_bearers_yaml(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    (tmp_path / "bearers.yaml").write_text("- token: old\n  tier: actuate\n  caller: c\n")
+    rc = init_wizard.run(interactive=False, cwd=tmp_path, force=False, no_token_stdout=False)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "bearers.yaml already exists" in err
+    assert "--force" in err
+
+
+def test_refuses_on_existing_env(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    (tmp_path / ".env").write_text("X=1\n")
+    rc = init_wizard.run(interactive=False, cwd=tmp_path, force=False, no_token_stdout=False)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert ".env already exists" in err
+
+
+def test_force_overwrites_and_invalidates_old_token(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    (tmp_path / "bearers.yaml").write_text("- token: OLD\n  tier: actuate\n  caller: c\n")
+
+    rc = init_wizard.run(interactive=False, cwd=tmp_path, force=True, no_token_stdout=False)
+    assert rc == 0
+
+    store = BearerStore.from_yaml(tmp_path / "bearers.yaml")
+    assert store.resolve("OLD") is None  # old token no longer valid

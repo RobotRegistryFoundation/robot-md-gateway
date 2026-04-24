@@ -149,6 +149,15 @@ def _check_mcp_on_path() -> None:
         )
 
 
+def _check_no_existing_files(cwd: Path) -> None:
+    for name in ("bearers.yaml", ".env"):
+        if (cwd / name).exists():
+            raise _Precondition(
+                f"./{name} already exists. Use 'init --force' to regenerate tokens "
+                "(this invalidates the old ones)."
+            )
+
+
 def run(
     *,
     interactive: bool,
@@ -161,6 +170,8 @@ def run(
         robot_md = _check_robot_md_exists(cwd)
         robot_name = _validate_robot_md(robot_md)
         _check_mcp_on_path()
+        if not force:
+            _check_no_existing_files(cwd)
     except _Precondition as e:
         print(str(e), file=sys.stderr)
         return 1
