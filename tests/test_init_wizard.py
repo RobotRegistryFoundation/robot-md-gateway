@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 from pathlib import Path
 
@@ -265,3 +266,39 @@ def test_bare_init_refuses_on_non_tty(
     err = capsys.readouterr().err
     assert "TTY" in err
     assert "--yes" in err
+
+
+def test_guided_mode_accepts_all_defaults(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    # Pipe enough newlines to default every prompt.
+    monkeypatch.setattr("sys.stdin", io.StringIO("\n" * 20))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    rc = init_wizard.run(interactive=True, cwd=tmp_path, force=False, no_token_stdout=False)
+    assert rc == 0
+
+    # Same outputs as --yes golden path
+    bearers = BearerStore.from_yaml(tmp_path / "bearers.yaml")
+    actuate = [e for e in bearers._by_token.values() if e.tier == "actuate"]
+    assert len(actuate) == 1
+    # .env defaults
+    env_text = (tmp_path / ".env").read_text()
+    assert "ROBOT_MD_PATH=./ROBOT.md" in env_text
+    # dispatch-test.sh uses default port
+    assert "127.0.0.1:8080" in (tmp_path / "dispatch-test.sh").read_text()
+
+
+def test_guided_mode_declining_initial_confirm_aborts(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    monkeypatch.setattr("sys.stdin", io.StringIO("n\n"))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    rc = init_wizard.run(interactive=True, cwd=tmp_path, force=False, no_token_stdout=False)
+    assert rc == 0
+    assert not (tmp_path / "bearers.yaml").exists()
+    out = capsys.readouterr().out
+    assert "aborted" in out.lower() or "cancelled" in out.lower() or "no changes" in out.lower()

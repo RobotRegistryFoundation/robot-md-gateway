@@ -149,6 +149,110 @@ def _check_mcp_on_path() -> None:
         )
 
 
+def _box(title: str, lines: list[str]) -> str:
+    width = 64
+    top = f"╭─ {title} " + "─" * (width - len(title) - 4) + "╮"
+    bot = "╰" + "─" * (width - 1) + "╯"
+    body = "\n".join(f"│ {line.ljust(width - 3)}│" for line in lines)
+    return f"{top}\n{body}\n{bot}"
+
+
+def _ask_yes_no(question: str, default: bool) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    raw = input(f"{question} {suffix}: ").strip().lower()
+    if not raw:
+        return default
+    return raw in ("y", "yes")
+
+
+def _ask_text(question: str, default: str) -> str:
+    raw = input(f"{question} [{default}]: ").strip()
+    return raw or default
+
+
+def _ask_int(question: str, default: int) -> int:
+    while True:
+        raw = input(f"{question} [{default}]: ").strip()
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            print(f"  not an integer: {raw!r}", file=sys.stderr)
+
+
+def _prompt_config(robot_name: str) -> WizardConfig | None:
+    """Interactive prompts. Returns None if user declined the initial confirm."""
+    print(_box(
+        "What this does",
+        [
+            "Writes a bearers.yaml (access tokens) and a .env (paths +",
+            "MCP command) next to your ROBOT.md. Does not start the",
+            "service or open network ports.",
+        ],
+    ))
+    if not _ask_yes_no(f"Enable remote dispatch for {robot_name!r}?", default=True):
+        print("No changes made.")
+        return None
+
+    print(_box(
+        "Bind address",
+        [
+            "Local address the dispatcher listens on. Use 127.0.0.1 if",
+            "you'll front this with Tailscale Funnel or a reverse proxy.",
+            "Use 0.0.0.0 only if your network boundary is hardened.",
+        ],
+    ))
+    bind = _ask_text("Bind address", default="127.0.0.1")
+
+    print(_box(
+        "Port",
+        ["TCP port the HTTP server binds to. 8080 is the default."],
+    ))
+    port = _ask_int("Port", default=8080)
+
+    print(_box(
+        "Bearer tokens",
+        [
+            "Callers authenticate with a bearer token. Each token has a",
+            "tier: 'actuate' can drive the robot; 'read' can only call",
+            "observation tools (render, validate, get_*, list_*, ...).",
+        ],
+    ))
+    gen_actuate = _ask_yes_no("Generate an actuate-tier token?", default=True)
+    gen_read = _ask_yes_no("Also generate a read-tier token?", default=False)
+
+    print(_box(
+        "Production install (systemd)",
+        [
+            "For long-running hosts, install as a systemd service under",
+            "a dedicated 'robot' user with MemoryMax/CPUQuota limits.",
+            "Requires sudo. This wizard PRINTS the commands; it does NOT",
+            "run sudo on your behalf.",
+        ],
+    ))
+    systemd = _ask_yes_no("Install as systemd service?", default=False)
+
+    print(_box(
+        "Tailscale Funnel",
+        [
+            "Named, revocable, TLS-terminated public URL via your",
+            "tailnet. We'll print the two setup commands; we won't run",
+            "them (they need your interactive auth).",
+        ],
+    ))
+    tailscale = _ask_yes_no("Print Tailscale Funnel setup commands?", default=False)
+
+    return WizardConfig(
+        bind=bind,
+        port=port,
+        generate_actuate=gen_actuate,
+        generate_read=gen_read,
+        systemd_print=systemd,
+        tailscale_print=tailscale,
+    )
+
+
 def _check_no_existing_files(cwd: Path) -> None:
     for name in ("bearers.yaml", ".env"):
         if (cwd / name).exists():
@@ -184,7 +288,13 @@ def run(
         )
         return 1
 
-    cfg = WizardConfig()  # interactive-mode prompts come in later tasks
+    if interactive:
+        cfg = _prompt_config(robot_name)
+        if cfg is None:
+            return 0  # user declined the initial confirm; no changes made
+    else:
+        cfg = WizardConfig()
+
     actuate_token, read_token = _generate_tokens(cfg)
 
     _write_bearers_yaml(
