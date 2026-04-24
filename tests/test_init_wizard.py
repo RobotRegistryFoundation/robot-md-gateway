@@ -302,3 +302,37 @@ def test_guided_mode_declining_initial_confirm_aborts(
     assert not (tmp_path / "bearers.yaml").exists()
     out = capsys.readouterr().out
     assert "aborted" in out.lower() or "cancelled" in out.lower() or "no changes" in out.lower()
+
+
+def test_guided_mode_custom_port(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    # NOTE: order matters — replace sys.stdin first, then patch isatty on the
+    # StringIO instance. The reverse order leaves isatty() returning False
+    # because monkeypatch.setattr("sys.stdin", ...) swaps in a fresh StringIO
+    # whose own isatty() shadows the earlier patch.
+    monkeypatch.setattr("sys.stdin", io.StringIO("\n\n9090\n\n\n\n\n"))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    # Confirm=Y, bind=default, port=9090, actuate=default, read=default,
+    # systemd=default, tailscale=default
+
+    rc = init_wizard.run(interactive=True, cwd=tmp_path, force=False, no_token_stdout=False)
+    assert rc == 0
+    assert "127.0.0.1:9090" in (tmp_path / "dispatch-test.sh").read_text()
+
+
+def test_guided_mode_read_tier_opt_in(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    # Walk to the read-tier prompt and answer "y"; defaults for everything else.
+    # Order matters: StringIO first, then isatty patch lands on it.
+    monkeypatch.setattr("sys.stdin", io.StringIO("\n\n\n\ny\n\n\n"))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    rc = init_wizard.run(interactive=True, cwd=tmp_path, force=False, no_token_stdout=False)
+    assert rc == 0
+    store = BearerStore.from_yaml(tmp_path / "bearers.yaml")
+    tiers = {e.tier for e in store._by_token.values()}
+    assert tiers == {"read", "actuate"}
