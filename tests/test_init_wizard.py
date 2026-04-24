@@ -4,6 +4,7 @@ import contextlib
 import io
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from robot_md_dispatcher import init_wizard
@@ -241,6 +242,17 @@ def test_refuses_on_existing_env(
     assert ".env already exists" in err
 
 
+def test_refuses_on_existing_dispatch_test_sh(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    (tmp_path / "dispatch-test.sh").write_text("#!/bin/sh\n# pre-existing\n")
+    rc = init_wizard.run(interactive=False, cwd=tmp_path, force=False, no_token_stdout=False)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "dispatch-test.sh already exists" in err
+
+
 def test_force_overwrites_and_invalidates_old_token(
     tmp_path: Path, valid_robot_md: Path, monkeypatch
 ):
@@ -422,7 +434,7 @@ def test_atomicity_rollback_on_second_write_failure(
 
 def test_cli_init_help_mentions_yes_and_force():
     out = subprocess.run(
-        ["robot-md-dispatcher", "init", "--help"],
+        [sys.executable, "-m", "robot_md_dispatcher", "init", "--help"],
         capture_output=True,
         text=True,
         check=True,
@@ -444,7 +456,7 @@ def test_cli_init_yes_runs_wizard(tmp_path: Path, valid_robot_md: Path):
     env["PATH"] = f"{stub_dir}:{env['PATH']}"
 
     result = subprocess.run(
-        ["robot-md-dispatcher", "init", "--yes"],
+        [sys.executable, "-m", "robot_md_dispatcher", "init", "--yes"],
         cwd=tmp_path,
         capture_output=True,
         text=True,

@@ -252,18 +252,18 @@ def _prompt_config(robot_name: str) -> WizardConfig | None:
     )
 
 
-def _rollback(cwd: Path) -> None:
-    for name in ("bearers.yaml", ".env", "dispatch-test.sh"):
+def _rollback(created_paths: list[Path]) -> None:
+    for path in created_paths:
         with contextlib.suppress(FileNotFoundError):
-            (cwd / name).unlink()
+            path.unlink()
 
 
 def _check_no_existing_files(cwd: Path) -> None:
-    for name in ("bearers.yaml", ".env"):
+    for name in ("bearers.yaml", ".env", "dispatch-test.sh"):
         if (cwd / name).exists():
             raise _Precondition(
-                f"./{name} already exists. Use 'init --force' to regenerate tokens "
-                "(this invalidates the old ones)."
+                f"./{name} already exists. Use 'init --force' to regenerate "
+                "(this invalidates the old tokens)."
             )
 
 
@@ -306,22 +306,31 @@ def run(
 
     actuate_token, read_token = _generate_tokens(cfg)
 
+    created: list[Path] = []
     try:
+        bearers_path = cwd / "bearers.yaml"
         _write_bearers_yaml(
-            cwd / "bearers.yaml",
+            bearers_path,
             actuate_token=actuate_token,
             read_token=read_token,
         )
-        _write_env(cwd / ".env")
+        created.append(bearers_path)
+
+        env_path = cwd / ".env"
+        _write_env(env_path)
+        created.append(env_path)
+
         if actuate_token:
+            test_path = cwd / "dispatch-test.sh"
             _write_dispatch_test_sh(
-                cwd / "dispatch-test.sh",
+                test_path,
                 actuate_token=actuate_token,
                 bind=cfg.bind,
                 port=cfg.port,
             )
+            created.append(test_path)
     except OSError as e:
-        _rollback(cwd)
+        _rollback(created)
         print(f"Write failed: {e}", file=sys.stderr)
         return 1
 
