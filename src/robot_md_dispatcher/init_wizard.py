@@ -253,6 +253,14 @@ def _prompt_config(robot_name: str) -> WizardConfig | None:
     )
 
 
+def _rollback(cwd: Path) -> None:
+    for name in ("bearers.yaml", ".env", "dispatch-test.sh"):
+        try:
+            (cwd / name).unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _check_no_existing_files(cwd: Path) -> None:
     for name in ("bearers.yaml", ".env"):
         if (cwd / name).exists():
@@ -301,19 +309,24 @@ def run(
 
     actuate_token, read_token = _generate_tokens(cfg)
 
-    _write_bearers_yaml(
-        cwd / "bearers.yaml",
-        actuate_token=actuate_token,
-        read_token=read_token,
-    )
-    _write_env(cwd / ".env")
-    if actuate_token:
-        _write_dispatch_test_sh(
-            cwd / "dispatch-test.sh",
+    try:
+        _write_bearers_yaml(
+            cwd / "bearers.yaml",
             actuate_token=actuate_token,
-            bind=cfg.bind,
-            port=cfg.port,
+            read_token=read_token,
         )
+        _write_env(cwd / ".env")
+        if actuate_token:
+            _write_dispatch_test_sh(
+                cwd / "dispatch-test.sh",
+                actuate_token=actuate_token,
+                bind=cfg.bind,
+                port=cfg.port,
+            )
+    except OSError as e:
+        _rollback(cwd)
+        print(f"Write failed: {e}", file=sys.stderr)
+        return 1
 
     _print_next_steps(
         cfg=cfg,

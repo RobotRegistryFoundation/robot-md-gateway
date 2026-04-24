@@ -390,3 +390,31 @@ def test_ctrl_c_during_prompt_returns_130_no_files(
     assert not (tmp_path / "bearers.yaml").exists()
     assert not (tmp_path / ".env").exists()
     assert not (tmp_path / "dispatch-test.sh").exists()
+
+
+def test_atomicity_rollback_on_second_write_failure(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+
+    original_replace = os.replace
+    calls: list[str] = []
+
+    def flaky_replace(src, dst):
+        calls.append(str(dst))
+        if len(calls) == 2:  # fail on the second atomic write (.env)
+            raise OSError("simulated disk full")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky_replace)
+
+    rc = init_wizard.run(interactive=False, cwd=tmp_path, force=False, no_token_stdout=False)
+    assert rc == 1
+
+    # Both user-facing files absent (bearers.yaml was rolled back)
+    assert not (tmp_path / "bearers.yaml").exists()
+    assert not (tmp_path / ".env").exists()
+    assert not (tmp_path / "dispatch-test.sh").exists()
+
+    err = capsys.readouterr().err
+    assert "Write failed" in err
