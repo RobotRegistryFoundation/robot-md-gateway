@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import subprocess
@@ -113,10 +114,8 @@ def test_atomic_write_removes_temp_on_failure(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(os, "replace", boom)
 
-    try:
+    with contextlib.suppress(OSError):
         init_wizard._atomic_write(target, "x", mode=0o600)
-    except OSError:
-        pass
 
     assert not target.exists()
     # No leftover dotfile in target_dir
@@ -212,7 +211,7 @@ def test_no_token_stdout_suppresses_token(
 
     bearers = tmp_path / "bearers.yaml"
     store = BearerStore.from_yaml(bearers)
-    token = [e for e in store._by_token.values() if e.tier == "actuate"][0].token
+    token = next(e for e in store._by_token.values() if e.tier == "actuate").token
 
     out = capsys.readouterr().out
     assert token not in out

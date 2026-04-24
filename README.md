@@ -50,23 +50,18 @@ Three shapes were considered; this repo is shape (c):
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install robot-md-dispatcher robot-md   # robot-md-mcp ships with robot-md
-
-cat > bearers.yaml <<'EOF'
-- token: replace-me-read
-  tier: read
-  caller: example-read
-- token: replace-me-actuate
-  tier: actuate
-  caller: example-actuate
-EOF
-
-# Generate real tokens: python3 -c "import secrets;print(secrets.token_urlsafe(32))"
-
-.venv/bin/robot-md-dispatcher serve \
-  --robot-md ./ROBOT.md \
-  --bearers ./bearers.yaml \
-  --host 127.0.0.1 --port 8080
+.venv/bin/robot-md-dispatcher init --yes
+.venv/bin/robot-md-dispatcher serve --bearers ./bearers.yaml --robot-md ./ROBOT.md
 ```
+
+`init --yes` writes `bearers.yaml`, `.env`, and `dispatch-test.sh` next to your
+ROBOT.md and prints a generated actuate-tier token once. Save the token — it's
+not stored anywhere else. Run `robot-md-dispatcher init` (no `--yes`) for a
+guided walk that explains each knob.
+
+From a Claude Code session with the `robot-md-mcp` plugin enabled, you can
+alternatively run the slash command `/enable-dispatch` — it runs `init --yes`
+for you but does not print the generated token into the conversation.
 
 Dispatch a task:
 
@@ -84,10 +79,13 @@ The response is NDJSON — one JSON object per agent message. Tail it.
 
 `systemd/install.sh` handles the full setup: dedicated `robot` system user, `/opt/robot-md-dispatcher/.venv` with hardened unit, `DeviceAllow=/dev/ttyACM0 rw`, `MemoryMax=1G`, `CPUQuota=80%`, journal logging.
 
+Run `robot-md-dispatcher init --yes` first (next to your `ROBOT.md`) to generate
+`bearers.yaml`, `.env`, and `dispatch-test.sh`. Then:
+
 ```bash
 sudo ./systemd/install.sh
-sudoedit /etc/robot-md-dispatcher/bearers.yaml
-cp ROBOT.md /etc/robot-md-dispatcher/ROBOT.md
+sudo cp ./bearers.yaml ./.env /etc/robot-md-dispatcher/
+sudo cp ./ROBOT.md /etc/robot-md-dispatcher/ROBOT.md
 sudo systemctl daemon-reload && sudo systemctl enable --now robot-md-dispatcher
 ```
 

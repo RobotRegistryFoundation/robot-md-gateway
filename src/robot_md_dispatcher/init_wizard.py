@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 import shutil
@@ -41,10 +42,8 @@ def _atomic_write(path: Path, content: str, mode: int) -> None:
         os.chmod(tmp_name, mode)
         os.replace(tmp_name, path)
     except Exception:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
         raise
 
 
@@ -255,10 +254,8 @@ def _prompt_config(robot_name: str) -> WizardConfig | None:
 
 def _rollback(cwd: Path) -> None:
     for name in ("bearers.yaml", ".env", "dispatch-test.sh"):
-        try:
+        with contextlib.suppress(FileNotFoundError):
             (cwd / name).unlink()
-        except FileNotFoundError:
-            pass
 
 
 def _check_no_existing_files(cwd: Path) -> None:
@@ -364,8 +361,8 @@ def _print_next_steps(
     print()
     print("Next:")
     print(
-        f"  robot-md-dispatcher serve --bearers ./bearers.yaml "
-        f"--robot-md ./ROBOT.md"
+        "  robot-md-dispatcher serve --bearers ./bearers.yaml "
+        "--robot-md ./ROBOT.md"
     )
 
     if cfg.systemd_print:
