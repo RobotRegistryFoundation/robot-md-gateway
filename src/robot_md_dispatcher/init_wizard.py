@@ -350,5 +350,20 @@ def _print_next_steps(
         f"  robot-md-dispatcher serve --bearers ./bearers.yaml "
         f"--robot-md ./ROBOT.md"
     )
+
+    if cfg.systemd_print:
+        print()
+        print("Production install (run these):")
+        print("  sudo ./systemd/install.sh")
+        print("  sudo cp ./bearers.yaml ./.env /etc/robot-md-dispatcher/")
+        print("  sudo cp ./ROBOT.md /etc/robot-md-dispatcher/ROBOT.md")
+        print("  sudo systemctl daemon-reload && sudo systemctl enable --now robot-md-dispatcher")
+
+    if cfg.tailscale_print:
+        print()
+        print("Tailscale Funnel exposure (run these):")
+        print(f"  tailscale serve --bg --https=443 http://{cfg.bind}:{cfg.port}")
+        print("  tailscale funnel 443 on")
+
     print()
     print("Tip: add bearers.yaml, .env, dispatch-test.sh to .gitignore")

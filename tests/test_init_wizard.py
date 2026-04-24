@@ -336,3 +336,37 @@ def test_guided_mode_read_tier_opt_in(
     store = BearerStore.from_yaml(tmp_path / "bearers.yaml")
     tiers = {e.tier for e in store._by_token.values()}
     assert tiers == {"read", "actuate"}
+
+
+def test_systemd_opt_in_prints_install_commands(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    # Walk to the systemd prompt and answer "y"; tailscale=default.
+    # Order matters: StringIO first, then isatty patch lands on it.
+    monkeypatch.setattr("sys.stdin", io.StringIO("\n\n\n\n\ny\n\n"))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    rc = init_wizard.run(interactive=True, cwd=tmp_path, force=False, no_token_stdout=False)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "sudo" in out
+    assert "install.sh" in out
+    assert "/etc/robot-md-dispatcher" in out
+
+
+def test_tailscale_opt_in_prints_funnel_commands(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    # Walk to the tailscale prompt and answer "y"; systemd=default.
+    # Order matters: StringIO first, then isatty patch lands on it.
+    monkeypatch.setattr("sys.stdin", io.StringIO("\n\n\n\n\n\ny\n"))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    rc = init_wizard.run(interactive=True, cwd=tmp_path, force=False, no_token_stdout=False)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "tailscale serve" in out
+    assert "tailscale funnel" in out
+    assert "8080" in out  # default port substituted in
