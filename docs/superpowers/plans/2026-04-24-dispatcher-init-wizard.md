@@ -368,7 +368,9 @@ def _validate_robot_md(robot_md: Path) -> str:
         msg_lines.append("Fix ROBOT.md and re-run 'robot-md-dispatcher init'.")
         raise _Precondition("\n".join(msg_lines))
 
-    return str(parsed.frontmatter.get("name", "unknown"))
+    # RCAN v3 schema: robot name lives at metadata.robot_name, not top-level name.
+    metadata = parsed.frontmatter.get("metadata") or {}
+    return str(metadata.get("robot_name", "unknown"))
 ```
 
 Update `run()` to call it:
