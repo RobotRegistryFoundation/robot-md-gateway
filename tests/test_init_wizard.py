@@ -142,3 +142,14 @@ def test_write_bearers_yaml_both_tiers(tmp_path: Path):
     assert store.resolve("A").tier == "actuate"
     assert store.resolve("R").tier == "read"
     assert store.resolve("R").caller_id == "read-default"
+
+
+def test_write_env_contains_four_expected_vars(tmp_path: Path):
+    path = tmp_path / ".env"
+    init_wizard._write_env(path)
+    content = path.read_text()
+    assert "ROBOT_MD_PATH=./ROBOT.md" in content
+    assert "ROBOT_MD_BEARERS_FILE=./bearers.yaml" in content
+    assert "ROBOT_MD_MCP_COMMAND=robot-md-mcp" in content
+    assert "ROBOT_MD_LOG_LEVEL=INFO" in content
+    assert oct(path.stat().st_mode & 0o777) == "0o644"

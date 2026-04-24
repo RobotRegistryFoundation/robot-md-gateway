@@ -69,6 +69,16 @@ def _write_bearers_yaml(path: Path, *, actuate_token: str, read_token: str | Non
     _atomic_write(path, content, mode=0o600)
 
 
+def _write_env(path: Path) -> None:
+    content = (
+        "ROBOT_MD_PATH=./ROBOT.md\n"
+        "ROBOT_MD_BEARERS_FILE=./bearers.yaml\n"
+        "ROBOT_MD_MCP_COMMAND=robot-md-mcp\n"
+        "ROBOT_MD_LOG_LEVEL=INFO\n"
+    )
+    _atomic_write(path, content, mode=0o644)
+
+
 def _check_robot_md_exists(cwd: Path) -> Path:
     robot_md = cwd / "ROBOT.md"
     if not robot_md.is_file():
