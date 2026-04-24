@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import secrets
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +29,23 @@ def _generate_tokens(cfg: WizardConfig) -> tuple[str, str | None]:
     actuate = secrets.token_urlsafe(32) if cfg.generate_actuate else ""
     read = secrets.token_urlsafe(32) if cfg.generate_read else None
     return actuate, read
+
+
+def _atomic_write(path: Path, content: str, mode: int) -> None:
+    """Write `content` to `path` atomically. On failure, leaves no partial files."""
+    target_dir = path.parent
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(target_dir))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _check_robot_md_exists(cwd: Path) -> Path:

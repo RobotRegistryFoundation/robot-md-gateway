@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from robot_md_dispatcher import init_wizard
@@ -85,3 +86,36 @@ def test_generate_tokens_both_when_opted_in():
     assert len(actuate) >= 32
     assert read is not None and len(read) >= 32
     assert actuate != read
+
+
+def test_atomic_write_commits_content_and_perms(tmp_path: Path):
+    target = tmp_path / "out.txt"
+    init_wizard._atomic_write(target, "hello\n", mode=0o600)
+    assert target.read_text() == "hello\n"
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+
+def test_atomic_write_overwrites_existing(tmp_path: Path):
+    target = tmp_path / "out.txt"
+    target.write_text("old")
+    init_wizard._atomic_write(target, "new", mode=0o600)
+    assert target.read_text() == "new"
+
+
+def test_atomic_write_removes_temp_on_failure(tmp_path: Path, monkeypatch):
+    target = tmp_path / "out.txt"
+
+    def boom(src: str, dst: str) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", boom)
+
+    try:
+        init_wizard._atomic_write(target, "x", mode=0o600)
+    except OSError:
+        pass
+
+    assert not target.exists()
+    # No leftover dotfile in target_dir
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".out.txt.")]
+    assert leftovers == []
