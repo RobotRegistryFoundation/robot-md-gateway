@@ -153,3 +153,24 @@ def test_write_env_contains_four_expected_vars(tmp_path: Path):
     assert "ROBOT_MD_MCP_COMMAND=robot-md-mcp" in content
     assert "ROBOT_MD_LOG_LEVEL=INFO" in content
     assert oct(path.stat().st_mode & 0o777) == "0o644"
+
+
+def test_write_dispatch_test_sh_bakes_token_and_is_0700(tmp_path: Path):
+    path = tmp_path / "dispatch-test.sh"
+    init_wizard._write_dispatch_test_sh(
+        path, actuate_token="ABCDE", bind="127.0.0.1", port=8080
+    )
+    content = path.read_text()
+    assert "Authorization: Bearer ABCDE" in content
+    assert "127.0.0.1:8080" in content
+    assert "ANTHROPIC_API_KEY" in content  # gated on env var
+    assert content.startswith("#!/usr/bin/env bash")
+    assert oct(path.stat().st_mode & 0o777) == "0o700"  # token in plaintext -> user-only
+
+
+def test_write_dispatch_test_sh_uses_custom_port(tmp_path: Path):
+    path = tmp_path / "dispatch-test.sh"
+    init_wizard._write_dispatch_test_sh(
+        path, actuate_token="X", bind="127.0.0.1", port=9090
+    )
+    assert "127.0.0.1:9090" in path.read_text()
