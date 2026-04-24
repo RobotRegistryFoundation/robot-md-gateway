@@ -370,3 +370,23 @@ def test_tailscale_opt_in_prints_funnel_commands(
     assert "tailscale serve" in out
     assert "tailscale funnel" in out
     assert "8080" in out  # default port substituted in
+
+
+def test_ctrl_c_during_prompt_returns_130_no_files(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    def boom(prompt: str) -> str:
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr("builtins.input", boom)
+
+    rc = init_wizard.run(interactive=True, cwd=tmp_path, force=False, no_token_stdout=False)
+    assert rc == 130
+    err = capsys.readouterr().err
+    assert "Aborted" in err
+    assert not (tmp_path / "bearers.yaml").exists()
+    assert not (tmp_path / ".env").exists()
+    assert not (tmp_path / "dispatch-test.sh").exists()

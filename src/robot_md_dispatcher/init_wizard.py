@@ -289,7 +289,11 @@ def run(
         return 1
 
     if interactive:
-        cfg = _prompt_config(robot_name)
+        try:
+            cfg = _prompt_config(robot_name)
+        except KeyboardInterrupt:
+            print("\nAborted. No files written.", file=sys.stderr)
+            return 130
         if cfg is None:
             return 0  # user declined the initial confirm; no changes made
     else:
