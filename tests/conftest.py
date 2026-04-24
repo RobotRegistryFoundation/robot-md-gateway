@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -41,3 +42,12 @@ def read_auth() -> AuthContext:
 @pytest.fixture
 def actuate_auth() -> AuthContext:
     return AuthContext(caller_id="bob", tier="actuate", api_key="sk-ant-test-actuate")
+
+
+@pytest.fixture
+def valid_robot_md(tmp_path: Path) -> Path:
+    """Copy the packaged fixture ROBOT.md into a tmp_path and return the path."""
+    src = Path(__file__).parent / "fixtures" / "valid_robot.md"
+    dst = tmp_path / "ROBOT.md"
+    shutil.copy(src, dst)
+    return dst
