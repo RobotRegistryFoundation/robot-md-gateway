@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -50,6 +51,15 @@ def _validate_robot_md(robot_md: Path) -> str:
     return str(metadata.get("robot_name", "unknown"))
 
 
+def _check_mcp_on_path() -> None:
+    if shutil.which("robot-md-mcp") is None:
+        raise _Precondition(
+            "robot-md-mcp not found on PATH. Install with "
+            "'npm install -g robot-md-mcp' (Node) or 'pip install robot-md' "
+            "(Python wrapper)."
+        )
+
+
 def run(
     *,
     interactive: bool,
@@ -61,6 +71,7 @@ def run(
     try:
         robot_md = _check_robot_md_exists(cwd)
         robot_name = _validate_robot_md(robot_md)  # noqa: F841 — used in later tasks
+        _check_mcp_on_path()
     except _Precondition as e:
         print(str(e), file=sys.stderr)
         return 1
