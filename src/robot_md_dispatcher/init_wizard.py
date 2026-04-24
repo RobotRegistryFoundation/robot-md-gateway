@@ -176,6 +176,14 @@ def run(
         print(str(e), file=sys.stderr)
         return 1
 
+    if interactive and not sys.stdin.isatty():
+        print(
+            "Interactive mode requires a TTY. Use 'init --yes' for defaults, "
+            "or run from a terminal.",
+            file=sys.stderr,
+        )
+        return 1
+
     cfg = WizardConfig()  # interactive-mode prompts come in later tasks
     actuate_token, read_token = _generate_tokens(cfg)
 

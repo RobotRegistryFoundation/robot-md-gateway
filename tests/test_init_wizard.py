@@ -251,3 +251,17 @@ def test_force_overwrites_and_invalidates_old_token(
 
     store = BearerStore.from_yaml(tmp_path / "bearers.yaml")
     assert store.resolve("OLD") is None  # old token no longer valid
+
+
+def test_bare_init_refuses_on_non_tty(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    # pytest's capsys replaces stdin with a non-tty already; assert explicitly:
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    rc = init_wizard.run(interactive=True, cwd=tmp_path, force=False, no_token_stdout=False)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "TTY" in err
+    assert "--yes" in err
