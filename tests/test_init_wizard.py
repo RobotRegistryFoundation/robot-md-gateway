@@ -199,3 +199,19 @@ def test_init_yes_golden_path(
     out = capsys.readouterr().out
     assert out.count(token) == 1
     assert token in test_sh.read_text()
+
+
+def test_no_token_stdout_suppresses_token(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
+):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    rc = init_wizard.run(interactive=False, cwd=tmp_path, force=False, no_token_stdout=True)
+    assert rc == 0
+
+    bearers = tmp_path / "bearers.yaml"
+    store = BearerStore.from_yaml(bearers)
+    token = [e for e in store._by_token.values() if e.tier == "actuate"][0].token
+
+    out = capsys.readouterr().out
+    assert token not in out
+    assert "Open the file" in out
