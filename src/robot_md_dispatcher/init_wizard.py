@@ -2,13 +2,31 @@
 
 from __future__ import annotations
 
+import secrets
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 
 class _Precondition(Exception):
     """Precondition failure with a user-facing message."""
+
+
+@dataclass
+class WizardConfig:
+    bind: str = "127.0.0.1"
+    port: int = 8080
+    generate_actuate: bool = True
+    generate_read: bool = False
+    systemd_print: bool = False
+    tailscale_print: bool = False
+
+
+def _generate_tokens(cfg: WizardConfig) -> tuple[str, str | None]:
+    actuate = secrets.token_urlsafe(32) if cfg.generate_actuate else ""
+    read = secrets.token_urlsafe(32) if cfg.generate_read else None
+    return actuate, read
 
 
 def _check_robot_md_exists(cwd: Path) -> Path:

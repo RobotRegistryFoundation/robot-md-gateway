@@ -26,10 +26,11 @@ def test_refuses_on_invalid_robot_md(tmp_path: Path, capsys):
     assert "re-run" in err.lower() or "fix" in err.lower()
 
 
-def test_accepts_valid_robot_md(tmp_path: Path, valid_robot_md: Path):
+def test_accepts_valid_robot_md(tmp_path: Path, valid_robot_md: Path, monkeypatch):
     # valid_robot_md fixture already copies ROBOT.md into tmp_path
     # At this point in the plan, the wizard only does precondition checks,
     # so it should return 0 (no files yet — that comes in later tasks).
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
     rc = init_wizard.run(interactive=False, cwd=tmp_path, force=False, no_token_stdout=False)
     assert rc == 0
 
@@ -59,3 +60,28 @@ def test_refuses_on_schema_invalid_robot_md(tmp_path: Path, capsys):
     assert rc == 1
     err = capsys.readouterr().err
     assert "validation failed" in err
+
+
+def test_default_config_has_sensible_values():
+    cfg = init_wizard.WizardConfig()
+    assert cfg.bind == "127.0.0.1"
+    assert cfg.port == 8080
+    assert cfg.generate_actuate is True
+    assert cfg.generate_read is False
+    assert cfg.systemd_print is False
+    assert cfg.tailscale_print is False
+
+
+def test_generate_tokens_actuate_only_by_default():
+    cfg = init_wizard.WizardConfig()
+    actuate, read = init_wizard._generate_tokens(cfg)
+    assert len(actuate) >= 32
+    assert read is None
+
+
+def test_generate_tokens_both_when_opted_in():
+    cfg = init_wizard.WizardConfig(generate_read=True)
+    actuate, read = init_wizard._generate_tokens(cfg)
+    assert len(actuate) >= 32
+    assert read is not None and len(read) >= 32
+    assert actuate != read
