@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from robot_md_dispatcher import init_wizard
+from robot_md_dispatcher.auth import BearerStore
 
 
 def test_wizard_module_imports_and_run_exists():
@@ -119,3 +120,25 @@ def test_atomic_write_removes_temp_on_failure(tmp_path: Path, monkeypatch):
     # No leftover dotfile in target_dir
     leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".out.txt.")]
     assert leftovers == []
+
+
+def test_write_bearers_yaml_actuate_only(tmp_path: Path):
+    path = tmp_path / "bearers.yaml"
+    init_wizard._write_bearers_yaml(
+        path, actuate_token="AAAA", read_token=None
+    )
+    # Format is loadable by the real consumer
+    store = BearerStore.from_yaml(path)
+    assert store.resolve("AAAA") is not None
+    assert store.resolve("AAAA").tier == "actuate"
+    assert store.resolve("AAAA").caller_id == "actuate-default"
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+
+
+def test_write_bearers_yaml_both_tiers(tmp_path: Path):
+    path = tmp_path / "bearers.yaml"
+    init_wizard._write_bearers_yaml(path, actuate_token="A", read_token="R")
+    store = BearerStore.from_yaml(path)
+    assert store.resolve("A").tier == "actuate"
+    assert store.resolve("R").tier == "read"
+    assert store.resolve("R").caller_id == "read-default"
