@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import subprocess
 from pathlib import Path
 
 from robot_md_dispatcher import init_wizard
@@ -418,3 +419,39 @@ def test_atomicity_rollback_on_second_write_failure(
 
     err = capsys.readouterr().err
     assert "Write failed" in err
+
+
+def test_cli_init_help_mentions_yes_and_force():
+    out = subprocess.run(
+        ["robot-md-dispatcher", "init", "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "--yes" in out
+    assert "--force" in out
+    assert "--no-token-stdout" in out
+
+
+def test_cli_init_yes_runs_wizard(tmp_path: Path, valid_robot_md: Path):
+    # Stub robot-md-mcp on PATH via a dummy binary in a tmp dir
+    stub_dir = tmp_path / "stubs"
+    stub_dir.mkdir()
+    stub = stub_dir / "robot-md-mcp"
+    stub.write_text("#!/usr/bin/env bash\ntrue\n")
+    stub.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{stub_dir}:{env['PATH']}"
+
+    result = subprocess.run(
+        ["robot-md-dispatcher", "init", "--yes"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "bearers.yaml").exists()
+    assert (tmp_path / ".env").exists()
+    assert (tmp_path / "dispatch-test.sh").exists()
