@@ -14,12 +14,12 @@ Phase 3 ships the skeleton:
 - placeholders for tier policy + tool allowlist (Plan 6 Phase 1).
 
 Subsequent plans fill in:
-- envelope signature verification (RC-001) — Plan 6 Phase 1,
-- replay protection (RC-002) — Plan 6 Phase 1,
-- confidence + HiTL gates (RC-003 / RC-004) — Plan 6 Phase 2,
-- ESTOP precedence (SF-001) + safe-stop (SF-002) — Plan 6 Phase 2,
-- audit bundle export (EV-001) — Plan 6 Phase 2,
-- key revocation polling (RR-001 / RR-002) — Plan 6 Phase 3.
+- envelope signature verification (RC-001) — DONE Plan 6 Phase 0 (opt-in via require_envelope_signature),
+- replay protection (RC-002) — DONE Plan 6 Phase 0 (opt-in via replay_cache),
+- confidence + HiTL gates (RC-003 / RC-004) — DONE Plan 6 Phase 1 (opt-in via confidence_policy / hitl_policy),
+- ESTOP precedence (SF-001) + safe-stop (SF-002) — Phase 1 simulator library shipped (cert.safety); receiver wiring deferred,
+- audit bundle export (EV-001) — Phase 1 library shipped (cert.audit); receiver wiring deferred,
+- key revocation polling (RR-001 / RR-002) — Plan 6 Phase 2.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .cert import report as cert_report
 from .cert.envelope import ReplayCache, check_replay, verify_envelope
+from .cert.gates import ConfidencePolicy, HiTLPolicy, check_confidence, check_hitl
 from .cert.policy import ToolAllowlist, check_tier, check_tool
 from .manifest_provenance import RRFResolver, verify_manifest
 
@@ -41,8 +42,12 @@ class InvokeEnvelope(BaseModel):
     """Minimal RCAN INVOKE envelope shape — subset Phase 3 actually validates.
 
     Plan 6 expands this to include nonce/replay fields, confidence,
-    HiTL chain, and ESTOP-precedence fields. Forward-compatible:
-    extra fields are silently accepted by FastAPI's Pydantic-v2 model.
+    HiTL chain, and ESTOP-precedence fields.
+    Forward-compatible note: extra fields are silently DROPPED by Pydantic v2's
+    default extra='ignore'. For Plan 6 cert-property fields not yet declared on
+    this model (`inference_confidence`, `delegation_chain`, etc.), the receiver
+    reads from the raw `envelope_dict` instead — see the gate-call sites in
+    `make_app` for the contract.
     """
 
     msg_id: str = Field(...)
@@ -61,6 +66,8 @@ def make_app(
     bearer_tiers: dict[str, str] | None = None,
     require_envelope_signature: bool = False,
     replay_cache: ReplayCache | None = None,
+    confidence_policy: ConfidencePolicy | None = None,
+    hitl_policy: HiTLPolicy | None = None,
 ) -> FastAPI:
     if tool_allowlist is None:
         tool_allowlist = _DEFAULT_ALLOWLIST
@@ -136,12 +143,28 @@ def make_app(
                 "reason": reason,
             })
 
+        if confidence_policy is not None:
+            ok, reason = check_confidence(envelope_dict, confidence_policy)
+            if not ok:
+                raise HTTPException(status_code=403, detail={
+                    "deny": "confidence_threshold",
+                    "reason": reason,
+                })
+
+        if hitl_policy is not None:
+            ok, reason = check_hitl(envelope_dict, hitl_policy)
+            if not ok:
+                raise HTTPException(status_code=403, detail={
+                    "deny": "hitl_required",
+                    "reason": reason,
+                })
+
         return {
             "ok": True,
             "manifest_kid": manifest_result.kid,
             "scope": envelope.scope,
             "tool_name": envelope.tool_name,
-            "next_gates": ["RC-001", "RC-002", "RC-003", "RC-004", "SF-001", "SF-002", "EV-001"],
+            "next_gates": ["SF-001", "SF-002", "EV-001"],
         }
 
     return app
