@@ -30,7 +30,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .cert import report as cert_report
+from .cert.policy import ToolAllowlist, check_tool
 from .manifest_provenance import RRFResolver, verify_manifest
+
+_DEFAULT_ALLOWLIST = ToolAllowlist(allowed_tools=("mcp__robot__render", "mcp__robot__validate"))
 
 
 class InvokeEnvelope(BaseModel):
@@ -50,7 +53,13 @@ class InvokeEnvelope(BaseModel):
     manifest_path: str = Field(..., description="Local path to ROBOT.md being actuated against")
 
 
-def make_app(*, resolver: RRFResolver) -> FastAPI:
+def make_app(
+    *,
+    resolver: RRFResolver,
+    tool_allowlist: ToolAllowlist | None = None,
+) -> FastAPI:
+    if tool_allowlist is None:
+        tool_allowlist = _DEFAULT_ALLOWLIST
     app = FastAPI(title="robot-md-gateway", version="0.3.0a1")
 
     @app.post("/v1/invoke")
@@ -80,10 +89,18 @@ def make_app(*, resolver: RRFResolver) -> FastAPI:
             },
         )
 
+        allowed, reason = check_tool(envelope.tool_name, tool_allowlist, msg_id=envelope.msg_id)
+        if not allowed:
+            raise HTTPException(status_code=403, detail={
+                "deny": "tool_allowlist",
+                "reason": reason,
+            })
+
         return {
             "ok": True,
             "manifest_kid": manifest_result.kid,
             "scope": envelope.scope,
+            "tool_name": envelope.tool_name,
             "next_gates": ["RC-001", "RC-002", "RC-003", "RC-004", "SF-001", "SF-002", "EV-001"],
         }
 
