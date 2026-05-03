@@ -15,9 +15,9 @@ from collections.abc import AsyncIterator
 
 from fastapi.testclient import TestClient
 
-from robot_md_dispatcher.app import AppDeps, ClientFactory, create_app
-from robot_md_dispatcher.auth import AuthContext
-from robot_md_dispatcher.gating import (
+from robot_md_gateway.app import AppDeps, ClientFactory, create_app
+from robot_md_gateway.auth import AuthContext
+from robot_md_gateway.gating import (
     TierPolicy,
     evaluate,
     make_can_use_tool,

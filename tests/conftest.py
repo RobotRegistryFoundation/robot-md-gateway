@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from robot_md_dispatcher.auth import AuthContext, BearerStore
-from robot_md_dispatcher.gating import TierPolicy
+from robot_md_gateway.auth import AuthContext, BearerStore
+from robot_md_gateway.gating import TierPolicy
 
 
 @pytest.fixture
