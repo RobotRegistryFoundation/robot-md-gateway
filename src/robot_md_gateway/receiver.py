@@ -29,6 +29,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from .cert import report as cert_report
 from .manifest_provenance import RRFResolver, verify_manifest
 
 
@@ -56,11 +57,28 @@ def make_app(*, resolver: RRFResolver) -> FastAPI:
     def invoke(envelope: InvokeEnvelope):
         manifest_result = verify_manifest(Path(envelope.manifest_path), resolver=resolver)
         if not manifest_result.accepted:
+            cert_report.record_property_fail(
+                property_id="MF-002",
+                evidence={
+                    "manifest_path": envelope.manifest_path,
+                    "reason": manifest_result.reason,
+                    "msg_id": envelope.msg_id,
+                },
+            )
             raise HTTPException(status_code=403, detail={
                 "deny": "manifest_provenance",
                 "reason": manifest_result.reason,
                 "kid": manifest_result.kid,
             })
+
+        cert_report.record_property_pass(
+            property_id="MF-001",
+            evidence={
+                "manifest_kid": manifest_result.kid,
+                "manifest_path": envelope.manifest_path,
+                "msg_id": envelope.msg_id,
+            },
+        )
 
         return {
             "ok": True,
