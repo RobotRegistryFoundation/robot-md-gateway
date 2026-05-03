@@ -42,8 +42,12 @@ class InvokeEnvelope(BaseModel):
     """Minimal RCAN INVOKE envelope shape — subset Phase 3 actually validates.
 
     Plan 6 expands this to include nonce/replay fields, confidence,
-    HiTL chain, and ESTOP-precedence fields. Forward-compatible:
-    extra fields are silently accepted by FastAPI's Pydantic-v2 model.
+    HiTL chain, and ESTOP-precedence fields.
+    Forward-compatible note: extra fields are silently DROPPED by Pydantic v2's
+    default extra='ignore'. For Plan 6 cert-property fields not yet declared on
+    this model (`inference_confidence`, `delegation_chain`, etc.), the receiver
+    reads from the raw `envelope_dict` instead — see the gate-call sites in
+    `make_app` for the contract.
     """
 
     msg_id: str = Field(...)
