@@ -5,6 +5,11 @@ on:
     tags:
       - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to emit version-tuple for (backfill mode; leave empty for normal dispatch)"
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -91,3 +96,42 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+
+  backfill-emit:
+    name: Emit signed version-tuple envelope (backfill)
+    if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine tag
+        id: tag
+        run: |
+          TAG="${{ inputs.tag }}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+
+      - name: Ensure GitHub release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "${{ steps.tag.outputs.tag }}" >/dev/null 2>&1; then
+            gh release create "${{ steps.tag.outputs.tag }}" \
+              --title "robot-md-dispatcher ${{ steps.tag.outputs.tag }}" \
+              --generate-notes
+          fi
+
+      - uses: continuonai/rcan-spec/.github/actions/emit-version-tuple@v3.2.0
+        with:
+          project: robot-md-dispatcher
+          ran: ${{ secrets.ROBOT_MD_DISPATCHER_RELEASE_RAN }}
+          field: gateway_version
+          value: ${{ steps.tag.outputs.version }}
+          depends_on: '{"manifest_spec_version":">=1.5.0","protocol_version":">=3.2.0"}'
+          pq_signing_key: ${{ secrets.ROBOT_MD_DISPATCHER_RELEASE_PQ_PRIV }}
+          pq_kid: ${{ secrets.ROBOT_MD_DISPATCHER_RELEASE_KID }}
+          ed25519_signing_key: ${{ secrets.ROBOT_MD_DISPATCHER_RELEASE_PRIV }}
+          ed25519_kid: ${{ secrets.ROBOT_MD_DISPATCHER_RELEASE_KID }}
+          release_tag: ${{ steps.tag.outputs.tag }}
