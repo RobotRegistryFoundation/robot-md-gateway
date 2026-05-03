@@ -6,7 +6,7 @@ from typing import Literal
 
 from .auth import AuthContext, Tier
 
-log = logging.getLogger("robot_md_dispatcher.gate")
+log = logging.getLogger("robot_md_gateway.gate")
 
 
 Decision = Literal["allow", "deny"]

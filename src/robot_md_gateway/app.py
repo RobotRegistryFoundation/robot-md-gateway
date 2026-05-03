@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from .auth import AuthContext, BearerStore, load_bearer_store_from_env, make_auth_dep
 from .gating import TierPolicy, make_can_use_tool, make_pre_tool_use_hook
 
-log = logging.getLogger("robot_md_dispatcher")
+log = logging.getLogger("robot_md_gateway")
 
 
 @runtime_checkable

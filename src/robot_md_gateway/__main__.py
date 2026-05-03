@@ -7,11 +7,39 @@ import sys
 from pathlib import Path
 
 
+class _LegacyByokAction(argparse.Action):
+    """Print a deprecation banner to stderr the moment --legacy-byok-launcher is parsed.
+
+    Done as a custom action so the warning fires even when --help is also passed
+    (argparse's --help short-circuits parsing, so a post-parse_args() print would
+    never run in that path).
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(
+            "warning: --legacy-byok-launcher is deprecated and removed in v0.4.0. "
+            "Migrate callers to send signed RCAN INVOKE envelopes instead.",
+            file=sys.stderr,
+        )
+        setattr(namespace, self.dest, True)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="robot-md-dispatcher")
+    parser = argparse.ArgumentParser(prog="robot-md-gateway")
+    parser.add_argument(
+        "--legacy-byok-launcher",
+        action=_LegacyByokAction,
+        nargs=0,
+        default=False,
+        help=(
+            "DEPRECATED. Run in v0.2.x BYOK Claude Agent SDK launcher mode. "
+            "The gateway will spawn a planner per request rather than receive "
+            "signed RCAN envelopes. Removed in v0.4.0."
+        ),
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    serve = sub.add_parser("serve", help="Run the dispatcher HTTP server")
+    serve = sub.add_parser("serve", help="Run the gateway HTTP server")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument(
@@ -66,9 +94,15 @@ def main() -> None:
 
         import uvicorn
 
-        from .app import create_app_from_env
+        if args.legacy_byok_launcher:
+            from .app import create_app_from_env
+            fastapi_app = create_app_from_env()
+        else:
+            from .auth import RRFResolverFromEnv
+            from .receiver import make_app
+            fastapi_app = make_app(resolver=RRFResolverFromEnv.from_env())
 
-        uvicorn.run(create_app_from_env(), host=args.host, port=args.port)
+        uvicorn.run(fastapi_app, host=args.host, port=args.port)
         return
 
     if args.cmd == "init":

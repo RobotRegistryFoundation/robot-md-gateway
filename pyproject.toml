@@ -3,14 +3,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "robot-md-dispatcher"
-version = "0.2.0"
-description = "BYOK dispatcher for robot-md — accepts tasks over HTTP, runs them through a local Claude Agent SDK session against a ROBOT.md-described robot."
+name = "robot-md-gateway"
+version = "0.3.0a1"
+description = "Enforcement gateway for the OpenCastor stack — receives signed RCAN action envelopes, verifies manifest provenance, applies tier policy + tool allowlist, dispatches to drivers. Mandatory exclusive path between agent intent and any actuator."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "craigm26", email = "craigm26@gmail.com" }]
-keywords = ["robotics", "claude", "anthropic", "robot-md", "agent-sdk", "dispatcher"]
+keywords = ["robotics", "robot-md", "rcan", "gateway", "safety", "enforcement"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -19,6 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: System :: Hardware",
 ]
@@ -40,14 +41,18 @@ dev = [
 ]
 
 [project.scripts]
-robot-md-dispatcher = "robot_md_dispatcher.__main__:main"
+robot-md-gateway = "robot_md_gateway.__main__:main"
+robot-md-dispatcher = "robot_md_gateway._legacy_cli:legacy_main"
 
 [project.urls]
 Homepage = "https://robotmd.dev"
-Repository = "https://github.com/RobotRegistryFoundation/robot-md-dispatcher"
+Repository = "https://github.com/RobotRegistryFoundation/robot-md-gateway"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/robot_md_dispatcher"]
+packages = ["src/robot_md_gateway", "src/robot_md_dispatcher"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/robot_md_gateway/udev/99-robot-md-gateway.rules.in" = "robot_md_gateway/udev/99-robot-md-gateway.rules.in"
 
 [tool.ruff]
 line-length = 100

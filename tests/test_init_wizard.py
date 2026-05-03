@@ -7,8 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from robot_md_dispatcher import init_wizard
-from robot_md_dispatcher.auth import BearerStore
+from robot_md_gateway import init_wizard
+from robot_md_gateway.auth import BearerStore
 
 
 def test_wizard_module_imports_and_run_exists():
@@ -434,7 +434,7 @@ def test_atomicity_rollback_on_second_write_failure(
 
 def test_cli_init_help_mentions_yes_and_force():
     out = subprocess.run(
-        [sys.executable, "-m", "robot_md_dispatcher", "init", "--help"],
+        [sys.executable, "-m", "robot_md_gateway", "init", "--help"],
         capture_output=True,
         text=True,
         check=True,
@@ -456,7 +456,7 @@ def test_cli_init_yes_runs_wizard(tmp_path: Path, valid_robot_md: Path):
     env["PATH"] = f"{stub_dir}:{env['PATH']}"
 
     result = subprocess.run(
-        [sys.executable, "-m", "robot_md_dispatcher", "init", "--yes"],
+        [sys.executable, "-m", "robot_md_gateway", "init", "--yes"],
         cwd=tmp_path,
         capture_output=True,
         text=True,
