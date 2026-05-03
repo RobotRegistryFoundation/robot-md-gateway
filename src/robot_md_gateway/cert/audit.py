@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from rcan.audit_bundle import canonical_json
 
 from . import report as cert_report
@@ -68,12 +69,14 @@ def verify_audit_bundle(bundle: dict, *, kid_to_pem: dict[str, bytes]) -> bool:
     sig = bundle.get("signature")
     if sig is None:
         return False
-    pem = kid_to_pem.get(sig["kid"])
-    if pem is None:
-        return False
-    pub = serialization.load_pem_public_key(pem)
-    body = {k: v for k, v in bundle.items() if k != "signature"}
     try:
+        pem = kid_to_pem.get(sig["kid"])
+        if pem is None:
+            return False
+        pub = serialization.load_pem_public_key(pem)
+        if not isinstance(pub, Ed25519PublicKey):
+            return False
+        body = {k: v for k, v in bundle.items() if k != "signature"}
         pub.verify(base64.b64decode(sig["sig"]), canonical_json(body))
     except Exception:
         return False
