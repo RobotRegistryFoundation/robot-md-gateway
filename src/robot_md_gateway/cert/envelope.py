@@ -1,28 +1,25 @@
-"""RCAN INVOKE envelope verification (RC-001) + replay protection (RC-002).
-
-`canonical_json` is inlined here pending Plan 4's `rcan.audit_bundle.canonical_json`
-helper. Once Plan 4 ships, replace the local impl with the rcan-py import.
-"""
+"""RCAN INVOKE envelope verification (RC-001) + replay protection (RC-002)."""
 
 from __future__ import annotations
 
 import base64
-import json
 from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from rcan.audit_bundle import canonical_json
 
 from ..manifest_provenance import RRFResolver
 from . import report as cert_report
 
-
-def canonical_json(obj: dict, *, exclude: str | None = None) -> bytes:
-    """Sorted-keys, no-whitespace JSON encoding. Optionally drops one top-level field."""
-    if exclude is not None:
-        obj = {k: v for k, v in obj.items() if k != exclude}
-    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+__all__ = [
+    "EnvelopeVerificationResult",
+    "ReplayCache",
+    "canonical_json",
+    "check_replay",
+    "verify_envelope",
+]
 
 
 @dataclass(frozen=True)
