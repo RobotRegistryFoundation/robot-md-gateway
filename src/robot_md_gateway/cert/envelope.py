@@ -1,0 +1,107 @@
+"""RCAN INVOKE envelope verification (RC-001) + replay protection (RC-002).
+
+`canonical_json` is inlined here pending Plan 4's `rcan.audit_bundle.canonical_json`
+helper. Once Plan 4 ships, replace the local impl with the rcan-py import.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+from dataclasses import dataclass
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from ..manifest_provenance import RRFResolver
+from . import report as cert_report
+
+
+def canonical_json(obj: dict, *, exclude: str | None = None) -> bytes:
+    """Sorted-keys, no-whitespace JSON encoding. Optionally drops one top-level field."""
+    if exclude is not None:
+        obj = {k: v for k, v in obj.items() if k != exclude}
+    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+@dataclass(frozen=True)
+class EnvelopeVerificationResult:
+    accepted: bool
+    kid: str | None
+    reason: str
+
+
+def verify_envelope(envelope: dict, *, resolver: RRFResolver) -> EnvelopeVerificationResult:
+    sig = envelope.get("envelope_signature")
+    if sig is None:
+        return EnvelopeVerificationResult(
+            accepted=False, kid=None, reason="no envelope_signature field",
+        )
+    kid = sig.get("kid")
+    pem = resolver.resolve_public_key_pem(kid)
+    if pem is None:
+        return EnvelopeVerificationResult(
+            accepted=False, kid=kid, reason=f"kid {kid} not registered",
+        )
+    try:
+        pub = serialization.load_pem_public_key(pem)
+    except ValueError as exc:
+        return EnvelopeVerificationResult(
+            accepted=False, kid=kid, reason=f"bad PEM: {exc}",
+        )
+    if not isinstance(pub, Ed25519PublicKey):
+        return EnvelopeVerificationResult(
+            accepted=False, kid=kid, reason="not Ed25519",
+        )
+    try:
+        pub.verify(
+            base64.b64decode(sig["sig"]),
+            canonical_json(envelope, exclude="envelope_signature"),
+        )
+    except InvalidSignature:
+        return EnvelopeVerificationResult(
+            accepted=False, kid=kid, reason="signature did not verify",
+        )
+    cert_report.record_property_pass(
+        property_id="RC-001",
+        evidence={"kid": kid, "msg_id": envelope.get("msg_id")},
+    )
+    return EnvelopeVerificationResult(accepted=True, kid=kid, reason="ok")
+
+
+class ReplayCache:
+    """In-memory bounded set of seen msg_ids. Production deployments use a
+    persistent store (sqlite or redis); this default is fine for HIL +
+    short-lived test runs.
+    """
+
+    def __init__(self, max_size: int = 100_000) -> None:
+        self._seen: set[str] = set()
+        self._max = max_size
+
+    def has_seen(self, msg_id: str) -> bool:
+        return msg_id in self._seen
+
+    def record(self, msg_id: str) -> None:
+        if len(self._seen) >= self._max:
+            self._seen.pop()
+        self._seen.add(msg_id)
+
+
+def check_replay(envelope: dict, cache: ReplayCache) -> tuple[bool, str]:
+    msg_id = envelope.get("msg_id")
+    if not msg_id:
+        return False, "missing msg_id"
+    if cache.has_seen(msg_id):
+        cert_report.record_property_pass(
+            property_id="RC-002",
+            evidence={"msg_id": msg_id, "outcome": "denied (replay)"},
+        )
+        return False, f"replay rejected (msg_id {msg_id} already seen)"
+    cache.record(msg_id)
+    cert_report.record_property_pass(
+        property_id="RC-002",
+        evidence={"msg_id": msg_id, "outcome": "accepted (fresh)"},
+    )
+    return True, "ok"

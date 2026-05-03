@@ -26,11 +26,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import Body, FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field, ValidationError
 
 from .cert import report as cert_report
+from .cert.envelope import ReplayCache, check_replay, verify_envelope
+from .cert.policy import ToolAllowlist, check_tier, check_tool
 from .manifest_provenance import RRFResolver, verify_manifest
+
+_DEFAULT_ALLOWLIST = ToolAllowlist(allowed_tools=("mcp__robot__render", "mcp__robot__validate"))
 
 
 class InvokeEnvelope(BaseModel):
@@ -50,11 +54,49 @@ class InvokeEnvelope(BaseModel):
     manifest_path: str = Field(..., description="Local path to ROBOT.md being actuated against")
 
 
-def make_app(*, resolver: RRFResolver) -> FastAPI:
+def make_app(
+    *,
+    resolver: RRFResolver,
+    tool_allowlist: ToolAllowlist | None = None,
+    bearer_tiers: dict[str, str] | None = None,
+    require_envelope_signature: bool = False,
+    replay_cache: ReplayCache | None = None,
+) -> FastAPI:
+    if tool_allowlist is None:
+        tool_allowlist = _DEFAULT_ALLOWLIST
+    bearer_tiers = bearer_tiers or {}
+    if replay_cache is None:
+        replay_cache = ReplayCache()
     app = FastAPI(title="robot-md-gateway", version="0.3.0a1")
 
     @app.post("/v1/invoke")
-    def invoke(envelope: InvokeEnvelope):
+    def invoke(
+        envelope_dict: dict = Body(...),
+        authorization: str | None = Header(default=None),
+    ):
+        tier = "anon"
+        if authorization and authorization.startswith("Bearer "):
+            tier = bearer_tiers.get(authorization[7:], "anon")
+
+        if require_envelope_signature:
+            env_result = verify_envelope(envelope_dict, resolver=resolver)
+            if not env_result.accepted:
+                raise HTTPException(status_code=403, detail={
+                    "deny": "envelope_signature",
+                    "reason": env_result.reason,
+                })
+            ok, reason = check_replay(envelope_dict, replay_cache)
+            if not ok:
+                raise HTTPException(status_code=403, detail={
+                    "deny": "replay",
+                    "reason": reason,
+                })
+
+        try:
+            envelope = InvokeEnvelope(**envelope_dict)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
         manifest_result = verify_manifest(Path(envelope.manifest_path), resolver=resolver)
         if not manifest_result.accepted:
             cert_report.record_property_fail(
@@ -80,10 +122,25 @@ def make_app(*, resolver: RRFResolver) -> FastAPI:
             },
         )
 
+        ok, reason = check_tier(tier, envelope.scope, msg_id=envelope.msg_id)
+        if not ok:
+            raise HTTPException(status_code=403, detail={
+                "deny": "tier_policy",
+                "reason": reason,
+            })
+
+        allowed, reason = check_tool(envelope.tool_name, tool_allowlist, msg_id=envelope.msg_id)
+        if not allowed:
+            raise HTTPException(status_code=403, detail={
+                "deny": "tool_allowlist",
+                "reason": reason,
+            })
+
         return {
             "ok": True,
             "manifest_kid": manifest_result.kid,
             "scope": envelope.scope,
+            "tool_name": envelope.tool_name,
             "next_gates": ["RC-001", "RC-002", "RC-003", "RC-004", "SF-001", "SF-002", "EV-001"],
         }
 
