@@ -96,3 +96,38 @@ def load_bearer_store_from_env() -> BearerStore:
     if not path:
         raise RuntimeError("ROBOT_MD_BEARERS_FILE not set")
     return BearerStore.from_yaml(Path(path))
+
+
+class RRFResolverFromEnv:
+    """Resolves a kid → public-key PEM via the RRF v2 API.
+
+    Reads OPENCASTOR_OPS_RRF_URL (default https://robotregistryfoundation.org).
+    Caches lookups in process memory for the gateway's lifetime; revocation
+    polling is added in Plan 6 (RR-001).
+    """
+
+    def __init__(self, base_url: str) -> None:
+        self._base = base_url.rstrip("/")
+        self._cache: dict[str, bytes] = {}
+
+    @classmethod
+    def from_env(cls) -> "RRFResolverFromEnv":
+        return cls(os.environ.get("OPENCASTOR_OPS_RRF_URL", "https://robotregistryfoundation.org"))
+
+    def resolve_public_key_pem(self, kid: str) -> bytes | None:
+        if kid in self._cache:
+            return self._cache[kid]
+        import json
+        import urllib.request
+        url = f"{self._base}/v2/keys/{kid}"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                if resp.status != 200:
+                    return None
+                payload = json.loads(resp.read())
+                pem = payload.get("public_key_pem", "").encode("utf-8")
+                if pem:
+                    self._cache[kid] = pem
+                return pem or None
+        except Exception:
+            return None

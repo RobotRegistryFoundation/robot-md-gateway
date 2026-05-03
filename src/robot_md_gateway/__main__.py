@@ -80,11 +80,6 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.cmd == "serve":
-        # Receive-only is the default (Plan 6 wires the actual receiver).
-        # --legacy-byok-launcher selects the v0.2.x app instead. Both branches
-        # currently resolve to the same module; Plan 6 Phase 4 swaps the
-        # default branch to the new receive-only handler.
-        _ = args.legacy_byok_launcher
         if args.robot_md:
             os.environ["ROBOT_MD_PATH"] = args.robot_md
         if args.bearers:
@@ -99,9 +94,15 @@ def main() -> None:
 
         import uvicorn
 
-        from .app import create_app_from_env
+        if args.legacy_byok_launcher:
+            from .app import create_app_from_env
+            fastapi_app = create_app_from_env()
+        else:
+            from .auth import RRFResolverFromEnv
+            from .receiver import make_app
+            fastapi_app = make_app(resolver=RRFResolverFromEnv.from_env())
 
-        uvicorn.run(create_app_from_env(), host=args.host, port=args.port)
+        uvicorn.run(fastapi_app, host=args.host, port=args.port)
         return
 
     if args.cmd == "init":
