@@ -23,7 +23,7 @@ class SafetyMonitor:
 
     def on_estop_wire(self, *, tripped: bool, msg_id: str | None = None) -> None:
         """SF-001 — ESTOP wire transitions preempt other state."""
-        if tripped:
+        if tripped and self.state != GatewayState.ESTOP_ACTIVE:
             prev = self.state
             self.state = GatewayState.ESTOP_ACTIVE
             cert_report.record_property_pass(
