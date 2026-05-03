@@ -14,12 +14,12 @@ Phase 3 ships the skeleton:
 - placeholders for tier policy + tool allowlist (Plan 6 Phase 1).
 
 Subsequent plans fill in:
-- envelope signature verification (RC-001) — Plan 6 Phase 1,
-- replay protection (RC-002) — Plan 6 Phase 1,
-- confidence + HiTL gates (RC-003 / RC-004) — Plan 6 Phase 2,
-- ESTOP precedence (SF-001) + safe-stop (SF-002) — Plan 6 Phase 2,
-- audit bundle export (EV-001) — Plan 6 Phase 2,
-- key revocation polling (RR-001 / RR-002) — Plan 6 Phase 3.
+- envelope signature verification (RC-001) — DONE Plan 6 Phase 0 (opt-in via require_envelope_signature),
+- replay protection (RC-002) — DONE Plan 6 Phase 0 (opt-in via replay_cache),
+- confidence + HiTL gates (RC-003 / RC-004) — DONE Plan 6 Phase 1 (opt-in via confidence_policy / hitl_policy),
+- ESTOP precedence (SF-001) + safe-stop (SF-002) — Phase 1 simulator library shipped (cert.safety); receiver wiring deferred,
+- audit bundle export (EV-001) — Phase 1 library shipped (cert.audit); receiver wiring deferred,
+- key revocation polling (RR-001 / RR-002) — Plan 6 Phase 2.
 """
 
 from __future__ import annotations
@@ -164,7 +164,7 @@ def make_app(
             "manifest_kid": manifest_result.kid,
             "scope": envelope.scope,
             "tool_name": envelope.tool_name,
-            "next_gates": ["RC-001", "RC-002", "RC-003", "RC-004", "SF-001", "SF-002", "EV-001"],
+            "next_gates": ["SF-001", "SF-002", "EV-001"],
         }
 
     return app
