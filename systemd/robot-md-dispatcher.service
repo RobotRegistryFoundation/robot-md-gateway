@@ -1,5 +1,5 @@
 [Unit]
-Description=robot-md-dispatcher — BYOK Claude Agent dispatcher for a ROBOT.md-described robot
+Description=robot-md-gateway — enforcement gateway between agent intent and actuators
 After=network-online.target
 Wants=network-online.target
 
