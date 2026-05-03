@@ -111,8 +111,9 @@ class RRFResolverFromEnv:
         self._cache: dict[str, bytes] = {}
 
     @classmethod
-    def from_env(cls) -> "RRFResolverFromEnv":
-        return cls(os.environ.get("OPENCASTOR_OPS_RRF_URL", "https://robotregistryfoundation.org"))
+    def from_env(cls) -> RRFResolverFromEnv:
+        default = "https://robotregistryfoundation.org"
+        return cls(os.environ.get("OPENCASTOR_OPS_RRF_URL", default))
 
     def resolve_public_key_pem(self, kid: str) -> bytes | None:
         if kid in self._cache:

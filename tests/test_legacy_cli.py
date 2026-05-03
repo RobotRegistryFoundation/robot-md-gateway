@@ -1,4 +1,4 @@
-"""Test that `robot-md-dispatcher` CLI entry-point delegates to gateway main with a deprecation warning."""
+"""Test that `robot-md-dispatcher` CLI delegates to gateway main with a deprecation warning."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import sys
 
 
 def test_legacy_cli_module_invocable_with_deprecation_message():
-    """`python -m robot_md_gateway._legacy_cli --help` runs and prints the deprecation banner to stderr."""
+    """`python -m robot_md_gateway._legacy_cli --help` runs + warns on stderr."""
     result = subprocess.run(
         [sys.executable, "-m", "robot_md_gateway._legacy_cli", "--help"],
         capture_output=True,

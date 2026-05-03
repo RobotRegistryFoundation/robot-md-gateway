@@ -24,7 +24,7 @@ warnings.warn(
     stacklevel=2,
 )
 
-from robot_md_gateway import __version__ as __version__
+from robot_md_gateway import __version__ as __version__  # noqa: E402
 
 _FORWARDED_SUBMODULES = ("auth", "gating", "app", "init_wizard", "__main__")
 for _name in _FORWARDED_SUBMODULES:

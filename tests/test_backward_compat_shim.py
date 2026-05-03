@@ -31,7 +31,7 @@ def test_dispatcher_alias_specific_classes_resolve():
     _force_clean_imports()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        from robot_md_dispatcher.auth import AuthContext as LegacyAuthContext
+        from robot_md_dispatcher.auth import AuthContext as LegacyAuthContext  # noqa: I001
         from robot_md_gateway.auth import AuthContext as NewAuthContext
     assert LegacyAuthContext is NewAuthContext
 

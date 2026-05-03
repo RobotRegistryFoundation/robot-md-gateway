@@ -1,4 +1,4 @@
-"""Test that --legacy-byok-launcher selects the BYOK launcher app and emits a deprecation warning."""
+"""Test that --legacy-byok-launcher selects the legacy app and warns."""
 
 from __future__ import annotations
 
@@ -27,7 +27,8 @@ def test_default_mode_does_not_warn_about_byok():
         check=False,
     )
     assert result.returncode == 0
-    assert "legacy-byok" not in result.stderr.lower() or "removed in v0.4.0" in result.stderr.lower()
+    stderr = result.stderr.lower()
+    assert "legacy-byok" not in stderr or "removed in v0.4.0" in stderr
 
 
 def test_help_documents_legacy_flag():
