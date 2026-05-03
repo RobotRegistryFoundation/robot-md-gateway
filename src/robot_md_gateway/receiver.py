@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .cert import report as cert_report
 from .cert.envelope import ReplayCache, check_replay, verify_envelope
+from .cert.gates import ConfidencePolicy, HiTLPolicy, check_confidence, check_hitl
 from .cert.policy import ToolAllowlist, check_tier, check_tool
 from .manifest_provenance import RRFResolver, verify_manifest
 
@@ -61,6 +62,8 @@ def make_app(
     bearer_tiers: dict[str, str] | None = None,
     require_envelope_signature: bool = False,
     replay_cache: ReplayCache | None = None,
+    confidence_policy: ConfidencePolicy | None = None,
+    hitl_policy: HiTLPolicy | None = None,
 ) -> FastAPI:
     if tool_allowlist is None:
         tool_allowlist = _DEFAULT_ALLOWLIST
@@ -135,6 +138,22 @@ def make_app(
                 "deny": "tool_allowlist",
                 "reason": reason,
             })
+
+        if confidence_policy is not None:
+            ok, reason = check_confidence(envelope_dict, confidence_policy)
+            if not ok:
+                raise HTTPException(status_code=403, detail={
+                    "deny": "confidence_threshold",
+                    "reason": reason,
+                })
+
+        if hitl_policy is not None:
+            ok, reason = check_hitl(envelope_dict, hitl_policy)
+            if not ok:
+                raise HTTPException(status_code=403, detail={
+                    "deny": "hitl_required",
+                    "reason": reason,
+                })
 
         return {
             "ok": True,
