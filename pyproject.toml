@@ -29,6 +29,7 @@ dependencies = [
     "uvicorn[standard]>=0.27",
     "python-frontmatter>=1.0",
     "pydantic>=2.6",
+    "rcan>=3.4.0",
     "robot-md>=1.1",
 ]
 
