@@ -1,116 +1,112 @@
-# robot-md-dispatcher
+# robot-md-gateway
 
-> **BYOK Claude Agent SDK dispatcher for a `ROBOT.md`-described robot.**
-> Accepts natural-language tasks over HTTP and runs them through a local Claude agent on the robot host. Reasoning, tool-calling, and audit stay local — only the goal and final result cross the network. Each caller brings their own Anthropic API key.
+> **The mandatory enforcement gateway for the OpenCastor stack.**
+> Receives signed RCAN action envelopes, verifies manifest provenance, applies tier policy + tool allowlist, dispatches to drivers. Exclusive path between agent intent and any actuator. Open, neutral, becomes OpenCastor's safety kernel via open-core extraction.
 
+[![PyPI](https://img.shields.io/pypi/v/robot-md-gateway.svg)](https://pypi.org/project/robot-md-gateway/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green)](https://www.python.org)
+[![RCAN](https://img.shields.io/badge/RCAN-live%20matrix-blue)](https://rcan.dev/compatibility)
+
+> **Renamed in 2026-05.** This package was previously published as `robot-md-dispatcher`. The old name is now a tombstone on PyPI; `pip install robot-md-dispatcher` continues to work and pulls this package as a dependency. Imports and the `robot-md-dispatcher` CLI keep working through v0.4.x via a backward-compat shim. See [CHANGELOG.md](CHANGELOG.md) for migration notes.
 
 ## Where this fits in the stack
 
-`robot-md-mcp` is the right answer when a human operator drives a robot from an interactive MCP client (Claude Code, Claude Desktop, Cursor, Zed). `robot-md-dispatcher` is the right answer when an **external system** — a cron job, a Slack bot, a phone app, another agent — needs to hand a robot a task and wait for the result. You keep the ROBOT.md safety gates; you get tier-gated auth; you don't open remote MCP to the internet.
+`robot-md-gateway` is **Layer 3** of the OpenCastor stack — the
+enforcement gateway. Every action that crosses from agent intent to
+any actuator passes through this gateway. There is no second path.
 
 | Layer | Piece | What it is |
 |---|---|---|
-| **Declaration** | [ROBOT.md](https://github.com/RobotRegistryFoundation/robot-md) | The file a robot ships at its root. YAML frontmatter + markdown prose. |
-| **Agent bridge** | [robot-md-mcp](https://github.com/RobotRegistryFoundation/robot-md-mcp) | MCP server that exposes a `ROBOT.md` to any MCP-aware agent over stdio. |
-| **Remote dispatch** ← *this* | [robot-md-dispatcher](https://github.com/RobotRegistryFoundation/robot-md-dispatcher) | **BYOK Claude Agent SDK dispatcher** — accepts tasks over HTTP, runs them through a local Claude agent, consumes `robot-md-mcp` unchanged. |
-| **Wire protocol** | [RCAN](https://rcan.dev/spec/) | How robots, gateways, and planners talk. |
-| **Registry** | [Robot Registry Foundation](https://robotregistryfoundation.org) | Permanent RRN identities. |
-| **Reference runtime** | [OpenCastor](https://github.com/craigm26/OpenCastor) | Open-source robot runtime. |
+| **1 — Declaration** | [robot-md](https://github.com/RobotRegistryFoundation/robot-md) | The ROBOT.md file + Python CLI. Declares identity, capabilities, safety gates. |
+| **2 — Agent runtime** | (any MCP host) | Claude Code, Codex, Gemini — plans actions, calls tools, never reaches actuators directly. |
+| **3 — Gateway / Enforcement** ← *this* | [robot-md-gateway](https://github.com/RobotRegistryFoundation/robot-md-gateway) | Mandatory exclusive path. Verifies signatures, applies policy, signs audit bundles. |
+| **4 — Robot-facing runtime** | [OpenCastor](https://github.com/craigm26/OpenCastor) | Productized open-core runtime. Embeds the gateway as its safety kernel. |
+| **5 — Protocol** | [rcan-spec](https://github.com/continuonai/rcan-spec) | Wire format, envelopes, conformance suite. |
+| **6 — Registry** | [Robot Registry Foundation](https://robotregistryfoundation.org) | Identity (RRN/RCN/RMN/RHN), public keys, evidence. |
 
-## Why not remote MCP?
+[See the live compatibility matrix →](https://rcan.dev/compatibility)
 
-Three shapes were considered; this repo is shape (c):
+## What it does
 
-| | (a) `--http` on robot-md-mcp | (b) Python shim around robot-md-mcp | (c) **Agent SDK dispatcher** |
-|---|---|---|---|
-| Reasoning runs at | Remote Claude surface | Remote Claude surface | **Robot host** |
-| Unit crossing the network | Every tool call + every result | Every tool call + every result | **Goal + final result** |
-| Upstream change required | Yes | None (shim) | **None (consumer)** |
-| Sensor data leaves the LAN | Yes | Yes | **No** |
-| Fits "fix upstream first" | Yes | No | **Yes** |
+The gateway accepts incoming **signed RCAN INVOKE envelopes** — never
+plaintext goals, never SDK sessions. Every envelope is checked for:
 
-`robot-md-mcp` remains a clean stdio server. The dispatcher *consumes* it; it does not wrap or mirror it.
+1. **Manifest provenance** — the ROBOT.md being actuated against has a verified signature from a key registered to this robot's RRN at RRF.
+2. **Tier + RBAC** — the caller's bearer token resolves to a tier authorized for this scope.
+3. **Tool allowlist** — the requested tool is in the operator's policy (default-deny on unknown).
+4. **Confidence + HiTL gates** *(Phase 4 — Plan 6)* — model-asserted confidence above threshold; human-in-the-loop approval if scope demands it.
+5. **Replay protection** *(Plan 6)* — envelope's nonce + timestamp not previously seen.
+6. **ESTOP precedence** *(Plan 6)* — physical or operator stop signal preempts any pending action.
 
-## How it works
+If all checks pass, the gateway dispatches to a local actuation tool
+(typically a robot-md-mcp tool call or a direct driver invocation) and
+emits a **signed audit bundle** entry per action. If any check fails,
+the action is denied and the failure is logged + signed.
 
-1. Caller POSTs to `/dispatch` with:
-   - `Authorization: Bearer <tier-token>` — determines **actuate** vs **read** tier
-   - `X-Anthropic-Api-Key: sk-ant-...` — the caller's own Anthropic key; inference bills to them
-   - Body `{"goal": "<natural language task>"}`
-2. The dispatcher spins up a **fresh** [`ClaudeSDKClient`](https://github.com/anthropics/claude-agent-sdk-python) for this request with `env={"ANTHROPIC_API_KEY": <caller_key>}`, `mcp_servers={"robot": {"type":"stdio","command":"robot-md-mcp"}}`, and a `system_prompt` that includes the full `ROBOT.md`.
-3. The agent loop runs on the robot host. Every tool invocation passes through two gates:
-   - `can_use_tool` — denies actuation tools (`estop`, `execute_task`, `record_skill`, ...) for read-tier callers. **Default-deny**: new tools added upstream are gated until you allowlist them.
-   - `PreToolUse` audit hook — writes `(caller, tier, key-fingerprint, tool, args)` to the journal.
-4. Agent messages stream back to the caller as NDJSON.
+## What it does not do
 
-## Quick start
+- ❌ **Spawn LLM planners.** That was the v0.2.x mode; it now ships as `--legacy-byok-launcher` for backward compat (deprecation-warned), removed in v0.4.0. Planners run in agent runtimes (Layer 2), separately, and produce signed envelopes that come *to* the gateway.
+- ❌ **Be optional.** If you can move the robot without going through the gateway, you don't have an enforcement gateway — you have a hint.
+- ❌ **Cover Layer 4.** Drivers, fleet UI, cloud bridge belong to OpenCastor (or any future Layer-4 runtime); not here.
+
+<!-- BEGIN: ecosystem authority disclaimer (canonical, verbatim per spec §10) -->
+> **Where safety is actually enforced.**
+>
+> Physical safety is enforced at Layer 3 (`robot-md-gateway`) or Layer 4 (a runtime that embeds it, e.g., OpenCastor). Declaration alone (Layer 1) does not enforce safety. Agent host alone (Layer 2) is not the safety boundary. If a deployment lacks Layer 3, no safety claim attaches to it.
+<!-- END: ecosystem authority disclaimer -->
+
+## Status (v0.3.0a1)
+
+This release lands the rename + scope-shift skeleton. The receive-only
+RCAN handler, manifest provenance verification (cert MF-001 / MF-002),
+and direct-device-bypass denial (cert GW-001) ship in upcoming patch
+releases under Plan 6. The legacy planner-launcher mode is preserved
+behind `--legacy-byok-launcher` for one minor release.
+
+## Installation
+
+```bash
+pip install robot-md-gateway
+```
+
+## Quick start (legacy mode, until receive-only ships)
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install robot-md-dispatcher robot-md   # robot-md-mcp ships with robot-md
-.venv/bin/robot-md-dispatcher init --yes
-.venv/bin/robot-md-dispatcher serve --bearers ./bearers.yaml --robot-md ./ROBOT.md
+.venv/bin/pip install robot-md-gateway robot-md   # robot-md-mcp ships with robot-md
+.venv/bin/robot-md-gateway init --yes
+.venv/bin/robot-md-gateway --legacy-byok-launcher serve \
+  --bearers ./bearers.yaml --robot-md ./ROBOT.md
 ```
 
 `init --yes` writes `bearers.yaml`, `.env`, and `dispatch-test.sh` next to your
 ROBOT.md and prints a generated actuate-tier token once. Save the token — it's
-not stored anywhere else. Run `robot-md-dispatcher init` (no `--yes`) for a
+not stored anywhere else. Run `robot-md-gateway init` (no `--yes`) for a
 guided walk that explains each knob.
-
-From a Claude Code session with the `robot-md-mcp` plugin enabled, you can
-alternatively run the slash command `/enable-dispatch` — it runs `init --yes`
-for you but does not print the generated token into the conversation.
-
-Dispatch a task:
-
-```bash
-curl -N http://127.0.0.1:8080/dispatch \
-  -H "Authorization: Bearer replace-me-actuate" \
-  -H "X-Anthropic-Api-Key: sk-ant-..." \
-  -H "Content-Type: application/json" \
-  -d '{"goal": "validate the manifest and describe what the robot can do"}'
-```
-
-The response is NDJSON — one JSON object per agent message. Tail it.
 
 ## Production install
 
-`systemd/install.sh` handles the full setup: dedicated `robot` system user, `/opt/robot-md-dispatcher/.venv` with hardened unit, `DeviceAllow=/dev/ttyACM0 rw`, `MemoryMax=1G`, `CPUQuota=80%`, journal logging.
+`systemd/install.sh` handles the full setup: dedicated `robot` system user, `/opt/robot-md-gateway/.venv` with hardened unit, `DeviceAllow=/dev/ttyACM0 rw`, `MemoryMax=1G`, `CPUQuota=80%`, journal logging.
 
-Run `robot-md-dispatcher init --yes` first (next to your `ROBOT.md`) to generate
+Run `robot-md-gateway init --yes` first (next to your `ROBOT.md`) to generate
 `bearers.yaml`, `.env`, and `dispatch-test.sh`. Then:
 
 ```bash
 sudo ./systemd/install.sh
-sudo cp ./bearers.yaml ./.env /etc/robot-md-dispatcher/
-sudo cp ./ROBOT.md /etc/robot-md-dispatcher/ROBOT.md
-sudo systemctl daemon-reload && sudo systemctl enable --now robot-md-dispatcher
+sudo cp ./bearers.yaml ./.env /etc/robot-md-gateway/
+sudo cp ./ROBOT.md /etc/robot-md-gateway/ROBOT.md
+sudo systemctl daemon-reload && sudo systemctl enable --now robot-md-gateway
 ```
 
 ### Ingress — do not port-forward
 
-The dispatcher binds to `127.0.0.1` by design. Expose it via Tailscale Funnel (named, revocable, TLS-terminated):
+The gateway binds to `127.0.0.1` by design. Expose it via Tailscale Funnel (named, revocable, TLS-terminated):
 
 ```bash
 tailscale serve --bg --https=443 http://127.0.0.1:8080
 tailscale funnel 443 on
 ```
-
-## Safety model
-
-- **Default-deny tier gate.** Read-tier callers can only invoke allowlisted observation tools (`render`, `validate`, `get_*`, `list_*`, `describe_*`, `vision_find`, `discover`, `status`). Every other tool — including `estop` and `estop_clear`, which are safety-critical but still disruptive — requires actuate-tier. Operators who want read-tier estop must install a custom policy.
-- **ROBOT.md is in the system prompt.** Claude sees every safety gate in the manifest on every dispatch. Gate violations are refused with an explanation.
-- **Resource rails.** `max_turns` and `max_budget_usd` are Pydantic-bounded; the systemd unit adds `MemoryMax`, `CPUQuota`, and `TasksMax` at the process level.
-- **Audit log.** Every tool call lands in the journal with the caller ID, tier, API-key fingerprint (sha256[:12], never the key itself), tool name, and args.
-- **No key persistence.** The caller's API key lives only in the per-request subprocess env and the in-memory `AuthContext`. It is never logged, stored, or forwarded.
-
-## BYOK and billing
-
-v0.1 is Bring Your Own Key: every caller supplies their own `sk-ant-...` and Anthropic bills them directly. This keeps the dispatcher out of the billing path entirely — you host the control plane, your users pay for the inference they request.
-
-A managed billing layer (shared keys, per-caller quotas, Stripe metering) is out of scope for this repo and belongs in downstream infrastructure; see [opencastor-ops](https://github.com/craigm26/opencastor-ops) for that shape.
 
 ## Configuration
 
@@ -118,9 +114,9 @@ Environment variables (also settable via CLI flags — flags win):
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `ROBOT_MD_PATH` | Path to the `ROBOT.md` loaded into the system prompt | unset |
+| `ROBOT_MD_PATH` | Path to the `ROBOT.md` loaded as the manifest under verification | unset |
 | `ROBOT_MD_BEARERS_FILE` | Path to `bearers.yaml` | **required** |
-| `ROBOT_MD_MCP_COMMAND` | Stdio MCP command the agent connects to | `robot-md-mcp` |
+| `ROBOT_MD_MCP_COMMAND` | Stdio MCP command the gateway dispatches to | `robot-md-mcp` |
 | `ROBOT_MD_MCP_ARGS` | Space-separated args for the MCP command | (none) |
 | `ROBOT_MD_LOG_LEVEL` | Python log level | `INFO` |
 
@@ -132,9 +128,7 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/ruff check src tests
 ```
 
-The test suite mocks the Claude Agent SDK boundary via a `ClientFactory` protocol, so `pytest` runs offline and does not require `claude` CLI, an API key, or the `claude-agent-sdk` package to actually function — only to import. The tier gate, auth, and HTTP surface are exercised end-to-end with a `TestClient`.
-
-Real tool names from `robot-md-mcp`'s server are pinned in `tests/test_gating.py`; if the upstream tool surface shifts in a way that inverts a read/actuate classification, the test fails loudly.
+The test suite mocks external SDK boundaries via Protocol shims, so `pytest` runs offline. The tier gate, auth, and HTTP surface are exercised end-to-end with a `TestClient`. Real tool names from `robot-md-mcp`'s server are pinned in `tests/test_gating.py`; if the upstream tool surface shifts in a way that inverts a read/actuate classification, the test fails loudly.
 
 ## License
 
