@@ -65,7 +65,7 @@ jobs:
 
       - uses: continuonai/rcan-spec/.github/actions/emit-version-tuple@v3.2.0
         with:
-          project: robot-md-dispatcher
+          project: robot-md-gateway
           ran: ${{ secrets.ROBOT_MD_DISPATCHER_RELEASE_RAN }}
           field: gateway_version
           value: ${{ env.VALUE }}
@@ -119,13 +119,13 @@ jobs:
         run: |
           if ! gh release view "${{ steps.tag.outputs.tag }}" >/dev/null 2>&1; then
             gh release create "${{ steps.tag.outputs.tag }}" \
-              --title "robot-md-dispatcher ${{ steps.tag.outputs.tag }}" \
+              --title "robot-md-gateway ${{ steps.tag.outputs.tag }}" \
               --generate-notes
           fi
 
       - uses: continuonai/rcan-spec/.github/actions/emit-version-tuple@v3.2.0
         with:
-          project: robot-md-dispatcher
+          project: robot-md-gateway
           ran: ${{ secrets.ROBOT_MD_DISPATCHER_RELEASE_RAN }}
           field: gateway_version
           value: ${{ steps.tag.outputs.version }}
