@@ -1,12 +1,14 @@
 """Gateway Authority cert-property report assembler.
 
-Phase 3 exercises only MF-001 / MF-002 / GW-001. The report assembler
-accumulates property pass/fail records in process memory and serializes
+Accumulates property pass/fail records in process memory and serializes
 them on demand to the JSON shape asserted by spec §5 —
 `gateway-authority-<repo>-<sha>.json`.
 
-Plan 6 expands the property set to all 12 and adds release-CI signing
-of the report. Phase 3 leaves the report unsigned but well-formed.
+Covers all 14 gateway-authority cert properties as of Plan 6 Phase 2:
+MF-001/002, GW-001/002/003, RC-001/002/003/004, SF-001/002, EV-001,
+RR-001/002. Signed at release time by `scripts/emit_gateway_authority_report.py`
+using the gateway's release Ed25519 key (`schema_version` 1.0); unsigned
+runs continue to write `schema_version` 0.1 for local/dev use.
 """
 
 from __future__ import annotations

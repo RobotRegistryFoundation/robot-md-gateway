@@ -35,7 +35,6 @@ def check_tool(tool_name: str, allowlist: ToolAllowlist, *, msg_id: str) -> tupl
 
 def check_tier(tier: str, scope: str, *, msg_id: str) -> tuple[bool, str]:
     """GW-003 — read-tier principal denied actuation."""
-    READ_ONLY_SCOPES = {"READ", "OBSERVE", "STATUS"}  # noqa: F841
     ACTUATION_SCOPES = {"MANIPULATE", "NAVIGATE", "ACTUATE", "EXECUTE"}
     if tier == "read" and scope in ACTUATION_SCOPES:
         cert_report.record_property_pass(

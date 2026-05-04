@@ -5,7 +5,8 @@ key's public-key PEM via an RRF resolver, and verifies the body
 signature. Returns a typed result.
 
 Signature footer format (transitional — to be reconciled with the
-robot-md spec's canonical scheme in Plan 6 Phase 1):
+robot-md spec once that side publishes a canonical signature scheme;
+not gated on any specific Plan 6 phase):
 
     <!-- ROBOT-MD-SIG kid=<kid> sig=<base64> -->
 
