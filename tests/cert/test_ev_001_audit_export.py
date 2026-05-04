@@ -52,11 +52,17 @@ def test_ev_001_malformed_signature_returns_false_not_raises():
     bundle = chain.export_signed(signing_key_pem=priv_pem, kid="gw")
 
     # Drop the "kid" subkey
-    bundle_no_kid = {**bundle, "signature": {k: v for k, v in bundle["signature"].items() if k != "kid"}}
+    bundle_no_kid = {
+        **bundle,
+        "signature": {k: v for k, v in bundle["signature"].items() if k != "kid"},
+    }
     assert verify_audit_bundle(bundle_no_kid, kid_to_pem={"gw": pub_pem}) is False
 
     # Drop the "sig" subkey
-    bundle_no_sig = {**bundle, "signature": {k: v for k, v in bundle["signature"].items() if k != "sig"}}
+    bundle_no_sig = {
+        **bundle,
+        "signature": {k: v for k, v in bundle["signature"].items() if k != "sig"},
+    }
     assert verify_audit_bundle(bundle_no_sig, kid_to_pem={"gw": pub_pem}) is False
 
 

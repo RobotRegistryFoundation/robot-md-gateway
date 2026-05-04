@@ -56,7 +56,14 @@ class AuditChain:
             "entries": [e.__dict__ for e in self.entries],
         }
         sig = priv.sign(canonical_json(body))
-        bundle = {**body, "signature": {"kid": kid, "alg": "Ed25519", "sig": base64.b64encode(sig).decode()}}
+        bundle = {
+            **body,
+            "signature": {
+                "kid": kid,
+                "alg": "Ed25519",
+                "sig": base64.b64encode(sig).decode(),
+            },
+        }
         cert_report.record_property_pass(
             property_id="EV-001",
             evidence={"entry_count": len(self.entries), "kid": kid, "outcome": "exported"},

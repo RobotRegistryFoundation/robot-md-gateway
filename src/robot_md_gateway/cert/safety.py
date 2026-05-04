@@ -41,12 +41,17 @@ class SafetyMonitor:
     def tick(self, *, now: float | None = None) -> None:
         """SF-002 — call regularly. Transition to SAFE_STOP on heartbeat staleness."""
         now = now if now is not None else time.monotonic()
-        if self.state == GatewayState.READY and (now - self.last_heartbeat_at) > self.heartbeat_staleness_s:
+        staleness = now - self.last_heartbeat_at
+        if self.state == GatewayState.READY and staleness > self.heartbeat_staleness_s:
             self.state = GatewayState.SAFE_STOP
             cert_report.record_property_pass(
                 property_id="SF-002",
-                evidence={"prev_state": "ready", "new_state": "safe_stop",
-                          "staleness_s": now - self.last_heartbeat_at, "outcome": "network_loss safe-stop"},
+                evidence={
+                    "prev_state": "ready",
+                    "new_state": "safe_stop",
+                    "staleness_s": staleness,
+                    "outcome": "network_loss safe-stop",
+                },
             )
 
     def can_actuate(self) -> bool:
