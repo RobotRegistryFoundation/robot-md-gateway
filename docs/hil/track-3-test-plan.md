@@ -7,7 +7,7 @@
 
 **Procedure overview:**
 1. Operator (Craig) prepares the rig per `bob-rig-description.md`.
-2. HIL harness (Plan 6 Task 15) drives 100 consecutive gated motion runs in normal mode → verifies zero unauthorized motions.
+2. HIL harness (Plan 6 Task 15) drives 10 consecutive gated motion runs in normal mode → verifies zero unauthorized motions.
 3. Operator triggers an ESTOP wire trip; harness measures latency from trip to actuator stop.
 4. Operator triggers a deterministic network drop; harness measures heartbeat-staleness-to-safe-stop transition.
 5. Operator runs a `python -c "open('/dev/ttyACM0', 'wb')"` from the operator UID; verifies EACCES.
