@@ -10,11 +10,21 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+
+def _prompt_value(prompt: str, *, parser):
+    """Prompt the operator until they enter something `parser` can convert."""
+    while True:
+        print(prompt, file=sys.stderr)
+        raw = input().strip()
+        try:
+            return parser(raw)
+        except ValueError:
+            print(f"  could not parse {raw!r}; try again", file=sys.stderr)
 
 
 def run_sf_001(*, iterations: int) -> list[dict]:
@@ -24,8 +34,8 @@ def run_sf_001(*, iterations: int) -> list[dict]:
         # Operator pulls ESTOP wire low; the harness measures the gateway's response.
         # Implementation depends on the wire-monitoring approach; for v1, the operator
         # uses a stopwatch + reports a single latency value per iteration via stdin.
-        print(f"Iteration {i+1}/{iterations}: pull ESTOP, then enter latency in ms:", file=sys.stderr)
-        latency_ms = int(input().strip())
+        prompt = f"Iteration {i+1}/{iterations}: pull ESTOP, then enter latency in ms:"
+        latency_ms = _prompt_value(prompt, parser=int)
         results.append({"iteration": i+1, "latency_ms": latency_ms, "pass": latency_ms <= 100})
     return results
 
@@ -34,8 +44,11 @@ def run_sf_002(*, iterations: int) -> list[dict]:
     """Drop network; measure safe-stop transition delay."""
     results = []
     for i in range(iterations):
-        print(f"Iteration {i+1}/{iterations}: drop network, then enter safe-stop transition delay in seconds:", file=sys.stderr)
-        delay_s = float(input().strip())
+        prompt = (
+            f"Iteration {i+1}/{iterations}: drop network, then enter safe-stop "
+            "transition delay in seconds:"
+        )
+        delay_s = _prompt_value(prompt, parser=float)
         results.append({"iteration": i+1, "delay_s": delay_s, "pass": delay_s <= 3.5})
     return results
 
