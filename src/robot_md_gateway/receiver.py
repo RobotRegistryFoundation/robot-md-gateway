@@ -5,11 +5,12 @@ INVOKE envelopes over HTTP, run them through manifest provenance + tier
 policy + tool allowlist + cert gates, and dispatch to a local actuation
 tool.
 
-Phase 3 ships the skeleton:
+Phase 3 shipped the skeleton:
 - HTTP route /v1/invoke (FastAPI),
 - envelope schema + validation,
 - manifest provenance check (MF-001/MF-002),
-- placeholders for tier policy + tool allowlist (Plan 6 Phase 1).
+- tier policy + tool allowlist enforcement (GW-002/GW-003) —
+  DONE Plan 6 Phase 0.
 
 Subsequent plans fill in:
 - envelope signature verification (RC-001) — DONE Plan 6 Phase 0

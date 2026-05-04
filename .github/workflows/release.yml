@@ -121,6 +121,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
       - name: Run full test suite + emit signed gateway-authority report
+        # Note: secret store names predate the Plan 3 dispatcher→gateway rename,
+        # so they keep the ROBOT_MD_DISPATCHER_RELEASE_* prefix even though
+        # the package + repo are now `robot-md-gateway`. Same key material;
+        # rotate via the existing ROBOT_MD_DISPATCHER_RELEASE_* secret entries.
         env:
           GATEWAY_RELEASE_PRIV: ${{ secrets.ROBOT_MD_DISPATCHER_RELEASE_PRIV }}
           GATEWAY_RELEASE_KID: ${{ secrets.ROBOT_MD_DISPATCHER_RELEASE_KID }}
