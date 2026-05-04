@@ -90,7 +90,7 @@ def make_app(
     # constructed fresh on every call (which would defeat caching entirely).
     if revocation_resolver is not None and revocation_cache is None:
         revocation_cache = RevocationCache()
-    app = FastAPI(title="robot-md-gateway", version="0.3.0a1")
+    app = FastAPI(title="robot-md-gateway", version="0.4.0a1")
     # Operators access these via app.state for ESTOP wire integration,
     # heartbeat injection, and audit-bundle export. ESTOP and heartbeat are
     # conceptually GPIO/transport-level signals — not exposed as HTTP routes
