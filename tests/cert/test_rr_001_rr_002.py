@@ -82,3 +82,60 @@ def test_rr_002_mismatch_detected():
     assert not round_trip_register(
         registrar=FailingReg(), kid="x", public_key_pem=b"PEM",
     )
+    rr_002 = [
+        p for p in cert_report._GLOBAL_REPORT.properties if p.property_id == "RR-002"
+    ]
+    assert len(rr_002) == 1
+    assert rr_002[0].outcome == "fail"
+    assert rr_002[0].evidence["outcome"] == "mismatch"
+
+
+def test_rr_001_records_on_cache_hit_path():
+    """Cache hits are a third exit path — must also record."""
+    class R:
+        def is_revoked(self, kid):
+            return False
+
+    cache = RevocationCache(ttl_s=60.0)
+    cache.is_revoked("k1", resolver=R())  # miss -> resolver
+    cache.is_revoked("k1", resolver=R())  # hit -> cache
+    rr_001 = [
+        p for p in cert_report._GLOBAL_REPORT.properties if p.property_id == "RR-001"
+    ]
+    assert len(rr_001) == 2
+    sources = [p.evidence.get("source") for p in rr_001]
+    assert sources == ["resolver", "cache"]
+
+
+def test_rr_001_resolver_none_raises():
+    """None from resolver is 'unresolvable' — must raise, not silently allow."""
+    class R:
+        def is_revoked(self, kid):
+            return None
+
+    cache = RevocationCache()
+    with pytest.raises(RuntimeError, match="cannot determine status"):
+        cache.is_revoked("k1", resolver=R())
+    rr_001 = [
+        p for p in cert_report._GLOBAL_REPORT.properties if p.property_id == "RR-001"
+    ]
+    assert len(rr_001) == 1
+    assert rr_001[0].outcome == "fail"
+    assert rr_001[0].evidence["outcome"] == "unresolvable"
+
+
+def test_rr_001_resolver_exception_records_fail():
+    """Resolver exceptions must record record_property_fail before propagating."""
+    class FlakyResolver:
+        def is_revoked(self, kid):
+            raise ConnectionError("RRF unreachable")
+
+    cache = RevocationCache()
+    with pytest.raises(ConnectionError):
+        cache.is_revoked("k1", resolver=FlakyResolver())
+    rr_001 = [
+        p for p in cert_report._GLOBAL_REPORT.properties if p.property_id == "RR-001"
+    ]
+    assert len(rr_001) == 1
+    assert rr_001[0].outcome == "fail"
+    assert rr_001[0].evidence["outcome"] == "error"

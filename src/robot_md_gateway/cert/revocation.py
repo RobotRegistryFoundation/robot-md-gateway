@@ -23,17 +23,52 @@ class RevocationCache:
     def is_revoked(self, kid: str, *, resolver: RRFRevocationResolver) -> bool:
         now = time.monotonic()
         cached = self._cache.get(kid)
-        if cached and (now - cached[0]) < self.ttl_s:
-            return cached[1]
-        revoked = bool(resolver.is_revoked(kid))
-        self._cache[kid] = (now, revoked)
         # Phase 1 audit-trail convention: record on EVERY exit path with
         # outcome captured in evidence (matches cert/gates.py + cert/safety.py).
+        # Four exit paths: cache-hit (pass), resolver-error (fail+raise),
+        # resolver-None (fail+raise), resolver-bool (pass). All must record.
+        if cached and (now - cached[0]) < self.ttl_s:
+            cert_report.record_property_pass(
+                property_id="RR-001",
+                evidence={
+                    "kid": kid,
+                    "outcome": "denied (revoked)" if cached[1] else "allowed (not revoked)",
+                    "source": "cache",
+                },
+            )
+            return cached[1]
+        try:
+            raw = resolver.is_revoked(kid)
+        except Exception as exc:
+            cert_report.record_property_fail(
+                property_id="RR-001",
+                evidence={
+                    "kid": kid,
+                    "outcome": "error",
+                    "error": str(exc),
+                    "source": "resolver",
+                },
+            )
+            raise
+        if raw is None:
+            # Fail-closed: a None response means RRF couldn't tell us.
+            # Allowing the request would be fail-open on a safety gateway.
+            cert_report.record_property_fail(
+                property_id="RR-001",
+                evidence={"kid": kid, "outcome": "unresolvable", "source": "resolver"},
+            )
+            raise RuntimeError(
+                f"revocation resolver returned None for kid {kid!r}; "
+                f"cannot determine status (treat as failure to verify)"
+            )
+        revoked = raw  # already a bool
+        self._cache[kid] = (now, revoked)
         cert_report.record_property_pass(
             property_id="RR-001",
             evidence={
                 "kid": kid,
                 "outcome": "denied (revoked)" if revoked else "allowed (not revoked)",
+                "source": "resolver",
             },
         )
         return revoked
@@ -44,8 +79,14 @@ def round_trip_register(*, registrar, kid: str, public_key_pem: bytes) -> bool:
     registrar.register(kid=kid, public_key_pem=public_key_pem)
     resolved = registrar.resolve(kid)
     ok = resolved == public_key_pem
-    cert_report.record_property_pass(
-        property_id="RR-002",
-        evidence={"kid": kid, "outcome": "ok" if ok else "mismatch"},
-    )
+    if ok:
+        cert_report.record_property_pass(
+            property_id="RR-002",
+            evidence={"kid": kid, "outcome": "ok"},
+        )
+    else:
+        cert_report.record_property_fail(
+            property_id="RR-002",
+            evidence={"kid": kid, "outcome": "mismatch"},
+        )
     return ok

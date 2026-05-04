@@ -152,6 +152,46 @@ def test_unrevoked_kid_passes(env_keypair):
     assert rr_001[0].evidence["outcome"] == "allowed (not revoked)"
 
 
+def test_revocation_cache_shared_across_requests(env_keypair):
+    """Cache must persist across requests when revocation_resolver is provided.
+
+    Regression for the receiver-level bug where revocation_cache=None caused
+    a fresh RevocationCache() to be built per request, defeating the TTL.
+    """
+    priv, pub_pem = env_keypair
+    calls = []
+
+    class CountingResolver:
+        def is_revoked(self, kid):
+            calls.append(kid)
+            return False
+
+    client, _ = _client(
+        env_pub_pem=pub_pem, revocation_resolver=CountingResolver(),
+    )
+    r1 = client.post(
+        "/v1/invoke",
+        headers={"Authorization": "Bearer actuate-token"},
+        json=_signed_envelope(priv, msg_id="msg-cache-1"),
+    )
+    assert r1.status_code == 200
+    r2 = client.post(
+        "/v1/invoke",
+        headers={"Authorization": "Bearer actuate-token"},
+        json=_signed_envelope(priv, msg_id="msg-cache-2"),
+    )
+    assert r2.status_code == 200
+    # Resolver should be called exactly once — second request hits cache.
+    assert calls == [ENV_KID]
+    rr_001 = [
+        p for p in cert_report._GLOBAL_REPORT.properties if p.property_id == "RR-001"
+    ]
+    # Two RR-001 records: one from resolver, one from cache.
+    assert len(rr_001) == 2
+    sources = [p.evidence.get("source") for p in rr_001]
+    assert sources == ["resolver", "cache"]
+
+
 def test_revocation_not_checked_without_envelope_signature_required(env_keypair):
     """When require_envelope_signature=False, env_result.kid is unknown — no RR-001."""
     priv, pub_pem = env_keypair

@@ -84,6 +84,12 @@ def make_app(
     bearer_tiers = bearer_tiers or {}
     if replay_cache is None:
         replay_cache = ReplayCache()
+    # Default the revocation cache at make_app level (parallel to replay_cache):
+    # if the operator opts into revocation_resolver but doesn't pass an explicit
+    # cache, build one here so it's shared across requests instead of being
+    # constructed fresh on every call (which would defeat caching entirely).
+    if revocation_resolver is not None and revocation_cache is None:
+        revocation_cache = RevocationCache()
     app = FastAPI(title="robot-md-gateway", version="0.3.0a1")
     # Operators access these via app.state for ESTOP wire integration,
     # heartbeat injection, and audit-bundle export. ESTOP and heartbeat are
@@ -152,23 +158,23 @@ def make_app(
                     "deny": "replay",
                     "reason": reason,
                 })
-            if revocation_resolver is not None:
-                cache = (
-                    revocation_cache if revocation_cache is not None else RevocationCache()
-                )
-                if env_result.kid and cache.is_revoked(
+            if (
+                revocation_resolver is not None
+                and env_result.kid
+                and revocation_cache.is_revoked(
                     env_result.kid, resolver=revocation_resolver,
-                ):
-                    _record(
-                        "deny",
-                        f"revoked_key: kid={env_result.kid}",
-                        env_result.kid,
-                        raw_msg_id,
-                    )
-                    raise HTTPException(status_code=403, detail={
-                        "deny": "revoked_key",
-                        "reason": f"kid {env_result.kid} is revoked",
-                    })
+                )
+            ):
+                _record(
+                    "deny",
+                    f"revoked_key: kid={env_result.kid}",
+                    env_result.kid,
+                    raw_msg_id,
+                )
+                raise HTTPException(status_code=403, detail={
+                    "deny": "revoked_key",
+                    "reason": f"kid {env_result.kid} is revoked",
+                })
 
         try:
             envelope = InvokeEnvelope(**envelope_dict)
