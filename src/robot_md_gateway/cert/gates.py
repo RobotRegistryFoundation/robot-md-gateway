@@ -34,10 +34,18 @@ def check_confidence(envelope: dict, policy: ConfidencePolicy) -> tuple[bool, st
     if confidence < threshold:
         cert_report.record_property_pass(
             property_id="RC-003",
-            evidence={"msg_id": envelope.get("msg_id"), "scope": envelope.get("scope"),
-                      "confidence": confidence, "threshold": threshold, "outcome": "denied (below threshold)"},
+            evidence={
+                "msg_id": envelope.get("msg_id"),
+                "scope": envelope.get("scope"),
+                "confidence": confidence,
+                "threshold": threshold,
+                "outcome": "denied (below threshold)",
+            },
         )
-        return False, f"confidence {confidence} below threshold {threshold} for scope {envelope.get('scope')}"
+        return False, (
+            f"confidence {confidence} below threshold {threshold} "
+            f"for scope {envelope.get('scope')}"
+        )
     cert_report.record_property_pass(
         property_id="RC-003",
         evidence={"msg_id": envelope.get("msg_id"), "scope": envelope.get("scope"),
@@ -65,7 +73,11 @@ def check_hitl(envelope: dict, policy: HiTLPolicy) -> tuple[bool, str]:
     if not chain:
         cert_report.record_property_pass(
             property_id="RC-004",
-            evidence={"msg_id": envelope.get("msg_id"), "scope": scope, "outcome": "denied (no HiTL chain)"},
+            evidence={
+                "msg_id": envelope.get("msg_id"),
+                "scope": scope,
+                "outcome": "denied (no HiTL chain)",
+            },
         )
         return False, f"scope {scope} requires HiTL but envelope has no delegation_chain"
     last = chain[-1]
@@ -76,7 +88,10 @@ def check_hitl(envelope: dict, policy: HiTLPolicy) -> tuple[bool, str]:
                       "chain_final_scope": last.get("scope"),
                       "outcome": "denied (delegation_chain final scope mismatch)"},
         )
-        return False, f"HiTL delegation_chain final scope {last.get('scope')} ≠ requested scope {scope}"
+        return False, (
+            f"HiTL delegation_chain final scope {last.get('scope')} ≠ "
+            f"requested scope {scope}"
+        )
     if not last.get("human_subject"):
         cert_report.record_property_pass(
             property_id="RC-004",
@@ -86,7 +101,11 @@ def check_hitl(envelope: dict, policy: HiTLPolicy) -> tuple[bool, str]:
         return False, "HiTL delegation_chain missing human_subject"
     cert_report.record_property_pass(
         property_id="RC-004",
-        evidence={"msg_id": envelope.get("msg_id"), "scope": scope, "human": last.get("human_subject"),
-                  "outcome": "allowed"},
+        evidence={
+            "msg_id": envelope.get("msg_id"),
+            "scope": scope,
+            "human": last.get("human_subject"),
+            "outcome": "allowed",
+        },
     )
     return True, "ok"
