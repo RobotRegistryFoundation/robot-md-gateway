@@ -10,7 +10,7 @@
 2. HIL harness (Plan 6 Task 15) drives 10 consecutive gated motion runs in normal mode → verifies zero unauthorized motions.
 3. Operator triggers an ESTOP wire trip; harness measures latency from trip to actuator stop.
 4. Operator triggers a deterministic network drop; harness measures heartbeat-staleness-to-safe-stop transition.
-5. Operator runs a `python -c "open('/dev/ttyACM0', 'wb')"` from the operator UID; verifies EACCES.
+5. Operator runs a `python3 -c "open('/dev/ttyACM0', 'wb')"` from the operator UID; verifies EACCES.
 6. Harness emits `hil-runtime-so-arm101-bob-<sha>.json` signed by both the rig key + the witness key.
 
 **Pass/fail criteria:**
