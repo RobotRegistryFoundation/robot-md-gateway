@@ -20,7 +20,8 @@ Subsequent plans fill in:
 - ESTOP precedence (SF-001) + safe-stop (SF-002) — DONE Plan 6 Phase 4
   (opt-in via safety_monitor),
 - audit bundle export (EV-001) — DONE Plan 6 Phase 4 (opt-in via audit_chain),
-- key revocation polling (RR-001 / RR-002) — Plan 6 Phase 2.
+- key revocation polling (RR-001 / RR-002) — DONE Plan 6 Phase 2
+  (opt-in via revocation_resolver).
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from .cert.audit import AuditChain, AuditEntry
 from .cert.envelope import ReplayCache, check_replay, verify_envelope
 from .cert.gates import ConfidencePolicy, HiTLPolicy, check_confidence, check_hitl
 from .cert.policy import ToolAllowlist, check_tier, check_tool
+from .cert.revocation import RevocationCache, RRFRevocationResolver
 from .cert.safety import SafetyMonitor
 from .manifest_provenance import RRFResolver, verify_manifest
 
@@ -74,12 +76,20 @@ def make_app(
     hitl_policy: HiTLPolicy | None = None,
     safety_monitor: SafetyMonitor | None = None,
     audit_chain: AuditChain | None = None,
+    revocation_resolver: RRFRevocationResolver | None = None,
+    revocation_cache: RevocationCache | None = None,
 ) -> FastAPI:
     if tool_allowlist is None:
         tool_allowlist = _DEFAULT_ALLOWLIST
     bearer_tiers = bearer_tiers or {}
     if replay_cache is None:
         replay_cache = ReplayCache()
+    # Default the revocation cache at make_app level (parallel to replay_cache):
+    # if the operator opts into revocation_resolver but doesn't pass an explicit
+    # cache, build one here so it's shared across requests instead of being
+    # constructed fresh on every call (which would defeat caching entirely).
+    if revocation_resolver is not None and revocation_cache is None:
+        revocation_cache = RevocationCache()
     app = FastAPI(title="robot-md-gateway", version="0.3.0a1")
     # Operators access these via app.state for ESTOP wire integration,
     # heartbeat injection, and audit-bundle export. ESTOP and heartbeat are
@@ -88,6 +98,7 @@ def make_app(
     # HTTP-layer auth.
     app.state.safety_monitor = safety_monitor
     app.state.audit_chain = audit_chain
+    app.state.revocation_cache = revocation_cache
 
     def _record(decision: str, reason: str, kid: str | None, msg_id: str) -> None:
         if audit_chain is None:
@@ -146,6 +157,23 @@ def make_app(
                 raise HTTPException(status_code=403, detail={
                     "deny": "replay",
                     "reason": reason,
+                })
+            if (
+                revocation_resolver is not None
+                and env_result.kid
+                and revocation_cache.is_revoked(
+                    env_result.kid, resolver=revocation_resolver,
+                )
+            ):
+                _record(
+                    "deny",
+                    f"revoked_key: kid={env_result.kid}",
+                    env_result.kid,
+                    raw_msg_id,
+                )
+                raise HTTPException(status_code=403, detail={
+                    "deny": "revoked_key",
+                    "reason": f"kid {env_result.kid} is revoked",
                 })
 
         try:
@@ -235,7 +263,7 @@ def make_app(
             "manifest_kid": manifest_result.kid,
             "scope": envelope.scope,
             "tool_name": envelope.tool_name,
-            "next_gates": ["RR-001", "RR-002"],
+            "next_gates": [],
         }
 
     return app

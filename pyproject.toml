@@ -25,6 +25,7 @@ classifiers = [
 ]
 dependencies = [
     "claude-agent-sdk>=0.1",
+    "cryptography>=41",  # Ed25519 signing in cert/* + emit script
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "python-frontmatter>=1.0",
