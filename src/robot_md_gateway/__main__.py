@@ -9,6 +9,21 @@ from pathlib import Path
 from .cert.policy import ToolAllowlist
 
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _require_envelope_signature_from_env() -> bool:
+    """Read ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE from env. Defaults to False.
+
+    Recognized true values: 1 / true / yes / on (case-insensitive).
+    Any other value (including empty) is False — preserves the receiver's
+    development-mode default while letting production deployments turn the
+    gate on without code changes.
+    """
+    raw = os.environ.get("ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE", "")
+    return raw.strip().lower() in _TRUTHY
+
+
 def _build_tool_allowlist_from_env() -> ToolAllowlist | None:
     """Read ROBOT_MD_TOOL_ALLOWLIST (comma-separated) into a ToolAllowlist.
 
@@ -120,9 +135,11 @@ def main() -> None:
             from .auth import RRFResolverFromEnv
             from .receiver import make_app
             tool_allowlist = _build_tool_allowlist_from_env()
+            require_envelope_signature = _require_envelope_signature_from_env()
             fastapi_app = make_app(
                 resolver=RRFResolverFromEnv.from_env(),
                 tool_allowlist=tool_allowlist,
+                require_envelope_signature=require_envelope_signature,
             )
 
         uvicorn.run(fastapi_app, host=args.host, port=args.port)

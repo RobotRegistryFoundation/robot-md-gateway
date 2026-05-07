@@ -121,8 +121,21 @@ class RRFResolverFromEnv:
         import json
         import urllib.request
         url = f"{self._base}/v2/keys/{kid}"
+        # Cloudflare in front of robotregistryfoundation.org rejects requests
+        # with the default Python-urllib/* User-Agent (HTTP 403). Send a
+        # distinct, identifying UA the WAF allows. Includes the gateway version
+        # so prod log analysis can correlate kid-resolution patterns with
+        # gateway releases.
         try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
+            from . import __version__ as _ver  # type: ignore[attr-defined]
+        except Exception:
+            _ver = "unknown"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": f"robot-md-gateway/{_ver} (+kid-resolver)"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 if resp.status != 200:
                     return None
                 payload = json.loads(resp.read())
