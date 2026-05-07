@@ -6,6 +6,25 @@ import os
 import sys
 from pathlib import Path
 
+from .cert.policy import ToolAllowlist
+
+
+def _build_tool_allowlist_from_env() -> ToolAllowlist | None:
+    """Read ROBOT_MD_TOOL_ALLOWLIST (comma-separated) into a ToolAllowlist.
+
+    Returns None when the env var is unset, empty, or contains only whitespace.
+    Operators wire this via /etc/robot-md-gateway/gateway.env (or equivalent),
+    e.g.: ROBOT_MD_TOOL_ALLOWLIST=mcp__robot__execute_capability,mcp__robot__render
+    Empty/whitespace entries between commas are dropped silently.
+    """
+    raw = os.environ.get("ROBOT_MD_TOOL_ALLOWLIST")
+    if not raw:
+        return None
+    tools = tuple(t.strip() for t in raw.split(",") if t.strip())
+    if not tools:
+        return None
+    return ToolAllowlist(allowed_tools=tools)
+
 
 class _LegacyByokAction(argparse.Action):
     """Print a deprecation banner to stderr the moment --legacy-byok-launcher is parsed.
@@ -100,7 +119,11 @@ def main() -> None:
         else:
             from .auth import RRFResolverFromEnv
             from .receiver import make_app
-            fastapi_app = make_app(resolver=RRFResolverFromEnv.from_env())
+            tool_allowlist = _build_tool_allowlist_from_env()
+            fastapi_app = make_app(
+                resolver=RRFResolverFromEnv.from_env(),
+                tool_allowlist=tool_allowlist,
+            )
 
         uvicorn.run(fastapi_app, host=args.host, port=args.port)
         return
