@@ -8,7 +8,6 @@ from pathlib import Path
 
 from .cert.policy import ToolAllowlist
 
-
 _TRUTHY = {"1", "true", "yes", "on"}
 
 

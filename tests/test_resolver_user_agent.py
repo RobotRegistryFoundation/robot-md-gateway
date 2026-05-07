@@ -7,7 +7,7 @@ denies in the gateway. The fix is to send a proper UA.
 """
 from __future__ import annotations
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from robot_md_gateway.auth import RRFResolverFromEnv
 
@@ -28,9 +28,10 @@ def test_resolver_sends_user_agent_header():
             return None
 
         def read(self):
-            return b'{"public_key_pem": "-----BEGIN PUBLIC KEY-----\\nabc\\n-----END PUBLIC KEY-----\\n"}'
+            pem = "-----BEGIN PUBLIC KEY-----\\nabc\\n-----END PUBLIC KEY-----\\n"
+            return f'{{"public_key_pem": "{pem}"}}'.encode()
 
-    def _fake_urlopen(req, timeout=None):  # noqa: ARG001
+    def _fake_urlopen(req, timeout=None):
         captured_request["url"] = req.full_url
         captured_request["headers"] = dict(req.headers)
         return _FakeResponse()
@@ -63,9 +64,10 @@ def test_resolver_caches_pem_after_first_fetch():
             return None
 
         def read(self):
-            return b'{"public_key_pem": "-----BEGIN PUBLIC KEY-----\\nabc\\n-----END PUBLIC KEY-----\\n"}'
+            pem = "-----BEGIN PUBLIC KEY-----\\nabc\\n-----END PUBLIC KEY-----\\n"
+            return f'{{"public_key_pem": "{pem}"}}'.encode()
 
-    def _fake_urlopen(req, timeout=None):  # noqa: ARG001
+    def _fake_urlopen(req, timeout=None):
         call_count["n"] += 1
         return _FakeResponse()
 
@@ -84,7 +86,7 @@ def test_resolver_returns_none_on_403():
     class _FakeError(Exception):
         pass
 
-    def _fake_urlopen(req, timeout=None):  # noqa: ARG001
+    def _fake_urlopen(req, timeout=None):
         import urllib.error
         raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, None)
 
