@@ -158,6 +158,7 @@ def run_phase_5(
             first_failure = i + 1
 
     operator_kid = envelopes[0]["envelope_signature"]["kid"] if envelopes else "unknown"
+    gm_all_pass = all(r["pass"] for r in results)
     gm_body = {
         "schema_version": "1.0",
         "property_id": f"bob.local/GATED-MOTION-{gated_motion_count}",
@@ -167,6 +168,7 @@ def run_phase_5(
         "ran_at": time.time(),
         "operator_kid": operator_kid,
         "iterations": len(results),
+        "all_pass": gm_all_pass,
         "trajectory": {
             "joints": ["wrist_pan"],
             "waypoints_deg": [30, 0, -30, 0],
@@ -175,7 +177,7 @@ def run_phase_5(
         },
         "results": results,
         "summary": {
-            "all_pass": all(r["pass"] for r in results),
+            "all_pass": gm_all_pass,
             "pass_count": sum(1 for r in results if r["pass"]),
             "fail_count": sum(1 for r in results if not r["pass"]),
             "first_failure_iteration": first_failure,
@@ -217,6 +219,10 @@ def run_phase_5(
                 "pass": False,
             })
 
+    rp_all_denied = (
+        len(replays) == len(replay_indices)
+        and all(r["pass"] for r in replays)
+    )
     rp_body = {
         "schema_version": "1.0",
         "property_id": f"bob.local/REPLAY-{replay_count}",
@@ -224,13 +230,12 @@ def run_phase_5(
         "robot_class": "so-arm101",
         "rrn": "RRN-000000000002",
         "ran_at": time.time(),
+        "iterations": len(replays),
+        "all_pass": rp_all_denied,
         "linked_msg_ids_from_gated_motion": [envelopes[i - 1]["msg_id"] for i in replay_indices],
         "replays": replays,
         "summary": {
-            "all_denied": (
-                len(replays) == len(replay_indices)
-                and all(r["pass"] for r in replays)
-            ),
+            "all_denied": rp_all_denied,
             "denied_count": sum(1 for r in replays if r["pass"]),
             "fail_count": sum(1 for r in replays if not r["pass"]),
         },
