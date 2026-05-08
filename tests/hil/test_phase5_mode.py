@@ -171,3 +171,69 @@ def test_phase5_emits_both_files_on_mid_run_failure(tmp_path):
     # Both bodies returned (not None / not raising)
     assert gm_body["property_id"] == "bob.local/GATED-MOTION-5"
     assert rp_body["property_id"] == "bob.local/REPLAY-1"
+
+
+def test_phase5_bodies_have_top_level_certintake_fields(tmp_path):
+    """Regression: RRF /v2/cert-intake v10 handler validates all_pass + iterations
+    at the top level (functions/v2/cert-intake/handlers/v10.ts:54-61). Both PHASE-5
+    bodies must expose them top-level — not only under summary — or POST 400s.
+    Caught 2026-05-08 during Plan 6 Phase 5 Task 8 closure (RobotRegistryFoundation/
+    opencastor-ops Amendment A3).
+    """
+    bundle_path = tmp_path / "b.json"
+    bundle_path.write_text(json.dumps(_bundle(10)))
+
+    seen: set[str] = set()
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body["msg_id"] in seen:
+            return httpx.Response(403, json={"detail": {"deny": "replay"}})
+        seen.add(body["msg_id"])
+        return httpx.Response(200, json={"status": "ok"})
+    transport = httpx.MockTransport(handler)
+
+    gm_body, rp_body = hil_run.run_phase_5(
+        envelope_file=bundle_path,
+        gated_motion_count=10,
+        replay_count=2,
+        gateway_url="http://test",
+        latency_budget_ms=5000,
+        http_client_factory=lambda: httpx.Client(transport=transport),
+    )
+
+    # Gated-motion body — required top-level fields per v10 handler
+    assert gm_body["all_pass"] is True
+    assert isinstance(gm_body["iterations"], int)
+    assert gm_body["iterations"] == 10
+    # Top-level all_pass must agree with summary.all_pass
+    assert gm_body["all_pass"] == gm_body["summary"]["all_pass"]
+
+    # Replay body — required top-level fields per v10 handler
+    assert rp_body["all_pass"] is True  # all denied → property holds
+    assert isinstance(rp_body["iterations"], int)
+    assert rp_body["iterations"] == 2  # len(replays), not gated_motion_count
+    # Top-level all_pass must agree with summary.all_denied (replay semantics)
+    assert rp_body["all_pass"] == rp_body["summary"]["all_denied"]
+
+
+def test_phase5_replay_top_level_all_pass_false_when_cache_broken(tmp_path):
+    """If the gateway returns 200 to a replay (cache broken), top-level all_pass
+    on the replay body must be False — matching summary.all_denied. Validates the
+    error path of Amendment A3."""
+    bundle_path = tmp_path / "b.json"
+    bundle_path.write_text(json.dumps(_bundle(5)))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "ok"})
+    transport = httpx.MockTransport(handler)
+
+    _, rp_body = hil_run.run_phase_5(
+        envelope_file=bundle_path,
+        gated_motion_count=5,
+        replay_count=2,
+        gateway_url="http://test",
+        latency_budget_ms=5000,
+        http_client_factory=lambda: httpx.Client(transport=transport),
+    )
+    assert rp_body["all_pass"] is False
+    assert rp_body["all_pass"] == rp_body["summary"]["all_denied"]
