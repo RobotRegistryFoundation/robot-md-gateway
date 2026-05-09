@@ -154,7 +154,7 @@ def main() -> None:
             from .app import create_app_from_env
             fastapi_app = create_app_from_env()
         else:
-            from .auth import RRFResolverFromEnv
+            from .auth import RRFResolverFromEnv, BearerStore
             from .receiver import make_app
             from .actuator import resolve_actuator
             from .auth import load_actuator_section
@@ -162,6 +162,17 @@ def main() -> None:
 
             tool_allowlist = _build_tool_allowlist_from_env()
             require_envelope_signature = _require_envelope_signature_from_env()
+
+            # Load bearer tiers from bearers.yaml if provided.
+            bearer_tiers: dict[str, str] = {}
+            if args.bearers:
+                store = BearerStore.from_yaml(_P(args.bearers))
+                # _by_token is the canonical map; build a name → tier dict.
+                bearer_tiers = {
+                    token: entry.tier
+                    for token, entry in store._by_token.items()
+                }
+
             actuator_section = load_actuator_section(_P(args.bearers)) if args.bearers else {"name": "noop", "config": {}}
             actuator_cls = resolve_actuator(actuator_section["name"])
             _validate_actuator_config(
@@ -175,6 +186,7 @@ def main() -> None:
                 require_envelope_signature=require_envelope_signature,
                 actuator=actuator_instance,
                 actuator_config=actuator_section["config"],
+                bearer_tiers=bearer_tiers,
             )
 
         uvicorn.run(fastapi_app, host=args.host, port=args.port)

@@ -127,3 +127,20 @@ class TestServeWiresActuator:
             actuator_cls=_EmptySchema,
             config={"anything": "goes"},
         )
+
+
+class TestServeBearerTiers:
+    def test_bearer_tiers_extracted_from_bearers_yaml(self, tmp_path):
+        # Smoke: build a bearer-tiers dict from a bearers.yaml the same way
+        # the serve path does. This documents the contract; the actual serve
+        # invocation isn't started in unit tests.
+        from robot_md_gateway.auth import BearerStore
+        bearers_path = tmp_path / "bearers.yaml"
+        bearers_path.write_text("""\
+- token: actuate-token
+  tier: actuate
+  caller: actuate-default
+""")
+        store = BearerStore.from_yaml(bearers_path)
+        bearer_tiers = {token: entry.tier for token, entry in store._by_token.items()}
+        assert bearer_tiers == {"actuate-token": "actuate"}
