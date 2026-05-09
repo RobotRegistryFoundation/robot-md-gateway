@@ -11,6 +11,19 @@ from .cert.policy import ToolAllowlist
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
+def _validate_actuator_config(*, actuator_cls: type, config: dict) -> None:
+    """Validate the actuator's config dict against its config_schema.
+
+    Raises jsonschema.ValidationError on mismatch. No-op when config_schema
+    is empty.
+    """
+    import jsonschema
+    schema = getattr(actuator_cls, "config_schema", None) or {}
+    if not schema:
+        return
+    jsonschema.validate(instance=config, schema=schema)
+
+
 def _require_envelope_signature_from_env() -> bool:
     """Read ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE from env. Defaults to False.
 
@@ -143,12 +156,25 @@ def main() -> None:
         else:
             from .auth import RRFResolverFromEnv
             from .receiver import make_app
+            from .actuator import resolve_actuator
+            from .auth import load_actuator_section
+            from pathlib import Path as _P
+
             tool_allowlist = _build_tool_allowlist_from_env()
             require_envelope_signature = _require_envelope_signature_from_env()
+            actuator_section = load_actuator_section(_P(args.bearers)) if args.bearers else {"name": "noop", "config": {}}
+            actuator_cls = resolve_actuator(actuator_section["name"])
+            _validate_actuator_config(
+                actuator_cls=actuator_cls,
+                config=actuator_section["config"],
+            )
+            actuator_instance = actuator_cls()
             fastapi_app = make_app(
                 resolver=RRFResolverFromEnv.from_env(),
                 tool_allowlist=tool_allowlist,
                 require_envelope_signature=require_envelope_signature,
+                actuator=actuator_instance,
+                actuator_config=actuator_section["config"],
             )
 
         uvicorn.run(fastapi_app, host=args.host, port=args.port)

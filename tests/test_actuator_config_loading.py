@@ -76,3 +76,54 @@ bearers:
 """)
         section = load_actuator_section(path)
         assert section == {"name": "noop", "config": {}}
+
+
+import jsonschema
+
+
+class _SchemaValidatedActuator:
+    name = "schema-checked"
+    description = "test schema validation"
+    config_schema = {
+        "type": "object",
+        "properties": {
+            "log_level": {"type": "string", "enum": ["INFO", "DEBUG", "WARNING"]},
+        },
+        "required": ["log_level"],
+    }
+    def execute(self, *, envelope, manifest_path, tier, config):
+        from robot_md_gateway.actuator import ActuatorOutcome
+        return ActuatorOutcome(success=True, outcome_kind="executed")
+
+
+class TestServeWiresActuator:
+    def test_validate_actuator_config_against_schema_passes(self):
+        from robot_md_gateway.__main__ import _validate_actuator_config
+
+        # Should NOT raise.
+        _validate_actuator_config(
+            actuator_cls=_SchemaValidatedActuator,
+            config={"log_level": "INFO"},
+        )
+
+    def test_validate_actuator_config_against_schema_rejects(self):
+        from robot_md_gateway.__main__ import _validate_actuator_config
+
+        with pytest.raises(jsonschema.ValidationError):
+            _validate_actuator_config(
+                actuator_cls=_SchemaValidatedActuator,
+                config={"log_level": "VERBOSE"},  # not in enum
+            )
+
+    def test_validate_actuator_config_with_empty_schema_skips(self):
+        from robot_md_gateway.__main__ import _validate_actuator_config
+
+        class _EmptySchema:
+            config_schema: dict = {}
+            def __init__(self): pass
+
+        # Should NOT raise even with arbitrary config.
+        _validate_actuator_config(
+            actuator_cls=_EmptySchema,
+            config={"anything": "goes"},
+        )

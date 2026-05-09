@@ -32,6 +32,7 @@ dependencies = [
     "pydantic>=2.6",
     "rcan>=3.4.0",
     "robot-md>=1.1",
+    "jsonschema>=4.0",
 ]
 
 [project.optional-dependencies]
