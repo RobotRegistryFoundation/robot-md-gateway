@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.0",
+  "exported_at": "2026-04-01T00:00:00+00:00",
+  "entry_count": 2,
+  "entries": [
+    {
+      "msg_id": "m1",
+      "timestamp_ms": 1700000000000,
+      "decision": "allow",
+      "decision_reason": "ok",
+      "envelope_kid": "fixture-kid",
+      "actuator_name": null,
+      "actuator_outcome_kind": null,
+      "actuator_telemetry_sha256": null,
+      "actuator_telemetry_path": null,
+      "actuator_error_kind": null,
+      "chain_prev": "0000000000000000000000000000000000000000000000000000000000000000",
+      "chain_hash": "PLACEHOLDER_FILLED_BY_TEST"
+    },
+    {
+      "msg_id": "m2",
+      "timestamp_ms": 1700000001000,
+      "decision": "deny",
+      "decision_reason": "tool_allowlist: denied",
+      "envelope_kid": "fixture-kid",
+      "actuator_name": null,
+      "actuator_outcome_kind": null,
+      "actuator_telemetry_sha256": null,
+      "actuator_telemetry_path": null,
+      "actuator_error_kind": null,
+      "chain_prev": "PLACEHOLDER_FILLED_BY_TEST",
+      "chain_hash": "PLACEHOLDER_FILLED_BY_TEST"
+    }
+  ],
+  "signature": {
+    "kid": "fixture-bundle-kid",
+    "alg": "Ed25519",
+    "sig": "PLACEHOLDER_FILLED_BY_TEST"
+  }
+}

@@ -11,6 +11,19 @@ from .cert.policy import ToolAllowlist
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
+def _validate_actuator_config(*, actuator_instance: object, config: dict) -> None:
+    """Validate the actuator's config dict against its config_schema.
+
+    Raises jsonschema.ValidationError on mismatch. No-op when config_schema
+    is empty.
+    """
+    import jsonschema
+    schema = getattr(actuator_instance, "config_schema", None) or {}
+    if not schema:
+        return
+    jsonschema.validate(instance=config, schema=schema)
+
+
 def _require_envelope_signature_from_env() -> bool:
     """Read ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE from env. Defaults to False.
 
@@ -110,6 +123,16 @@ def main() -> None:
         "(used by the Claude Code plugin slash command)",
     )
 
+    list_p = sub.add_parser(
+        "list-actuators",
+        help="List actuators discovered via the robot_md_gateway.actuators entry-point group.",
+    )
+    list_p.add_argument(
+        "--bearers",
+        help="Path to bearers.yaml (used to mark the currently-active actuator).",
+        default=None,
+    )
+
     args = parser.parse_args()
 
     if args.cmd == "serve":
@@ -131,14 +154,39 @@ def main() -> None:
             from .app import create_app_from_env
             fastapi_app = create_app_from_env()
         else:
-            from .auth import RRFResolverFromEnv
+            from .auth import RRFResolverFromEnv, BearerStore
             from .receiver import make_app
+            from .actuator import resolve_actuator
+            from .auth import load_actuator_section
+            from pathlib import Path as _P
+
             tool_allowlist = _build_tool_allowlist_from_env()
             require_envelope_signature = _require_envelope_signature_from_env()
+
+            # Load bearer tiers from bearers.yaml if provided.
+            bearer_tiers: dict[str, str] = {}
+            if args.bearers:
+                store = BearerStore.from_yaml(_P(args.bearers))
+                # _by_token is the canonical map; build a name → tier dict.
+                bearer_tiers = {
+                    token: entry.tier
+                    for token, entry in store._by_token.items()
+                }
+
+            actuator_section = load_actuator_section(_P(args.bearers)) if args.bearers else {"name": "noop", "config": {}}
+            actuator_cls = resolve_actuator(actuator_section["name"])
+            actuator_instance = actuator_cls()
+            _validate_actuator_config(
+                actuator_instance=actuator_instance,
+                config=actuator_section["config"],
+            )
             fastapi_app = make_app(
                 resolver=RRFResolverFromEnv.from_env(),
                 tool_allowlist=tool_allowlist,
                 require_envelope_signature=require_envelope_signature,
+                actuator=actuator_instance,
+                actuator_config=actuator_section["config"],
+                bearer_tiers=bearer_tiers,
             )
 
         uvicorn.run(fastapi_app, host=args.host, port=args.port)
@@ -154,6 +202,32 @@ def main() -> None:
             no_token_stdout=args.no_token_stdout,
         )
         sys.exit(rc)
+
+    if args.cmd == "list-actuators":
+        from .actuator import discover_actuators
+        from .auth import load_actuator_section
+
+        discovered = discover_actuators()
+        active_name: str | None = None
+        if args.bearers:
+            section = load_actuator_section(Path(args.bearers))
+            active_name = section["name"]
+
+        for name in sorted(discovered):
+            cls = discovered[name]
+            # Instantiate to read instance metadata. Built-ins should not
+            # take args; if a user-defined actuator's __init__ requires
+            # args, we just print its name without metadata.
+            try:
+                inst = cls()
+                desc = getattr(inst, "description", "")
+                schema = getattr(inst, "config_schema", {})
+            except Exception as exc:  # noqa: BLE001
+                desc = f"<could not instantiate: {exc}>"
+                schema = {}
+            marker = " *" if active_name and active_name == name else ""
+            print(f"{name}{marker}\t{desc}\t{schema}")
+        return
 
 
 if __name__ == "__main__":
