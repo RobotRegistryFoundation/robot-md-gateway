@@ -343,4 +343,19 @@ def make_app(
             "outcome_kind": outcome.outcome_kind,
         }
 
+    @app.get("/v1/audit/last")
+    def audit_last(authorization: str | None = Header(default=None)):
+        # Auth: require a valid bearer mapped to a known tier (any tier OK
+        # for read-only access — operator chooses tier-tightening via bearers).
+        if authorization is None or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="missing Authorization header")
+        token = authorization[7:]
+        if token not in bearer_tiers:
+            raise HTTPException(status_code=403, detail="unknown bearer")
+
+        if audit_chain is None or not audit_chain.entries:
+            raise HTTPException(status_code=404, detail="audit chain empty")
+        last = audit_chain.entries[-1]
+        return last.__dict__
+
     return app
