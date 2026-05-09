@@ -63,24 +63,63 @@ class TestAuditEntryActuatorFields:
 
 
 def _build_v0_4_x_bundle():
-    """Construct a v0.4.x-shaped audit bundle (no actuator_* fields) signed
-    with a fresh test key. Returns (bundle_dict, kid_to_pem)."""
-    # v0.4.x shape: AuditEntry without actuator_* fields. Build entries manually
-    # using only the legacy fields, then run them through AuditChain.append to
-    # compute proper chain_prev / chain_hash. After append, keep the
-    # actuator_* fields = None (as they would be in a v0.4.x export).
-    chain = AuditChain()
-    chain.append(AuditEntry(
-        msg_id="m1", timestamp_ms=1700000000000,
-        decision="allow", decision_reason="ok", envelope_kid="fixture-kid",
-    ))
-    chain.append(AuditEntry(
-        msg_id="m2", timestamp_ms=1700000001000,
-        decision="deny", decision_reason="tool_allowlist: denied",
-        envelope_kid="fixture-kid",
-    ))
-    # Sign with a fresh key. The entries already have all fields (including
-    # actuator_* = None) because AuditChain.append builds full AuditEntry dicts.
+    """Construct a TRUE v0.4.x-shaped audit bundle (no actuator_* fields) signed
+    with a fresh test key. Returns (bundle_dict, kid_to_pem).
+
+    v0.4.x entries have ONLY these 7 keys:
+    - msg_id
+    - timestamp_ms
+    - decision
+    - decision_reason
+    - envelope_kid
+    - chain_prev
+    - chain_hash
+
+    No actuator_* keys are present (they didn't exist in v0.4.x).
+    """
+    # Build entries as plain dicts with only the 7 legacy keys.
+    # Compute chain hashes using the same logic as the verifier.
+    entries = []
+
+    # Entry 0: chain_prev = "0" * 64
+    entry0_dict = {
+        "msg_id": "m1",
+        "timestamp_ms": 1700000000000,
+        "decision": "allow",
+        "decision_reason": "ok",
+        "envelope_kid": "fixture-kid",
+        "chain_prev": "0" * 64,
+    }
+    entry0_hash = hashlib.sha256(
+        canonical_json(entry0_dict)
+    ).hexdigest()
+    entry0_dict["chain_hash"] = entry0_hash
+    entries.append(entry0_dict)
+
+    # Entry 1: chain_prev = entry0's chain_hash
+    entry1_dict = {
+        "msg_id": "m2",
+        "timestamp_ms": 1700000001000,
+        "decision": "deny",
+        "decision_reason": "tool_allowlist: denied",
+        "envelope_kid": "fixture-kid",
+        "chain_prev": entry0_hash,
+    }
+    entry1_hash = hashlib.sha256(
+        canonical_json(entry1_dict)
+    ).hexdigest()
+    entry1_dict["chain_hash"] = entry1_hash
+    entries.append(entry1_dict)
+
+    # Build the bundle body (v0.4.x shape).
+    body = {
+        "schema_version": "0.4.x",
+        "exported_at": 1700000002000,
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+
+    # Sign the body using Ed25519.
     priv = Ed25519PrivateKey.generate()
     pem = priv.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -91,7 +130,24 @@ def _build_v0_4_x_bundle():
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
-    bundle = chain.export_signed(signing_key_pem=pem, kid="fixture-bundle-kid")
+
+    # Sign the canonical JSON of the body.
+    body_bytes = canonical_json(body)
+    signature = priv.sign(body_bytes)
+    signature_b64 = base64.b64encode(signature).decode("utf-8")
+
+    # Build the final signed bundle.
+    bundle = {
+        "schema_version": "0.4.x",
+        "exported_at": 1700000002000,
+        "entry_count": len(entries),
+        "entries": entries,
+        "signature": {
+            "kid": "fixture-bundle-kid",
+            "sig": signature_b64,
+        },
+    }
+
     return bundle, {"fixture-bundle-kid": pub}
 
 
@@ -119,15 +175,18 @@ class TestAuditBackwardCompat:
         assert verify_audit_bundle(bundle, kid_to_pem={"kid-2026": pub}) is True
 
     def test_v0_4_x_shape_chain_verifies_with_none_actuator_fields(self):
-        """A chain whose entries have all actuator_* fields = None (v0.4.x
-        equivalent) must verify cleanly under the v0.5.0a1 verifier."""
+        """A v0.4.x-shaped bundle (entries with NO actuator_* keys at all)
+        must verify cleanly under the v0.5.0a1 verifier."""
         bundle, kid_to_pem = _build_v0_4_x_bundle()
         # Verify under the v0.5.0a1 verifier (current code path).
         assert verify_audit_bundle(bundle, kid_to_pem=kid_to_pem) is True
-        # Sanity: actuator fields are None on each entry.
+        # Sanity: NO actuator fields in any entry (they didn't exist in v0.4.x).
         for entry in bundle["entries"]:
-            assert entry["actuator_name"] is None
-            assert entry["actuator_outcome_kind"] is None
+            assert "actuator_name" not in entry
+            assert "actuator_outcome_kind" not in entry
+            assert "actuator_telemetry_sha256" not in entry
+            assert "actuator_telemetry_path" not in entry
+            assert "actuator_error_kind" not in entry
 
     def test_tampered_chain_rejects(self):
         chain = AuditChain()
