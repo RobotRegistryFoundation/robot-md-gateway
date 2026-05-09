@@ -102,7 +102,7 @@ class TestServeWiresActuator:
 
         # Should NOT raise.
         _validate_actuator_config(
-            actuator_cls=_SchemaValidatedActuator,
+            actuator_instance=_SchemaValidatedActuator(),
             config={"log_level": "INFO"},
         )
 
@@ -111,7 +111,7 @@ class TestServeWiresActuator:
 
         with pytest.raises(jsonschema.ValidationError):
             _validate_actuator_config(
-                actuator_cls=_SchemaValidatedActuator,
+                actuator_instance=_SchemaValidatedActuator(),
                 config={"log_level": "VERBOSE"},  # not in enum
             )
 
@@ -124,7 +124,7 @@ class TestServeWiresActuator:
 
         # Should NOT raise even with arbitrary config.
         _validate_actuator_config(
-            actuator_cls=_EmptySchema,
+            actuator_instance=_EmptySchema(),
             config={"anything": "goes"},
         )
 

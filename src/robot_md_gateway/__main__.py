@@ -11,14 +11,14 @@ from .cert.policy import ToolAllowlist
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
-def _validate_actuator_config(*, actuator_cls: type, config: dict) -> None:
+def _validate_actuator_config(*, actuator_instance: object, config: dict) -> None:
     """Validate the actuator's config dict against its config_schema.
 
     Raises jsonschema.ValidationError on mismatch. No-op when config_schema
     is empty.
     """
     import jsonschema
-    schema = getattr(actuator_cls, "config_schema", None) or {}
+    schema = getattr(actuator_instance, "config_schema", None) or {}
     if not schema:
         return
     jsonschema.validate(instance=config, schema=schema)
@@ -175,11 +175,11 @@ def main() -> None:
 
             actuator_section = load_actuator_section(_P(args.bearers)) if args.bearers else {"name": "noop", "config": {}}
             actuator_cls = resolve_actuator(actuator_section["name"])
+            actuator_instance = actuator_cls()
             _validate_actuator_config(
-                actuator_cls=actuator_cls,
+                actuator_instance=actuator_instance,
                 config=actuator_section["config"],
             )
-            actuator_instance = actuator_cls()
             fastapi_app = make_app(
                 resolver=RRFResolverFromEnv.from_env(),
                 tool_allowlist=tool_allowlist,
