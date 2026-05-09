@@ -27,11 +27,13 @@ Subsequent plans fill in:
 
 from __future__ import annotations
 
+import hashlib
 import time
 from pathlib import Path
 
 from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, ValidationError
+from rcan.audit_bundle import canonical_json
 
 from .actuator import Actuator, ActuatorOutcome, NoOpActuator
 from .cert import report as cert_report
@@ -129,9 +131,25 @@ def make_app(
             envelope_kid=kid,
         )
         if outcome is not None:
+            telem_sha: str | None = None
+            telem_path: str | None = None
+            if outcome.telemetry_path is not None:
+                # Hash the file's bytes for tamper-evidence; record path as string.
+                telem_path = str(outcome.telemetry_path)
+                if outcome.telemetry_path.exists():
+                    telem_sha = hashlib.sha256(
+                        outcome.telemetry_path.read_bytes()
+                    ).hexdigest()
+            elif outcome.telemetry:
+                # Hash the canonical JSON of the in-memory telemetry dict.
+                telem_sha = hashlib.sha256(
+                    canonical_json(outcome.telemetry)
+                ).hexdigest()
             entry_kwargs.update(
                 actuator_name=actuator_name,
                 actuator_outcome_kind=outcome.outcome_kind,
+                actuator_telemetry_sha256=telem_sha,
+                actuator_telemetry_path=telem_path,
                 actuator_error_kind=error_kind,
             )
         audit_chain.append(AuditEntry(**entry_kwargs))

@@ -200,3 +200,92 @@ class TestActuatorErrorHandling:
         assert entry.actuator_name == "raises"
         assert entry.actuator_outcome_kind == "error"
         assert entry.actuator_error_kind == "ValueError"
+
+
+import hashlib
+import json as _json
+
+from rcan.audit_bundle import canonical_json
+
+
+class _ActuatorWithTelemetry:
+    name = "telem"
+    description = "telemetry test"
+    config_schema: dict = {}
+    def __init__(self, telemetry, telemetry_path=None):
+        self._telemetry = telemetry
+        self._telemetry_path = telemetry_path
+    def execute(self, *, envelope, manifest_path, tier, config):
+        return ActuatorOutcome(
+            success=True, outcome_kind="executed",
+            telemetry=self._telemetry,
+            telemetry_path=self._telemetry_path,
+        )
+
+
+class TestTelemetryPersistence:
+    def test_telemetry_dict_hashed_into_audit_entry(self, tmp_path, monkeypatch):
+        from robot_md_gateway import manifest_provenance
+        monkeypatch.setattr(
+            manifest_provenance, "verify_manifest",
+            lambda path, *, resolver: type("R", (), {
+                "accepted": True, "kid": "fake-kid", "reason": "ok",
+            })(),
+        )
+
+        telemetry = {"sample_count": 3, "duration_ms": 42}
+        chain = AuditChain()
+        app = _make_test_app(
+            actuator=_ActuatorWithTelemetry(telemetry=telemetry),
+            audit_chain=chain,
+        )
+
+        with TestClient(app) as client:
+            client.post(
+                "/v1/invoke",
+                json=_valid_envelope(tmp_path),
+                headers={"Authorization": "Bearer actuate-token"},
+            )
+
+        expected_sha = hashlib.sha256(canonical_json(telemetry)).hexdigest()
+        entry = chain.entries[0]
+        assert entry.actuator_telemetry_sha256 == expected_sha
+        assert entry.actuator_telemetry_path is None
+
+    def test_telemetry_path_recorded_and_file_hashed(self, tmp_path, monkeypatch):
+        from robot_md_gateway import manifest_provenance
+        monkeypatch.setattr(
+            manifest_provenance, "verify_manifest",
+            lambda path, *, resolver: type("R", (), {
+                "accepted": True, "kid": "fake-kid", "reason": "ok",
+            })(),
+        )
+
+        telem_file = tmp_path / "telemetry" / "msg-001.json"
+        telem_file.parent.mkdir(parents=True)
+        file_bytes = b'{"actually_ran": true}\n'
+        telem_file.write_bytes(file_bytes)
+
+        chain = AuditChain()
+        app = _make_test_app(
+            actuator=_ActuatorWithTelemetry(
+                telemetry={"sample_count": 3},
+                telemetry_path=telem_file,
+            ),
+            audit_chain=chain,
+        )
+
+        with TestClient(app) as client:
+            client.post(
+                "/v1/invoke",
+                json=_valid_envelope(tmp_path),
+                headers={"Authorization": "Bearer actuate-token"},
+            )
+
+        entry = chain.entries[0]
+        # Path is recorded as string.
+        assert entry.actuator_telemetry_path == str(telem_file)
+        # sha256 reflects FILE BYTES (not the in-memory telemetry dict)
+        # when telemetry_path is set.
+        expected = hashlib.sha256(file_bytes).hexdigest()
+        assert entry.actuator_telemetry_sha256 == expected
