@@ -33,6 +33,7 @@ from pathlib import Path
 from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, ValidationError
 
+from .actuator import Actuator, NoOpActuator
 from .cert import report as cert_report
 from .cert.audit import AuditChain, AuditEntry
 from .cert.envelope import ReplayCache, check_replay, verify_envelope
@@ -79,10 +80,16 @@ def make_app(
     audit_chain: AuditChain | None = None,
     revocation_resolver: RRFRevocationResolver | None = None,
     revocation_cache: RevocationCache | None = None,
+    actuator: Actuator | None = None,
+    actuator_config: dict | None = None,
 ) -> FastAPI:
     if tool_allowlist is None:
         tool_allowlist = _DEFAULT_ALLOWLIST
     bearer_tiers = bearer_tiers or {}
+    if actuator is None:
+        actuator = NoOpActuator()
+    if actuator_config is None:
+        actuator_config = {}
     if replay_cache is None:
         replay_cache = ReplayCache()
     # Default the revocation cache at make_app level (parallel to replay_cache):
@@ -100,6 +107,8 @@ def make_app(
     app.state.safety_monitor = safety_monitor
     app.state.audit_chain = audit_chain
     app.state.revocation_cache = revocation_cache
+    app.state.actuator = actuator
+    app.state.actuator_config = actuator_config
 
     def _record(decision: str, reason: str, kid: str | None, msg_id: str) -> None:
         if audit_chain is None:
