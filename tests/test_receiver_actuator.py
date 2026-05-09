@@ -158,3 +158,45 @@ class TestActuatorCalledAfterGates:
         assert len(chain.entries) == 1
         assert chain.entries[0].decision == "deny"
         assert chain.entries[0].actuator_name is None
+
+
+class _RaisingActuator:
+    name = "raises"
+    description = "test raiser"
+    config_schema: dict = {}
+    def execute(self, *, envelope, manifest_path, tier, config):
+        raise ValueError("simulated driver failure")
+
+
+class TestActuatorErrorHandling:
+    def test_actuator_exception_returns_500_and_audits_error(self, tmp_path, monkeypatch):
+        from robot_md_gateway import manifest_provenance
+        monkeypatch.setattr(
+            manifest_provenance, "verify_manifest",
+            lambda path, *, resolver: type("R", (), {
+                "accepted": True, "kid": "fake-kid", "reason": "ok",
+            })(),
+        )
+
+        chain = AuditChain()
+        app = _make_test_app(actuator=_RaisingActuator(), audit_chain=chain)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/invoke",
+                json=_valid_envelope(tmp_path),
+                headers={"Authorization": "Bearer actuate-token"},
+            )
+
+        assert response.status_code == 500
+        body = response.json()
+        assert body["detail"]["actuator_error"] == "simulated driver failure"
+        assert body["detail"]["actuator_error_kind"] == "ValueError"
+
+        # Audit entry: gate decision was allow, but actuator outcome is error.
+        assert len(chain.entries) == 1
+        entry = chain.entries[0]
+        assert entry.decision == "allow"
+        assert entry.actuator_name == "raises"
+        assert entry.actuator_outcome_kind == "error"
+        assert entry.actuator_error_kind == "ValueError"
