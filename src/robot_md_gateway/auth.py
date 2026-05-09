@@ -36,10 +36,25 @@ class BearerStore:
 
     @classmethod
     def from_yaml(cls, path: Path) -> BearerStore:
-        data = yaml.safe_load(path.read_text()) or []
+        data = yaml.safe_load(path.read_text())
+        # Two accepted shapes:
+        #   1. Legacy: top-level list of bearer entries.
+        #   2. New (v0.5.0a1+): top-level dict with `bearers:` and optional
+        #      `actuator:` keys.
+        if data is None:
+            data = []
+        if isinstance(data, dict):
+            rows = data.get("bearers") or []
+        elif isinstance(data, list):
+            rows = data
+        else:
+            raise ValueError(
+                f"{path}: top-level must be a list (legacy) or a dict with 'bearers' "
+                f"key (v0.5.0a1+); got {type(data).__name__}"
+            )
         entries = [
             _BearerEntry(token=row["token"], tier=row["tier"], caller_id=row["caller"])
-            for row in data
+            for row in rows
         ]
         if not entries:
             raise ValueError(f"{path} has no bearer entries")
@@ -96,6 +111,23 @@ def load_bearer_store_from_env() -> BearerStore:
     if not path:
         raise RuntimeError("ROBOT_MD_BEARERS_FILE not set")
     return BearerStore.from_yaml(Path(path))
+
+
+def load_actuator_section(path: Path) -> dict:
+    """Read the optional ``actuator:`` section of bearers.yaml.
+
+    Returns a normalized dict with ``name`` (default ``"noop"``) and ``config``
+    (default empty dict). Legacy list-shape bearers.yaml has no actuator
+    section and falls back to the noop default.
+    """
+    data = yaml.safe_load(path.read_text())
+    if not isinstance(data, dict):
+        return {"name": "noop", "config": {}}
+    section = data.get("actuator") or {}
+    return {
+        "name": section.get("name") or "noop",
+        "config": section.get("config") or {},
+    }
 
 
 class RRFResolverFromEnv:
