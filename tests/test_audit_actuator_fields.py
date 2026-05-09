@@ -1,11 +1,15 @@
 """Tests for AuditEntry's actuator_* fields (added in v0.5.0a1)."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
 from rcan.audit_bundle import canonical_json
 
-from robot_md_gateway.cert.audit import AuditChain, AuditEntry
+from robot_md_gateway.cert.audit import AuditChain, AuditEntry, verify_audit_bundle
 
 
 class TestAuditEntryActuatorFields:
@@ -56,3 +60,93 @@ class TestAuditEntryActuatorFields:
         d = e.__dict__
         # canonical_json must accept the dict (no unhashable types)
         canonical_json(d)
+
+
+def _build_v0_4_x_bundle():
+    """Construct a v0.4.x-shaped audit bundle (no actuator_* fields) signed
+    with a fresh test key. Returns (bundle_dict, kid_to_pem)."""
+    # v0.4.x shape: AuditEntry without actuator_* fields. Build entries manually
+    # using only the legacy fields, then run them through AuditChain.append to
+    # compute proper chain_prev / chain_hash. After append, keep the
+    # actuator_* fields = None (as they would be in a v0.4.x export).
+    chain = AuditChain()
+    chain.append(AuditEntry(
+        msg_id="m1", timestamp_ms=1700000000000,
+        decision="allow", decision_reason="ok", envelope_kid="fixture-kid",
+    ))
+    chain.append(AuditEntry(
+        msg_id="m2", timestamp_ms=1700000001000,
+        decision="deny", decision_reason="tool_allowlist: denied",
+        envelope_kid="fixture-kid",
+    ))
+    # Sign with a fresh key. The entries already have all fields (including
+    # actuator_* = None) because AuditChain.append builds full AuditEntry dicts.
+    priv = Ed25519PrivateKey.generate()
+    pem = priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    pub = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    bundle = chain.export_signed(signing_key_pem=pem, kid="fixture-bundle-kid")
+    return bundle, {"fixture-bundle-kid": pub}
+
+
+class TestAuditBackwardCompat:
+    def test_v0_5_chain_verifies(self):
+        """A chain produced by v0.5.0a1 (with actuator_* fields populated)
+        verifies under the v0.5.0a1 verifier."""
+        chain = AuditChain()
+        chain.append(AuditEntry(
+            msg_id="m1", timestamp_ms=1700000000000,
+            decision="allow", decision_reason="ok", envelope_kid="fixture-kid",
+            actuator_name="noop", actuator_outcome_kind="no_op",
+        ))
+        priv = Ed25519PrivateKey.generate()
+        pem = priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        pub = priv.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        bundle = chain.export_signed(signing_key_pem=pem, kid="kid-2026")
+        assert verify_audit_bundle(bundle, kid_to_pem={"kid-2026": pub}) is True
+
+    def test_v0_4_x_shape_chain_verifies_with_none_actuator_fields(self):
+        """A chain whose entries have all actuator_* fields = None (v0.4.x
+        equivalent) must verify cleanly under the v0.5.0a1 verifier."""
+        bundle, kid_to_pem = _build_v0_4_x_bundle()
+        # Verify under the v0.5.0a1 verifier (current code path).
+        assert verify_audit_bundle(bundle, kid_to_pem=kid_to_pem) is True
+        # Sanity: actuator fields are None on each entry.
+        for entry in bundle["entries"]:
+            assert entry["actuator_name"] is None
+            assert entry["actuator_outcome_kind"] is None
+
+    def test_tampered_chain_rejects(self):
+        chain = AuditChain()
+        chain.append(AuditEntry(
+            msg_id="m1", timestamp_ms=1700000000000,
+            decision="allow", decision_reason="ok", envelope_kid="fixture-kid",
+            actuator_name="noop", actuator_outcome_kind="no_op",
+        ))
+        priv = Ed25519PrivateKey.generate()
+        pem = priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        pub = priv.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        bundle = chain.export_signed(signing_key_pem=pem, kid="kid-2026")
+        # Tamper with telemetry_sha256.
+        bundle["entries"][0]["actuator_telemetry_sha256"] = "f" * 64
+        assert verify_audit_bundle(bundle, kid_to_pem={"kid-2026": pub}) is False
