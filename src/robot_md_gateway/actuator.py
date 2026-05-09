@@ -16,6 +16,7 @@ declares the same entry-point group; gateway picks it up at serve time.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from importlib.metadata import entry_points as _entry_points
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -72,3 +73,32 @@ class NoOpActuator:
             outcome_kind="no_op",
             telemetry={"msg_id": envelope.get("msg_id"), "tier": tier},
         )
+
+
+def discover_actuators() -> dict[str, type]:
+    """Resolve all entry-points in the ``robot_md_gateway.actuators`` group.
+
+    Returns: mapping of entry-point name to the loaded class.
+    """
+    return {ep.name: ep.load() for ep in _entry_points(group=ENTRY_POINT_GROUP)}
+
+
+def resolve_actuator(name: str | None, *, fallback: type = NoOpActuator) -> type:
+    """Resolve an actuator class by entry-point name.
+
+    Args:
+        name: entry-point name (e.g. ``"noop"``, ``"my-camera-stack"``);
+            ``None`` or ``"noop"`` returns the built-in NoOpActuator.
+        fallback: returned when ``name`` is ``None``. Defaults to NoOpActuator.
+
+    Raises:
+        LookupError: ``name`` is given but not found in the entry-point group.
+    """
+    if name is None or name == "noop":
+        return fallback
+    discovered = discover_actuators()
+    if name not in discovered:
+        raise LookupError(
+            f"actuator {name!r} not found in entry-point group {ENTRY_POINT_GROUP!r}"
+        )
+    return discovered[name]

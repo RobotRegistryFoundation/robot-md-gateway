@@ -46,6 +46,9 @@ dev = [
 robot-md-gateway = "robot_md_gateway.__main__:main"
 robot-md-dispatcher = "robot_md_gateway._legacy_cli:legacy_main"
 
+[project.entry-points."robot_md_gateway.actuators"]
+noop = "robot_md_gateway.actuator:NoOpActuator"
+
 [project.urls]
 Homepage = "https://robotmd.dev"
 Repository = "https://github.com/RobotRegistryFoundation/robot-md-gateway"

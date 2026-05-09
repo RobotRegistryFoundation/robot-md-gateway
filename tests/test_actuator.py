@@ -59,3 +59,60 @@ class TestNoOpActuator:
         assert outcome.outcome_kind == "no_op"
         assert outcome.telemetry == {"msg_id": "test-msg-001", "tier": "actuate"}
         assert outcome.error_message is None
+
+
+from robot_md_gateway.actuator import (
+    ENTRY_POINT_GROUP,
+    discover_actuators,
+    resolve_actuator,
+)
+
+
+class TestEntryPointDiscovery:
+    def test_entry_point_group_constant(self):
+        assert ENTRY_POINT_GROUP == "robot_md_gateway.actuators"
+
+    def test_discover_finds_built_in_noop(self):
+        # After this branch ships and the package is installed, the noop
+        # entry-point must be discoverable. In the pre-install dev tree
+        # that's not guaranteed — skip the assertion when running from
+        # source without `pip install -e .`.
+        discovered = discover_actuators()
+        if "noop" not in discovered:
+            pytest.skip("package not installed; skip live entry-point check")
+        assert discovered["noop"] is NoOpActuator
+
+    def test_resolve_actuator_default(self):
+        cls = resolve_actuator(None)
+        assert cls is NoOpActuator
+
+    def test_resolve_actuator_noop_explicit(self):
+        cls = resolve_actuator("noop")
+        assert cls is NoOpActuator
+
+    def test_resolve_actuator_unknown_raises(self):
+        with pytest.raises(LookupError, match="not found"):
+            resolve_actuator("definitely-not-a-real-actuator")
+
+    def test_resolve_actuator_via_monkeypatched_entry_point(self, monkeypatch):
+        class FakeActuator:
+            name = "fake"
+            description = "test fake"
+            config_schema: dict = {}
+            def execute(self, *, envelope, manifest_path, tier, config):
+                return ActuatorOutcome(success=True, outcome_kind="executed")
+
+        # Inject a fake entry point so resolve_actuator finds it.
+        from robot_md_gateway import actuator as actuator_module
+
+        def fake_eps(*, group):
+            assert group == ENTRY_POINT_GROUP
+            class _EP:
+                name = "fake"
+                def load(self):
+                    return FakeActuator
+            return [_EP()]
+
+        monkeypatch.setattr(actuator_module, "_entry_points", fake_eps)
+        cls = resolve_actuator("fake")
+        assert cls is FakeActuator
