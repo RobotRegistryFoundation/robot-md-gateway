@@ -33,7 +33,7 @@ from pathlib import Path
 from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, ValidationError
 
-from .actuator import Actuator, NoOpActuator
+from .actuator import Actuator, ActuatorOutcome, NoOpActuator
 from .cert import report as cert_report
 from .cert.audit import AuditChain, AuditEntry
 from .cert.envelope import ReplayCache, check_replay, verify_envelope
@@ -110,16 +110,35 @@ def make_app(
     app.state.actuator = actuator
     app.state.actuator_config = actuator_config
 
-    def _record(decision: str, reason: str, kid: str | None, msg_id: str) -> None:
+    def _record_with_outcome(
+        decision: str,
+        reason: str,
+        kid: str | None,
+        msg_id: str,
+        outcome: ActuatorOutcome | None = None,
+        error_kind: str | None = None,
+        actuator_name: str | None = None,
+    ) -> None:
         if audit_chain is None:
             return
-        audit_chain.append(AuditEntry(
+        entry_kwargs = dict(
             msg_id=msg_id,
             timestamp_ms=int(time.time() * 1000),
             decision=decision,
             decision_reason=reason,
             envelope_kid=kid,
-        ))
+        )
+        if outcome is not None:
+            entry_kwargs.update(
+                actuator_name=actuator_name,
+                actuator_outcome_kind=outcome.outcome_kind,
+                actuator_error_kind=error_kind,
+            )
+        audit_chain.append(AuditEntry(**entry_kwargs))
+
+    # Backward-compat shim: existing deny-path call sites still call _record.
+    def _record(decision: str, reason: str, kid: str | None, msg_id: str) -> None:
+        _record_with_outcome(decision=decision, reason=reason, kid=kid, msg_id=msg_id)
 
     @app.post("/v1/invoke")
     def invoke(
@@ -267,13 +286,43 @@ def make_app(
                     "reason": reason,
                 })
 
-        _record("allow", "ok", manifest_result.kid, envelope.msg_id)
+        # All gates passed — call the actuator. Capture outcome regardless of
+        # success so the audit entry records what actually happened.
+        try:
+            outcome = actuator.execute(
+                envelope=envelope_dict,
+                manifest_path=Path(envelope.manifest_path),
+                tier=tier,
+                config=actuator_config,
+            )
+            error_kind: str | None = None
+        except Exception as exc:  # noqa: BLE001  intentionally broad — actuator is operator code
+            outcome = ActuatorOutcome(
+                success=False, outcome_kind="error",
+                error_message=str(exc),
+            )
+            error_kind = type(exc).__name__
+
+        _record_with_outcome(
+            decision="allow", reason="ok",
+            kid=manifest_result.kid, msg_id=envelope.msg_id,
+            outcome=outcome, error_kind=error_kind,
+            actuator_name=actuator.name,
+        )
+
+        if not outcome.success:
+            raise HTTPException(status_code=500, detail={
+                "actuator_error": outcome.error_message,
+                "actuator_error_kind": error_kind,
+            })
+
         return {
             "ok": True,
             "manifest_kid": manifest_result.kid,
             "scope": envelope.scope,
             "tool_name": envelope.tool_name,
-            "next_gates": [],
+            "actuator_name": actuator.name,
+            "outcome_kind": outcome.outcome_kind,
         }
 
     return app
