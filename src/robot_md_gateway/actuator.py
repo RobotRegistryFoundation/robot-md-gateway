@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 ENTRY_POINT_GROUP = "robot_md_gateway.actuators"
 
@@ -28,3 +29,46 @@ class ActuatorOutcome:
     telemetry: dict = field(default_factory=dict)
     error_message: str | None = None
     telemetry_path: Path | None = None
+
+
+@runtime_checkable
+class Actuator(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def description(self) -> str: ...
+
+    @property
+    def config_schema(self) -> dict: ...
+
+    def execute(
+        self,
+        *,
+        envelope: dict,
+        manifest_path: Path,
+        tier: str,
+        config: dict,
+    ) -> ActuatorOutcome: ...
+
+
+class NoOpActuator:
+    name = "noop"
+    description = (
+        "Built-in default. Logs envelope, returns no_op. Use until a driver is wired."
+    )
+    config_schema: dict = {}
+
+    def execute(
+        self,
+        *,
+        envelope: dict,
+        manifest_path: Path,
+        tier: str,
+        config: dict,
+    ) -> ActuatorOutcome:
+        return ActuatorOutcome(
+            success=True,
+            outcome_kind="no_op",
+            telemetry={"msg_id": envelope.get("msg_id"), "tier": tier},
+        )
