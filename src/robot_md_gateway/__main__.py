@@ -110,6 +110,16 @@ def main() -> None:
         "(used by the Claude Code plugin slash command)",
     )
 
+    list_p = sub.add_parser(
+        "list-actuators",
+        help="List actuators discovered via the robot_md_gateway.actuators entry-point group.",
+    )
+    list_p.add_argument(
+        "--bearers",
+        help="Path to bearers.yaml (used to mark the currently-active actuator).",
+        default=None,
+    )
+
     args = parser.parse_args()
 
     if args.cmd == "serve":
@@ -154,6 +164,32 @@ def main() -> None:
             no_token_stdout=args.no_token_stdout,
         )
         sys.exit(rc)
+
+    if args.cmd == "list-actuators":
+        from .actuator import discover_actuators
+        from .auth import load_actuator_section
+
+        discovered = discover_actuators()
+        active_name: str | None = None
+        if args.bearers:
+            section = load_actuator_section(Path(args.bearers))
+            active_name = section["name"]
+
+        for name in sorted(discovered):
+            cls = discovered[name]
+            # Instantiate to read instance metadata. Built-ins should not
+            # take args; if a user-defined actuator's __init__ requires
+            # args, we just print its name without metadata.
+            try:
+                inst = cls()
+                desc = getattr(inst, "description", "")
+                schema = getattr(inst, "config_schema", {})
+            except Exception as exc:  # noqa: BLE001
+                desc = f"<could not instantiate: {exc}>"
+                schema = {}
+            marker = " *" if active_name and active_name == name else ""
+            print(f"{name}{marker}\t{desc}\t{schema}")
+        return
 
 
 if __name__ == "__main__":
