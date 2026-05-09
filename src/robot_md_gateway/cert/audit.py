@@ -30,6 +30,13 @@ class AuditEntry:
     decision: str  # "allow" or "deny"
     decision_reason: str
     envelope_kid: str | None
+    # NEW v0.5.0a1 — actuator outcome fields. None for v0.4.x entries.
+    actuator_name: str | None = None
+    actuator_outcome_kind: str | None = None  # "executed" | "no_op" | "deferred" | "error"
+    actuator_telemetry_sha256: str | None = None  # sha256 of canonical(telemetry)
+    actuator_telemetry_path: str | None = None  # filesystem path if persisted
+    actuator_error_kind: str | None = None  # exception class name on actuator error
+    # Chain linkage — must remain last; AuditChain.append fills these in.
     chain_prev: str = ""  # filled by AuditChain.append; sha256 of prior entry's canonical bytes
     chain_hash: str = ""  # filled by AuditChain.append; sha256 of this entry's canonical bytes
 
