@@ -317,12 +317,14 @@ def test_invoke_response_includes_outcome_telemetry(tmp_path, monkeypatch):
             )
 
     app = _make_test_app(actuator=TelemetryActuator())
-    client = TestClient(app)
-    resp = client.post(
-        "/v1/invoke",
-        json=_valid_envelope(tmp_path),
-        headers={"Authorization": "Bearer actuate-token"},
-    )
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/invoke",
+            json=_valid_envelope(tmp_path),
+            headers={"Authorization": "Bearer actuate-token"},
+        )
+
     assert resp.status_code == 200
     body = resp.json()
     assert body["outcome_kind"] == "executed"
