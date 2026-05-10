@@ -289,3 +289,41 @@ class TestTelemetryPersistence:
         # when telemetry_path is set.
         expected = hashlib.sha256(file_bytes).hexdigest()
         assert entry.actuator_telemetry_sha256 == expected
+
+
+def test_invoke_response_includes_outcome_telemetry(tmp_path, monkeypatch):
+    """Receiver should return outcome.telemetry in the 200 response so
+    callers can verify actuator-level success (e.g., move().reached) without
+    a second round-trip. Added in 0.5.0a2."""
+    from robot_md_gateway import manifest_provenance
+
+    monkeypatch.setattr(
+        manifest_provenance, "verify_manifest",
+        lambda path, *, resolver: type("R", (), {
+            "accepted": True, "kid": "fake-kid", "reason": "ok",
+        })(),
+    )
+
+    class TelemetryActuator:
+        name = "telem"
+        description = "fixture"
+        config_schema: dict = {}
+
+        def execute(self, *, envelope, manifest_path, tier, config):
+            return ActuatorOutcome(
+                success=True,
+                outcome_kind="executed",
+                telemetry={"reached": True, "elapsed_s": 0.42, "thing": "value"},
+            )
+
+    app = _make_test_app(actuator=TelemetryActuator())
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/invoke",
+        json=_valid_envelope(tmp_path),
+        headers={"Authorization": "Bearer actuate-token"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["outcome_kind"] == "executed"
+    assert body["telemetry"] == {"reached": True, "elapsed_s": 0.42, "thing": "value"}

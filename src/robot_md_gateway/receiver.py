@@ -341,6 +341,7 @@ def make_app(
             "tool_name": envelope.tool_name,
             "actuator_name": actuator.name,
             "outcome_kind": outcome.outcome_kind,
+            "telemetry": outcome.telemetry,
         }
 
     @app.get("/v1/audit/last")

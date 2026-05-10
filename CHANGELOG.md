@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.0a2] — 2026-05-10
+
+### Added
+
+- **`telemetry` in `/v1/invoke` 200 response.** Receiver now returns the
+  full `outcome.telemetry` dict alongside `outcome_kind`, so callers can
+  verify actuator-level success (e.g., `move().reached`) without a second
+  round-trip. Required for `bob.local/MOTION-FIDELITY-100` cert-intake
+  evidence (Phase 2 of the foundation rebuild roadmap).
+
 ## [0.5.0a1] — 2026-05-08
 
 ### Added
