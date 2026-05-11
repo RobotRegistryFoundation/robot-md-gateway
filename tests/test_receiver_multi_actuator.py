@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
 from fastapi.testclient import TestClient
 
@@ -29,7 +30,7 @@ class _FakeResolver:
 class _NamedSpy:
     """Actuator that announces a configurable name + records calls."""
     description = "test spy"
-    config_schema: dict = {}
+    config_schema: ClassVar[dict] = {}
 
     def __init__(self, name: str, telemetry_marker: str):
         self.name = name
