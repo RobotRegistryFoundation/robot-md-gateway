@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.5.0a3] — 2026-05-11
+
+### Added
+
+- **Multi-actuator dispatch.** `make_app(actuators={name: Actuator},
+  actuator_configs={name: dict})` registers multiple actuators behind one
+  gateway. The receiver routes `/v1/invoke` by `envelope.actuator_name`;
+  missing name → 422, unknown name → 404. Single-actuator mode
+  (`make_app(actuator=...)`) is unchanged and remains the default. Closes
+  the robot-md trial → gateway invoke gap for rigs with both a perception
+  actuator and a motion actuator (Spec B Phase E).
+- **`actuators:` list section in bearers.yaml.** New `load_actuators_section()`
+  reads `actuators: [{name, config}, ...]`. The serve path uses the list
+  shape when present and falls back to the singular `actuator:` section
+  otherwise.
+- **`InvokeEnvelope.actuator_name`.** Now a real optional field rather than
+  silently dropped via Pydantic's `extra='ignore'`. Required when the
+  gateway is configured for multiple actuators; ignored otherwise.
+
 ## [0.5.0a2] — 2026-05-10
 
 ### Added

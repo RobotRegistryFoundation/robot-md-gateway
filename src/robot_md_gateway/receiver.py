@@ -67,6 +67,10 @@ class InvokeEnvelope(BaseModel):
     tool_name: str = Field(...)
     tool_args: dict = Field(default_factory=dict)
     manifest_path: str = Field(..., description="Local path to ROBOT.md being actuated against")
+    # Optional. When the gateway is configured with multiple actuators
+    # (`make_app(actuators={...})`), the dispatcher routes by this name.
+    # In single-actuator mode this field is ignored.
+    actuator_name: str | None = Field(default=None)
 
 
 def make_app(
@@ -84,14 +88,30 @@ def make_app(
     revocation_cache: RevocationCache | None = None,
     actuator: Actuator | None = None,
     actuator_config: dict | None = None,
+    actuators: dict[str, Actuator] | None = None,
+    actuator_configs: dict[str, dict] | None = None,
 ) -> FastAPI:
     if tool_allowlist is None:
         tool_allowlist = _DEFAULT_ALLOWLIST
     bearer_tiers = bearer_tiers or {}
-    if actuator is None:
-        actuator = NoOpActuator()
-    if actuator_config is None:
+    # Multi-actuator mode is on when `actuators` is provided (even if empty
+    # dict — that's a misconfiguration the operator made; loud failure at
+    # request time is better than silent fallback to single).
+    multi_actuator_mode = actuators is not None
+    if multi_actuator_mode:
+        if actuator_configs is None:
+            actuator_configs = {}
+        # In multi-actuator mode the single-actuator slots are unused; null
+        # them so anyone reading app.state.actuator gets a clear sentinel.
+        actuator = None
         actuator_config = {}
+    else:
+        if actuator is None:
+            actuator = NoOpActuator()
+        if actuator_config is None:
+            actuator_config = {}
+        actuators = {}
+        actuator_configs = {}
     if replay_cache is None:
         replay_cache = ReplayCache()
     # Default the revocation cache at make_app level (parallel to replay_cache):
@@ -111,6 +131,9 @@ def make_app(
     app.state.revocation_cache = revocation_cache
     app.state.actuator = actuator
     app.state.actuator_config = actuator_config
+    app.state.actuators = actuators
+    app.state.actuator_configs = actuator_configs
+    app.state.multi_actuator_mode = multi_actuator_mode
 
     def _record_with_outcome(
         decision: str,
@@ -304,14 +327,38 @@ def make_app(
                     "reason": reason,
                 })
 
-        # All gates passed — call the actuator. Capture outcome regardless of
-        # success so the audit entry records what actually happened.
+        # All gates passed — pick the actuator. In multi-actuator mode, route
+        # by `envelope.actuator_name`. In single-actuator mode, use the one
+        # configured at make_app time. Routing failures are 4xx (parser-level)
+        # and not audited; gate failures above are audit-tracked.
+        if multi_actuator_mode:
+            if envelope.actuator_name is None:
+                raise HTTPException(status_code=422, detail={
+                    "deny": "actuator_name_required",
+                    "reason": "gateway is configured for multiple actuators; "
+                              "envelope must set actuator_name",
+                })
+            target_actuator = actuators.get(envelope.actuator_name)
+            if target_actuator is None:
+                raise HTTPException(status_code=404, detail={
+                    "deny": "unknown_actuator",
+                    "reason": f"no actuator named {envelope.actuator_name!r} is "
+                              f"registered on this gateway",
+                    "known": sorted(actuators.keys()),
+                })
+            target_config = actuator_configs.get(envelope.actuator_name, {})
+        else:
+            target_actuator = actuator
+            target_config = actuator_config
+
+        # Capture outcome regardless of success so the audit entry records
+        # what actually happened.
         try:
-            outcome = actuator.execute(
+            outcome = target_actuator.execute(
                 envelope=envelope_dict,
                 manifest_path=Path(envelope.manifest_path),
                 tier=tier,
-                config=actuator_config,
+                config=target_config,
             )
             error_kind: str | None = None
         except Exception as exc:  # noqa: BLE001  intentionally broad — actuator is operator code
@@ -325,7 +372,7 @@ def make_app(
             decision="allow", reason="ok",
             kid=manifest_result.kid, msg_id=envelope.msg_id,
             outcome=outcome, error_kind=error_kind,
-            actuator_name=actuator.name,
+            actuator_name=target_actuator.name,
         )
 
         if not outcome.success:
@@ -339,7 +386,7 @@ def make_app(
             "manifest_kid": manifest_result.kid,
             "scope": envelope.scope,
             "tool_name": envelope.tool_name,
-            "actuator_name": actuator.name,
+            "actuator_name": target_actuator.name,
             "outcome_kind": outcome.outcome_kind,
             "telemetry": outcome.telemetry,
         }
