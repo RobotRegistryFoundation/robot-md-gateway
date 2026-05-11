@@ -157,7 +157,7 @@ def main() -> None:
             from .auth import RRFResolverFromEnv, BearerStore
             from .receiver import make_app
             from .actuator import resolve_actuator
-            from .auth import load_actuator_section
+            from .auth import load_actuator_section, load_actuators_section
             from pathlib import Path as _P
 
             tool_allowlist = _build_tool_allowlist_from_env()
@@ -173,21 +173,48 @@ def main() -> None:
                     for token, entry in store._by_token.items()
                 }
 
-            actuator_section = load_actuator_section(_P(args.bearers)) if args.bearers else {"name": "noop", "config": {}}
-            actuator_cls = resolve_actuator(actuator_section["name"])
-            actuator_instance = actuator_cls()
-            _validate_actuator_config(
-                actuator_instance=actuator_instance,
-                config=actuator_section["config"],
+            # Prefer the list-shape `actuators:` section if present — that
+            # turns on multi-actuator routing in the receiver. Fall back to the
+            # singular `actuator:` section for backward compat.
+            actuators_list = (
+                load_actuators_section(_P(args.bearers)) if args.bearers else []
             )
-            fastapi_app = make_app(
-                resolver=RRFResolverFromEnv.from_env(),
-                tool_allowlist=tool_allowlist,
-                require_envelope_signature=require_envelope_signature,
-                actuator=actuator_instance,
-                actuator_config=actuator_section["config"],
-                bearer_tiers=bearer_tiers,
-            )
+            if actuators_list:
+                actuators: dict = {}
+                actuator_configs: dict[str, dict] = {}
+                for entry in actuators_list:
+                    cls = resolve_actuator(entry["name"])
+                    instance = cls()
+                    _validate_actuator_config(
+                        actuator_instance=instance,
+                        config=entry["config"],
+                    )
+                    actuators[instance.name] = instance
+                    actuator_configs[instance.name] = entry["config"]
+                fastapi_app = make_app(
+                    resolver=RRFResolverFromEnv.from_env(),
+                    tool_allowlist=tool_allowlist,
+                    require_envelope_signature=require_envelope_signature,
+                    actuators=actuators,
+                    actuator_configs=actuator_configs,
+                    bearer_tiers=bearer_tiers,
+                )
+            else:
+                actuator_section = load_actuator_section(_P(args.bearers)) if args.bearers else {"name": "noop", "config": {}}
+                actuator_cls = resolve_actuator(actuator_section["name"])
+                actuator_instance = actuator_cls()
+                _validate_actuator_config(
+                    actuator_instance=actuator_instance,
+                    config=actuator_section["config"],
+                )
+                fastapi_app = make_app(
+                    resolver=RRFResolverFromEnv.from_env(),
+                    tool_allowlist=tool_allowlist,
+                    require_envelope_signature=require_envelope_signature,
+                    actuator=actuator_instance,
+                    actuator_config=actuator_section["config"],
+                    bearer_tiers=bearer_tiers,
+                )
 
         uvicorn.run(fastapi_app, host=args.host, port=args.port)
         return

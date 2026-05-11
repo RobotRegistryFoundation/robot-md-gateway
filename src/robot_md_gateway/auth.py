@@ -130,6 +130,31 @@ def load_actuator_section(path: Path) -> dict:
     }
 
 
+def load_actuators_section(path: Path) -> list[dict]:
+    """Read the optional ``actuators:`` list-shape section of bearers.yaml.
+
+    The list-shape registers multiple actuators behind one gateway; the
+    receiver routes by `envelope.actuator_name`. Each entry is a dict with
+    ``name`` (required) and ``config`` (optional). Returns ``[]`` when the
+    section is absent — caller should fall back to ``load_actuator_section``.
+    """
+    data = yaml.safe_load(path.read_text())
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("actuators")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not name:
+            continue
+        out.append({"name": name, "config": entry.get("config") or {}})
+    return out
+
+
 class RRFResolverFromEnv:
     """Resolves a kid → public-key PEM via the RRF v2 API.
 

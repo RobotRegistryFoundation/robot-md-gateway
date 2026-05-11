@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from robot_md_gateway.auth import BearerStore, load_actuator_section
+from robot_md_gateway.auth import BearerStore, load_actuator_section, load_actuators_section
 
 
 def _write(tmp_path: Path, content: str) -> Path:
@@ -144,3 +144,60 @@ class TestServeBearerTiers:
         store = BearerStore.from_yaml(bearers_path)
         bearer_tiers = {token: entry.tier for token, entry in store._by_token.items()}
         assert bearer_tiers == {"actuate-token": "actuate"}
+
+
+class TestActuatorsListShape:
+    def test_actuators_list_loaded(self, tmp_path):
+        path = _write(tmp_path, """\
+bearers:
+  - token: actuate-token
+    tier: actuate
+    caller: ops
+actuators:
+  - name: oak-d
+    config:
+      camera: lite
+  - name: so-arm101
+    config:
+      tolerance_rad: 0.07
+""")
+        out = load_actuators_section(path)
+        assert out == [
+            {"name": "oak-d", "config": {"camera": "lite"}},
+            {"name": "so-arm101", "config": {"tolerance_rad": 0.07}},
+        ]
+
+    def test_actuators_list_absent_returns_empty(self, tmp_path):
+        path = _write(tmp_path, """\
+bearers:
+  - token: actuate-token
+    tier: actuate
+    caller: ops
+actuator:
+  name: only-one
+  config: {}
+""")
+        assert load_actuators_section(path) == []
+
+    def test_actuators_list_legacy_shape_returns_empty(self, tmp_path):
+        path = _write(tmp_path, """\
+- token: actuate-token
+  tier: actuate
+  caller: ops
+""")
+        assert load_actuators_section(path) == []
+
+    def test_actuators_list_skips_malformed_entries(self, tmp_path):
+        path = _write(tmp_path, """\
+bearers:
+  - token: t
+    tier: actuate
+    caller: ops
+actuators:
+  - name: ok-one
+    config: {}
+  - missing_name: true
+  - "not-a-dict"
+""")
+        out = load_actuators_section(path)
+        assert out == [{"name": "ok-one", "config": {}}]
