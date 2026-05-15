@@ -99,6 +99,39 @@ sudo cp ./ROBOT.md /etc/robot-md-gateway/ROBOT.md
 sudo systemctl daemon-reload && sudo systemctl enable --now robot-md-gateway
 ```
 
+### Onboarding checklist for the operator
+
+The systemd service runs as the unprivileged `robot` user, which the install
+script adds to `dialout` so it can open `/dev/ttyACM*`. The interactive human
+who installs the gateway usually *also* wants to run `robot-md`,
+`robot-md-mcp`, or `robot-md-gateway` from their own shell — and that
+requires the same group membership for their UID. Without it,
+`backend.open` fails with `EACCES` and the MCP server silently falls through
+to "no backend" mode (see issue #21).
+
+`systemd/install.sh` handles this by default: it adds `$SUDO_USER` to
+`dialout` alongside the service user. To opt out (strictly service-only
+install), pass `--no-interactive-user`:
+
+```bash
+sudo ./systemd/install.sh --no-interactive-user
+```
+
+**You must log out and back in** for the new group membership to attach to
+your login session. After re-login, verify with:
+
+```bash
+groups | grep -E 'dialout|robot-md-gateway' && ls -l /dev/ttyACM0 && echo OK
+```
+
+If `/dev/ttyACM0` is owned by a custom group (e.g. a site-local udev rule
+that hands the device to `robot-md-gateway:robot-md-gateway` rather than
+`dialout`), add yourself to that group too:
+
+```bash
+sudo usermod -aG <group> $USER
+```
+
 ### Ingress — do not port-forward
 
 The gateway binds to `127.0.0.1` by design. Expose it via Tailscale Funnel (named, revocable, TLS-terminated):
