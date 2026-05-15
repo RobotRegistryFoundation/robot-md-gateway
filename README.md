@@ -126,10 +126,12 @@ groups | grep -E 'dialout|robot-md-gateway' && ls -l /dev/ttyACM0 && echo OK
 
 If `/dev/ttyACM0` is owned by a custom group (e.g. a site-local udev rule
 that hands the device to `robot-md-gateway:robot-md-gateway` rather than
-`dialout`), add yourself to that group too:
+`dialout`), add yourself to that group too. Pass the username explicitly —
+under `sudo`, `$USER` is `root` and would add the wrong account:
 
 ```bash
-sudo usermod -aG <group> $USER
+sudo usermod -aG <group> <your-login-username>
+# or, programmatically: sudo usermod -aG <group> "$(logname)"
 ```
 
 ### Ingress — do not port-forward

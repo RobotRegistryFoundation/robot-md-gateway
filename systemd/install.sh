@@ -38,11 +38,16 @@ for arg in "$@"; do
             cat <<EOF
 Usage: $0 [--no-interactive-user]
 
-Provisions the systemd-managed gateway service. By default, also adds the
-invoking user (\$SUDO_USER) to the '${SERIAL_GROUP}' group so they can talk
-to /dev/ttyACM* from an interactive shell (e.g. running 'robot-md-mcp' or
-'robot-md init' as themselves). Pass --no-interactive-user for a strictly
-service-only install.
+Installs robot-md-dispatcher under /opt/robot-md-dispatcher with config at
+/etc/robot-md-dispatcher and the robot-md-dispatcher.service unit. (Package
++ repo were renamed to robot-md-gateway; the on-disk paths and service unit
+still use the legacy 'dispatcher' name and will be migrated in a separate
+release.)
+
+By default, also adds the invoking user (\$SUDO_USER) to the
+'${SERIAL_GROUP}' group so they can talk to /dev/ttyACM* from an interactive
+shell (e.g. running 'robot-md-mcp' or 'robot-md init' as themselves). Pass
+--no-interactive-user for a strictly service-only install.
 EOF
             exit 0
             ;;
