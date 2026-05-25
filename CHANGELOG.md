@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`systemd/install.sh` adds `$SUDO_USER` to the `dialout` group** so the
+  human who installed the gateway can also open `/dev/ttyACM0` from their
+  own shell (mirrors what the service user already gets). Without this,
+  `robot-md-mcp` silently fell through to "no backend" mode and advertised
+  actuator tools that would fail at dispatch
+  ([#21](https://github.com/RobotRegistryFoundation/robot-md-gateway/issues/21)).
+  Opt out with `--no-interactive-user` for service-only installs. The script
+  prints a verification snippet and a "log out and back in" reminder.
+
+- **README onboarding subsection** documents the group-membership
+  requirement, the relogin step, and the verification command.
+
 ## [0.5.0a3] — 2026-05-11
 
 ### Added

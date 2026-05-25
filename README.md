@@ -99,6 +99,29 @@ sudo cp ./ROBOT.md /etc/robot-md-gateway/ROBOT.md
 sudo systemctl daemon-reload && sudo systemctl enable --now robot-md-gateway
 ```
 
+### Onboarding the interactive user
+
+`install.sh` adds `$SUDO_USER` to the `dialout` group so the human who installed
+the gateway can also open `/dev/ttyACM0` from their own shell (needed for
+`robot-md-mcp`, `robot-md doctor`, and calibration flows). Without this step,
+`robot-md-mcp` falls through to "no backend" mode silently — the MCP server
+advertises actuator tools but every call fails at dispatch time
+([#21](https://github.com/RobotRegistryFoundation/robot-md-gateway/issues/21)).
+
+**The group change does not take effect in your current shell.** Log out and
+back in (or `newgrp dialout`), then verify:
+
+```bash
+groups | tr ' ' '\n' | grep -q dialout && ls -l /dev/ttyACM0 && echo OK
+```
+
+For service-only installs where no human will talk to the actuator directly,
+pass `--no-interactive-user`:
+
+```bash
+sudo ./systemd/install.sh --no-interactive-user
+```
+
 ### Ingress — do not port-forward
 
 The gateway binds to `127.0.0.1` by design. Expose it via Tailscale Funnel (named, revocable, TLS-terminated):
