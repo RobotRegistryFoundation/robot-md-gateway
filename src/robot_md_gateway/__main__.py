@@ -178,12 +178,16 @@ def main() -> None:
             from .receiver import make_app
             from .actuator import resolve_actuator
             from .auth import load_actuator_section, load_actuators_section
+            from .cert.audit import AuditChain
             from pathlib import Path as _P
 
             tool_allowlist = _build_tool_allowlist_from_env()
             require_envelope_signature = _require_envelope_signature_from_env()
             hitl_from_manifest = _hitl_from_manifest_from_env()
             require_rrn_binding = _require_rrn_binding_from_env()
+            # In-memory audit chain so executed invokes are recorded (and /v1/audit/last
+            # works). Restart-wiped by design; persistence is out of scope here.
+            audit_chain = AuditChain()
 
             # Load bearer tiers from bearers.yaml if provided.
             bearer_tiers: dict[str, str] = {}
@@ -214,6 +218,7 @@ def main() -> None:
                     require_envelope_signature=require_envelope_signature,
                     hitl_from_manifest=hitl_from_manifest,
                     require_rrn_binding=require_rrn_binding,
+                    audit_chain=audit_chain,
                     actuators=actuators,
                     actuator_configs=actuator_configs,
                     bearer_tiers=bearer_tiers,
@@ -236,6 +241,7 @@ def main() -> None:
                     require_envelope_signature=require_envelope_signature,
                     hitl_from_manifest=hitl_from_manifest,
                     require_rrn_binding=require_rrn_binding,
+                    audit_chain=audit_chain,
                     actuator=actuator_instance,
                     actuator_config=actuator_section["config"],
                     bearer_tiers=bearer_tiers,
