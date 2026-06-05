@@ -18,6 +18,7 @@ def _validate_actuator_config(*, actuator_instance: object, config: dict) -> Non
     is empty.
     """
     import jsonschema
+
     schema = getattr(actuator_instance, "config_schema", None) or {}
     if not schema:
         return
@@ -34,6 +35,26 @@ def _require_envelope_signature_from_env() -> bool:
     """
     raw = os.environ.get("ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE", "")
     return raw.strip().lower() in _TRUTHY
+
+
+def _hitl_from_manifest_from_env() -> bool:
+    """Read ROBOT_MD_HITL_FROM_MANIFEST from env. Defaults to False.
+
+    When on, make_app builds the HiTL policy from the manifest's declared
+    `safety.hitl_gates` (B3) instead of the hardcoded set — production/HIL flips
+    it on via the env var without code changes.
+    """
+    return os.environ.get("ROBOT_MD_HITL_FROM_MANIFEST", "").strip().lower() in _TRUTHY
+
+
+def _require_rrn_binding_from_env() -> bool:
+    """Read ROBOT_MD_REQUIRE_RRN_BINDING from env. Defaults to False.
+
+    When on, the gate chain requires the envelope ruri's RRN to match the
+    manifest's `metadata.rrn` (B4, fail-closed 403). Off preserves the receiver's
+    development-mode default.
+    """
+    return os.environ.get("ROBOT_MD_REQUIRE_RRN_BINDING", "").strip().lower() in _TRUTHY
 
 
 def _build_tool_allowlist_from_env() -> ToolAllowlist | None:
@@ -88,9 +109,7 @@ def main() -> None:
     serve = sub.add_parser("serve", help="Run the gateway HTTP server")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
-    serve.add_argument(
-        "--robot-md", default=None, help="Path to ROBOT.md (sets ROBOT_MD_PATH)"
-    )
+    serve.add_argument("--robot-md", default=None, help="Path to ROBOT.md (sets ROBOT_MD_PATH)")
     serve.add_argument(
         "--bearers",
         default=None,
@@ -152,6 +171,7 @@ def main() -> None:
 
         if args.legacy_byok_launcher:
             from .app import create_app_from_env
+
             fastapi_app = create_app_from_env()
         else:
             from .auth import RRFResolverFromEnv, BearerStore
@@ -162,23 +182,20 @@ def main() -> None:
 
             tool_allowlist = _build_tool_allowlist_from_env()
             require_envelope_signature = _require_envelope_signature_from_env()
+            hitl_from_manifest = _hitl_from_manifest_from_env()
+            require_rrn_binding = _require_rrn_binding_from_env()
 
             # Load bearer tiers from bearers.yaml if provided.
             bearer_tiers: dict[str, str] = {}
             if args.bearers:
                 store = BearerStore.from_yaml(_P(args.bearers))
                 # _by_token is the canonical map; build a name → tier dict.
-                bearer_tiers = {
-                    token: entry.tier
-                    for token, entry in store._by_token.items()
-                }
+                bearer_tiers = {token: entry.tier for token, entry in store._by_token.items()}
 
             # Prefer the list-shape `actuators:` section if present — that
             # turns on multi-actuator routing in the receiver. Fall back to the
             # singular `actuator:` section for backward compat.
-            actuators_list = (
-                load_actuators_section(_P(args.bearers)) if args.bearers else []
-            )
+            actuators_list = load_actuators_section(_P(args.bearers)) if args.bearers else []
             if actuators_list:
                 actuators: dict = {}
                 actuator_configs: dict[str, dict] = {}
@@ -195,12 +212,18 @@ def main() -> None:
                     resolver=RRFResolverFromEnv.from_env(),
                     tool_allowlist=tool_allowlist,
                     require_envelope_signature=require_envelope_signature,
+                    hitl_from_manifest=hitl_from_manifest,
+                    require_rrn_binding=require_rrn_binding,
                     actuators=actuators,
                     actuator_configs=actuator_configs,
                     bearer_tiers=bearer_tiers,
                 )
             else:
-                actuator_section = load_actuator_section(_P(args.bearers)) if args.bearers else {"name": "noop", "config": {}}
+                actuator_section = (
+                    load_actuator_section(_P(args.bearers))
+                    if args.bearers
+                    else {"name": "noop", "config": {}}
+                )
                 actuator_cls = resolve_actuator(actuator_section["name"])
                 actuator_instance = actuator_cls()
                 _validate_actuator_config(
@@ -211,6 +234,8 @@ def main() -> None:
                     resolver=RRFResolverFromEnv.from_env(),
                     tool_allowlist=tool_allowlist,
                     require_envelope_signature=require_envelope_signature,
+                    hitl_from_manifest=hitl_from_manifest,
+                    require_rrn_binding=require_rrn_binding,
                     actuator=actuator_instance,
                     actuator_config=actuator_section["config"],
                     bearer_tiers=bearer_tiers,
