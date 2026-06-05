@@ -9,7 +9,7 @@ from typing import Literal
 import yaml
 from fastapi import Header, HTTPException
 
-Tier = Literal["read", "actuate"]
+Tier = Literal["read", "actuate", "commission"]
 
 
 @dataclass(frozen=True)
@@ -59,7 +59,7 @@ class BearerStore:
         if not entries:
             raise ValueError(f"{path} has no bearer entries")
         for e in entries:
-            if e.tier not in ("read", "actuate"):
+            if e.tier not in ("read", "actuate", "commission"):
                 raise ValueError(f"invalid tier {e.tier!r} for caller {e.caller_id}")
         return cls(entries)
 
