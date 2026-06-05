@@ -28,9 +28,11 @@ Subsequent plans fill in:
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 from pathlib import Path
 
+import yaml
 from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, ValidationError
 from rcan.audit_bundle import canonical_json
@@ -42,10 +44,38 @@ from .cert.envelope import ReplayCache, check_replay, verify_envelope
 from .cert.gates import ConfidencePolicy, HiTLPolicy, check_confidence, check_hitl
 from .cert.policy import ToolAllowlist, check_tier, check_tool
 from .cert.revocation import RevocationCache, RRFRevocationResolver
+from .cert.rrn_binding import verify_rrn_binding
 from .cert.safety import SafetyMonitor
 from .manifest_provenance import RRFResolver, verify_manifest
 
 _DEFAULT_ALLOWLIST = ToolAllowlist(allowed_tools=("mcp__robot__render", "mcp__robot__validate"))
+
+# Manifest frontmatter cache keyed by path -> (mtime, frontmatter dict). Used by the
+# RRN-binding (B4) and manifest-driven HiTL (B3) gates so they read the manifest's
+# metadata.rrn / safety.hitl_gates without re-parsing on every invoke; refreshes when
+# the deployed manifest's mtime changes (e.g. after `resign_and_deploy`).
+_MANIFEST_FM_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _manifest_frontmatter(path: str) -> dict:
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    cached = _MANIFEST_FM_CACHE.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    fm: dict = {}
+    try:
+        text = Path(path).read_text()
+        if text.startswith("---"):
+            end = text.find("\n---", 3)
+            if end != -1:
+                fm = yaml.safe_load(text[3:end]) or {}
+    except (OSError, yaml.YAMLError):
+        fm = {}
+    _MANIFEST_FM_CACHE[path] = (mtime, fm)
+    return fm
 
 
 class InvokeEnvelope(BaseModel):
@@ -82,6 +112,8 @@ def make_app(
     replay_cache: ReplayCache | None = None,
     confidence_policy: ConfidencePolicy | None = None,
     hitl_policy: HiTLPolicy | None = None,
+    hitl_from_manifest: bool = False,
+    require_rrn_binding: bool = False,
     safety_monitor: SafetyMonitor | None = None,
     audit_chain: AuditChain | None = None,
     revocation_resolver: RRFRevocationResolver | None = None,
@@ -283,6 +315,19 @@ def make_app(
             },
         )
 
+        # MF-003 — RRN binding (flagged). Bind the envelope identity to the robot's
+        # registered RRN so a correctly-signed envelope for robot A can't actuate B.
+        if require_rrn_binding:
+            fm = _manifest_frontmatter(envelope.manifest_path)
+            manifest_rrn = (fm.get("metadata") or {}).get("rrn") or fm.get("rrn")
+            rb = verify_rrn_binding(envelope.ruri, manifest_rrn, msg_id=envelope.msg_id)
+            if not rb.accepted:
+                _record("deny", f"rrn_binding: {rb.reason}", manifest_result.kid, envelope.msg_id)
+                raise HTTPException(status_code=403, detail={
+                    "deny": "rrn_binding",
+                    "reason": rb.reason,
+                })
+
         ok, reason = check_tier(tier, envelope.scope, msg_id=envelope.msg_id)
         if not ok:
             _record("deny", f"tier_policy: {reason}", manifest_result.kid, envelope.msg_id)
@@ -313,8 +358,16 @@ def make_app(
                     "reason": reason,
                 })
 
-        if hitl_policy is not None:
-            ok, reason = check_hitl(envelope_dict, hitl_policy)
+        # RC-004 — HiTL. When hitl_from_manifest is on, the manifest's declared
+        # safety.hitl_gates are authoritative (built per-request, cached by mtime);
+        # otherwise fall back to the policy passed at make_app time.
+        effective_hitl = hitl_policy
+        if hitl_from_manifest:
+            fm = _manifest_frontmatter(envelope.manifest_path)
+            gates = (fm.get("safety") or {}).get("hitl_gates")
+            effective_hitl = HiTLPolicy.from_manifest_gates(gates)
+        if effective_hitl is not None:
+            ok, reason = check_hitl(envelope_dict, effective_hitl)
             if not ok:
                 _record(
                     "deny",

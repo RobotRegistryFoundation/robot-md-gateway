@@ -55,10 +55,38 @@ def check_confidence(envelope: dict, policy: ConfidencePolicy) -> tuple[bool, st
 
 
 # RC-004 — HiTL authorization chain
+
+# Maps a manifest `safety.hitl_gates[].scope` value to the RCAN invoke scope(s) it
+# governs. The manifest speaks in operator terms (destructive/system/commission); the
+# gate chain speaks in RCAN scopes (MANIPULATE/EXECUTE/ACTUATE/COMMISSION).
+_MANIFEST_GATE_SCOPE_MAP: dict[str, frozenset[str]] = {
+    "destructive": frozenset({"MANIPULATE"}),
+    "system": frozenset({"EXECUTE", "ACTUATE"}),
+    "commission": frozenset({"COMMISSION"}),
+}
+
+
 @dataclass(frozen=True)
 class HiTLPolicy:
-    """Scopes that require human-in-the-loop authorization."""
+    """Scopes that require human-in-the-loop authorization.
+
+    Default mirrors the historical hardcoded behaviour ({MANIPULATE}). Prefer
+    `from_manifest_gates` so the manifest's declared `safety.hitl_gates` are
+    authoritative instead of a hardcoded set (wired behind a flag in make_app).
+    """
     required_for_scopes: frozenset[str] = frozenset({"MANIPULATE"})
+
+    @classmethod
+    def from_manifest_gates(cls, gates: list[dict] | None) -> "HiTLPolicy":
+        """Build a policy from a manifest's `safety.hitl_gates`. Only gates with
+        `require_auth: true` contribute; their `scope` is mapped to RCAN scope(s).
+        Unrecognized gate scopes are ignored (surfaced elsewhere as a gate-gap)."""
+        scopes: set[str] = set()
+        for gate in gates or []:
+            if not gate.get("require_auth"):
+                continue
+            scopes |= _MANIFEST_GATE_SCOPE_MAP.get(gate.get("scope", ""), frozenset())
+        return cls(required_for_scopes=frozenset(scopes))
 
 
 def check_hitl(envelope: dict, policy: HiTLPolicy) -> tuple[bool, str]:
