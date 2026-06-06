@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from robot_md_gateway.attestation import outcome_status
+import hashlib
+
+from rcan.audit_bundle import canonical_json
+
+from robot_md_gateway.actuator import ActuatorOutcome
+from robot_md_gateway.attestation import outcome_status, telemetry_sha256_of
 
 
 def test_status_deny_maps_to_denied():
@@ -20,14 +25,6 @@ def test_status_allow_clean_failure_maps_to_failure():
 
 def test_status_allow_exception_maps_to_error():
     assert outcome_status(decision="allow", success=False, error_kind="ValueError") == "error"
-
-
-import hashlib
-
-from rcan.audit_bundle import canonical_json
-
-from robot_md_gateway.actuator import ActuatorOutcome
-from robot_md_gateway.attestation import telemetry_sha256_of
 
 
 def test_telemetry_sha256_of_inmemory_dict_matches_canonical_json_hash():

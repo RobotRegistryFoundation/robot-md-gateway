@@ -87,13 +87,18 @@ def outcome_status(*, decision: str, success: bool | None, error_kind: str | Non
 def telemetry_sha256_of(outcome: ActuatorOutcome | None) -> str | None:
     """sha256 of the actuator telemetry, matching receiver.py's audit recipe.
 
-    File bytes if ``telemetry_path`` is set and exists; else the canonical JSON
-    of the in-memory ``telemetry`` dict; else None (no telemetry).
+    If ``telemetry_path`` is set (even if the file does not exist), the path
+    branch is taken: hash file bytes when the file exists, else return None.
+    Only when ``telemetry_path`` is None does the in-memory branch run:
+    canonical JSON of the ``telemetry`` dict. This mirrors the elif structure
+    in receiver.py (lines 191-202) so the signed value equals the audit value.
     """
     if outcome is None:
         return None
-    if outcome.telemetry_path is not None and outcome.telemetry_path.exists():
-        return hashlib.sha256(outcome.telemetry_path.read_bytes()).hexdigest()
-    if outcome.telemetry:
+    if outcome.telemetry_path is not None:
+        if outcome.telemetry_path.exists():
+            return hashlib.sha256(outcome.telemetry_path.read_bytes()).hexdigest()
+        return None
+    elif outcome.telemetry:
         return hashlib.sha256(canonical_json(outcome.telemetry)).hexdigest()
     return None
