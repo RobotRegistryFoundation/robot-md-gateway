@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from robot_md_gateway.shipper import ShipperConfig, ship_once, target_url
 
 
