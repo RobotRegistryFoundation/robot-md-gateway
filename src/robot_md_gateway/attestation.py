@@ -7,6 +7,7 @@ attestation (the gateway still runs as verifier).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from dataclasses import dataclass
@@ -14,6 +15,9 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from rcan.audit_bundle import canonical_json
+
+from .actuator import ActuatorOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -78,3 +82,18 @@ def outcome_status(*, decision: str, success: bool | None, error_kind: str | Non
     if error_kind is not None:
         return "error"
     return "failure"
+
+
+def telemetry_sha256_of(outcome: ActuatorOutcome | None) -> str | None:
+    """sha256 of the actuator telemetry, matching receiver.py's audit recipe.
+
+    File bytes if ``telemetry_path`` is set and exists; else the canonical JSON
+    of the in-memory ``telemetry`` dict; else None (no telemetry).
+    """
+    if outcome is None:
+        return None
+    if outcome.telemetry_path is not None and outcome.telemetry_path.exists():
+        return hashlib.sha256(outcome.telemetry_path.read_bytes()).hexdigest()
+    if outcome.telemetry:
+        return hashlib.sha256(canonical_json(outcome.telemetry)).hexdigest()
+    return None
