@@ -28,3 +28,64 @@ def test_gate1_canonical_json_byte_exact_on_all_vectors():
             f"canonical_json drift on case {case['name']!r}:\n"
             f"  expected: {expected!r}\n  actual:   {actual!r}"
         )
+
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+
+from robot_md_gateway.attestation import build_outcome
+from robot_md_gateway.cert.envelope import sign_envelope
+
+
+def _s3_verify_envelope(env: dict, ed25519_pem: bytes) -> str:
+    """Python mirror of proxy-worker src/crypto/rcan-verify.ts::verifyEnvelope.
+
+    Returns 'verified' | 'verify_failed'. Preimage is canonicalBytes(env,
+    'envelope_signature') == canonical_json(env, exclude='envelope_signature').
+    """
+    try:
+        sig_block = env.get("envelope_signature") or {}
+        sig_b64 = sig_block.get("sig")
+        if not sig_b64:
+            return "verify_failed"
+        pub = serialization.load_pem_public_key(ed25519_pem)
+        if not isinstance(pub, Ed25519PublicKey):
+            return "verify_failed"
+        pub.verify(base64.b64decode(sig_b64), canonical_json(env, exclude="envelope_signature"))
+        return "verified"
+    except (InvalidSignature, ValueError, KeyError):
+        return "verify_failed"
+
+
+def test_gate2_gateway_signed_outcome_verifies_s3_style():
+    priv = Ed25519PrivateKey.generate()
+    pub_pem = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    outcome = build_outcome(
+        corr_id="m1", rrn="RRN-000000000011", status="ok",
+        started_at="2026-06-06T00:00:00+00:00", ended_at="2026-06-06T00:00:00.120000+00:00",
+        duration_ms=120, telemetry_sha256="0" * 64, error=None, result_summary=None,
+    )
+    signed = sign_envelope(priv, outcome, "gateway-kid")
+
+    assert _s3_verify_envelope(signed, pub_pem) == "verified"
+
+
+def test_gate2_tampered_outcome_fails_s3_verify():
+    priv = Ed25519PrivateKey.generate()
+    pub_pem = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    outcome = build_outcome(
+        corr_id="m1", rrn="RRN-000000000011", status="ok",
+        started_at="2026-06-06T00:00:00+00:00", ended_at="2026-06-06T00:00:00+00:00",
+        duration_ms=None, telemetry_sha256=None, error=None, result_summary=None,
+    )
+    signed = sign_envelope(priv, outcome, "gateway-kid")
+    signed["rrn"] = "RRN-999999999999"  # tamper a signed field
+
+    assert _s3_verify_envelope(signed, pub_pem) == "verify_failed"
