@@ -12,9 +12,9 @@ import logging
 import os
 import time
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class ShipperConfig:
     offset_file: Path
 
     @classmethod
-    def from_env(cls) -> "ShipperConfig":
+    def from_env(cls) -> ShipperConfig:
         ingest_key = os.environ.get("PLATATLAS_INGEST_KEY")
         org_slug = os.environ.get("PLATATLAS_ORG_SLUG")
         export = os.environ.get("ROBOT_MD_ATTESTATION_EXPORT_FILE")
@@ -85,16 +85,16 @@ def _http_post(url: str, headers: dict, data: bytes) -> int:
 def ship_once(cfg: ShipperConfig, *, post: PostFn = _http_post) -> int:
     """Ship all unsent complete lines once. Returns the number of lines shipped.
 
-    Reads from the persisted offset; POSTs each complete (newline-terminated)
-    line; advances the offset only after a 2xx. A partial trailing line (no
-    newline yet — the gateway may be mid-write) is left for the next pass.
+    Tails the append-only NDJSON: seeks to the persisted byte offset and reads
+    only the new bytes (so each poll is O(new) not O(total) — a long-running Pi
+    sidecar never re-reads the whole ever-growing file). POSTs each complete
+    (newline-terminated) line and advances the offset only after a 2xx. A partial
+    trailing line (no newline yet — the gateway may be mid-write) is left for the
+    next pass.
     """
     if not cfg.export_file.exists():
         return 0
     offset = _read_offset(cfg)
-    data = cfg.export_file.read_bytes()
-    if offset >= len(data):
-        return 0
     headers = {
         "Authorization": f"Bearer {cfg.ingest_key}",
         "Content-Type": "application/x-ndjson",
@@ -102,18 +102,21 @@ def ship_once(cfg: ShipperConfig, *, post: PostFn = _http_post) -> int:
     url = target_url(cfg)
     shipped = 0
     pos = offset
-    while True:
-        nl = data.find(b"\n", pos)
-        if nl == -1:
-            break  # no complete line remaining
-        line = data[pos:nl + 1]
-        status = post(url, headers, line)
-        if not (200 <= status < 300):
-            logger.warning("platatlas-shipper: POST returned %s; will retry", status)
-            break  # do NOT advance offset -> at-least-once redelivery
-        pos = nl + 1
-        shipped += 1
-        _write_offset(cfg, pos)
+    # "rb": the offset is a byte count and the writer emits UTF-8 bytes, so
+    # binary seek/readline keeps the offset byte-accurate.
+    with cfg.export_file.open("rb") as fh:
+        fh.seek(offset)
+        while True:
+            line = fh.readline()
+            if not line.endswith(b"\n"):
+                break  # EOF or partial trailing line -> leave it for next pass
+            status = post(url, headers, line)
+            if not (200 <= status < 300):
+                logger.warning("platatlas-shipper: POST returned %s; will retry", status)
+                break  # do NOT advance offset -> at-least-once redelivery
+            pos += len(line)
+            shipped += 1
+            _write_offset(cfg, pos)
     return shipped
 
 
@@ -130,7 +133,7 @@ def main() -> None:
         try:
             n = ship_once(cfg)
             backoff = poll_s if n >= 0 else backoff
-        except Exception as exc:  # noqa: BLE001 — sidecar must not die on a transient error
+        except Exception as exc:  # sidecar must not die on a transient error
             logger.warning("platatlas-shipper: ship_once error: %s", exc)
             backoff = min(backoff * 2, 60.0)
         time.sleep(backoff)
