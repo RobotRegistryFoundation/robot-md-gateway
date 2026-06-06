@@ -102,3 +102,20 @@ def telemetry_sha256_of(outcome: ActuatorOutcome | None) -> str | None:
     elif outcome.telemetry:
         return hashlib.sha256(canonical_json(outcome.telemetry)).hexdigest()
     return None
+
+
+def build_action_trace(*, invoke: dict, outcome: dict, ruri: str | None, rrn: str) -> dict:
+    """Wrap the verified invoke + signed outcome in an rcan-action-trace/1 record (§3.7).
+
+    The invoke is passed verbatim (the raw verified envelope). corr_id is taken
+    from invoke.msg_id; ruri/rrn are top-level hints S3 checks against the signed
+    fields (binding_ok).
+    """
+    return {
+        "v": "rcan-action-trace/1",
+        "invoke": invoke,
+        "outcome": outcome,
+        "corr_id": invoke.get("msg_id"),
+        "ruri": ruri,
+        "rrn": rrn,
+    }
