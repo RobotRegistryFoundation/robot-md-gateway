@@ -189,6 +189,12 @@ def main() -> None:
             # works). Restart-wiped by design; persistence is out of scope here.
             audit_chain = AuditChain()
 
+            from .attestation import load_signing_identity_from_env
+
+            signing_identity = load_signing_identity_from_env()
+            _export = os.environ.get("ROBOT_MD_ATTESTATION_EXPORT_FILE")
+            attestation_export_file = _P(_export) if _export else None
+
             # Load bearer tiers from bearers.yaml if provided.
             bearer_tiers: dict[str, str] = {}
             if args.bearers:
@@ -222,6 +228,8 @@ def main() -> None:
                     actuators=actuators,
                     actuator_configs=actuator_configs,
                     bearer_tiers=bearer_tiers,
+                    signing_identity=signing_identity,
+                    attestation_export_file=attestation_export_file,
                 )
             else:
                 actuator_section = (
@@ -245,6 +253,8 @@ def main() -> None:
                     actuator=actuator_instance,
                     actuator_config=actuator_section["config"],
                     bearer_tiers=bearer_tiers,
+                    signing_identity=signing_identity,
+                    attestation_export_file=attestation_export_file,
                 )
 
         uvicorn.run(fastapi_app, host=args.host, port=args.port)
