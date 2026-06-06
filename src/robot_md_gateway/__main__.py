@@ -174,12 +174,17 @@ def main() -> None:
 
             fastapi_app = create_app_from_env()
         else:
-            from .auth import RRFResolverFromEnv, BearerStore
-            from .receiver import make_app
-            from .actuator import resolve_actuator
-            from .auth import load_actuator_section, load_actuators_section
-            from .cert.audit import AuditChain
             from pathlib import Path as _P
+
+            from .actuator import resolve_actuator
+            from .auth import (
+                BearerStore,
+                RRFResolverFromEnv,
+                load_actuator_section,
+                load_actuators_section,
+            )
+            from .cert.audit import AuditChain
+            from .receiver import make_app
 
             tool_allowlist = _build_tool_allowlist_from_env()
             require_envelope_signature = _require_envelope_signature_from_env()
@@ -188,6 +193,12 @@ def main() -> None:
             # In-memory audit chain so executed invokes are recorded (and /v1/audit/last
             # works). Restart-wiped by design; persistence is out of scope here.
             audit_chain = AuditChain()
+
+            from .attestation import load_signing_identity_from_env
+
+            signing_identity = load_signing_identity_from_env()
+            _export = os.environ.get("ROBOT_MD_ATTESTATION_EXPORT_FILE")
+            attestation_export_file = _P(_export) if _export else None
 
             # Load bearer tiers from bearers.yaml if provided.
             bearer_tiers: dict[str, str] = {}
@@ -222,6 +233,8 @@ def main() -> None:
                     actuators=actuators,
                     actuator_configs=actuator_configs,
                     bearer_tiers=bearer_tiers,
+                    signing_identity=signing_identity,
+                    attestation_export_file=attestation_export_file,
                 )
             else:
                 actuator_section = (
@@ -245,6 +258,8 @@ def main() -> None:
                     actuator=actuator_instance,
                     actuator_config=actuator_section["config"],
                     bearer_tiers=bearer_tiers,
+                    signing_identity=signing_identity,
+                    attestation_export_file=attestation_export_file,
                 )
 
         uvicorn.run(fastapi_app, host=args.host, port=args.port)
@@ -280,7 +295,7 @@ def main() -> None:
                 inst = cls()
                 desc = getattr(inst, "description", "")
                 schema = getattr(inst, "config_schema", {})
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 desc = f"<could not instantiate: {exc}>"
                 schema = {}
             marker = " *" if active_name and active_name == name else ""

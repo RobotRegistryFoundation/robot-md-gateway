@@ -46,6 +46,7 @@ dev = [
 [project.scripts]
 robot-md-gateway = "robot_md_gateway.__main__:main"
 robot-md-dispatcher = "robot_md_gateway._legacy_cli:legacy_main"
+platatlas-shipper = "robot_md_gateway.shipper:main"
 
 [project.entry-points."robot_md_gateway.actuators"]
 noop = "robot_md_gateway.actuator:NoOpActuator"
