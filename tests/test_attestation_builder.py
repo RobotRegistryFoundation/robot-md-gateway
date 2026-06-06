@@ -76,3 +76,68 @@ def test_build_action_trace_passes_invoke_verbatim():
     assert rec["invoke"] is invoke  # verbatim, no copy/mutation
     assert rec["corr_id"] == "z"
     assert rec["ruri"] is None
+
+
+from robot_md_gateway.attestation import build_outcome
+
+
+def test_build_outcome_allow_ok_has_required_fields_no_error():
+    out = build_outcome(
+        corr_id="m1",
+        rrn="RRN-000000000011",
+        status="ok",
+        started_at="2026-06-06T00:00:00+00:00",
+        ended_at="2026-06-06T00:00:00.120000+00:00",
+        duration_ms=120,
+        telemetry_sha256="0" * 64,
+        error=None,
+        result_summary=None,
+    )
+    assert out == {
+        "corr_id": "m1",
+        "rrn": "RRN-000000000011",
+        "status": "ok",
+        "started_at": "2026-06-06T00:00:00+00:00",
+        "ended_at": "2026-06-06T00:00:00.120000+00:00",
+        "duration_ms": 120,
+        "telemetry_sha256": "0" * 64,
+    }
+    assert "error" not in out
+    assert "envelope_signature" not in out
+
+
+def test_build_outcome_denied_includes_error_kind_and_message():
+    out = build_outcome(
+        corr_id="m2",
+        rrn="RRN-000000000011",
+        status="denied",
+        started_at="2026-06-06T00:00:00+00:00",
+        ended_at="2026-06-06T00:00:00+00:00",
+        duration_ms=None,
+        telemetry_sha256=None,
+        error={"kind": "hitl_required", "message": "destructive scope"},
+        result_summary=None,
+    )
+    assert out["status"] == "denied"
+    assert out["error"] == {"kind": "hitl_required", "message": "destructive scope"}
+    # Optional fields that are None must be omitted entirely (clean signed shape).
+    assert "duration_ms" not in out
+    assert "telemetry_sha256" not in out
+    assert "result_summary" not in out
+
+
+def test_build_outcome_omits_all_none_optionals():
+    out = build_outcome(
+        corr_id="m3",
+        rrn="RRN-000000000011",
+        status="failure",
+        started_at="2026-06-06T00:00:00+00:00",
+        ended_at="2026-06-06T00:00:00+00:00",
+        duration_ms=None,
+        telemetry_sha256=None,
+        error={"kind": "actuator_failure", "message": "clean false"},
+        result_summary="partial",
+    )
+    assert set(out) == {
+        "corr_id", "rrn", "status", "started_at", "ended_at", "error", "result_summary",
+    }

@@ -119,3 +119,39 @@ def build_action_trace(*, invoke: dict, outcome: dict, ruri: str | None, rrn: st
         "ruri": ruri,
         "rrn": rrn,
     }
+
+
+def build_outcome(
+    *,
+    corr_id: str,
+    rrn: str,
+    status: str,
+    started_at: str,
+    ended_at: str,
+    duration_ms: int | None,
+    telemetry_sha256: str | None,
+    error: dict | None,
+    result_summary: str | None,
+) -> dict:
+    """Build the flat outcome payload (§3.4), WITHOUT envelope_signature.
+
+    Required fields are always present. Optional fields are omitted when None so
+    the signed shape stays clean (the absence of a field is signed, not a null).
+    The caller signs the returned dict with sign_envelope(priv, outcome, kid).
+    """
+    outcome: dict = {
+        "corr_id": corr_id,
+        "rrn": rrn,
+        "status": status,
+        "started_at": started_at,
+        "ended_at": ended_at,
+    }
+    if duration_ms is not None:
+        outcome["duration_ms"] = duration_ms
+    if telemetry_sha256 is not None:
+        outcome["telemetry_sha256"] = telemetry_sha256
+    if error is not None:
+        outcome["error"] = error
+    if result_summary is not None:
+        outcome["result_summary"] = result_summary
+    return outcome
