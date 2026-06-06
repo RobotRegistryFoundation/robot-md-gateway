@@ -548,7 +548,7 @@ def make_app(
                 config=target_config,
             )
             error_kind: str | None = None
-        except Exception as exc:  # noqa: BLE001  intentionally broad — actuator is operator code
+        except Exception as exc:
             outcome = ActuatorOutcome(
                 success=False, outcome_kind="error",
                 error_message=str(exc),

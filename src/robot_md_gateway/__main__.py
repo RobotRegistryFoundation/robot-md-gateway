@@ -174,12 +174,17 @@ def main() -> None:
 
             fastapi_app = create_app_from_env()
         else:
-            from .auth import RRFResolverFromEnv, BearerStore
-            from .receiver import make_app
-            from .actuator import resolve_actuator
-            from .auth import load_actuator_section, load_actuators_section
-            from .cert.audit import AuditChain
             from pathlib import Path as _P
+
+            from .actuator import resolve_actuator
+            from .auth import (
+                BearerStore,
+                RRFResolverFromEnv,
+                load_actuator_section,
+                load_actuators_section,
+            )
+            from .cert.audit import AuditChain
+            from .receiver import make_app
 
             tool_allowlist = _build_tool_allowlist_from_env()
             require_envelope_signature = _require_envelope_signature_from_env()
@@ -290,7 +295,7 @@ def main() -> None:
                 inst = cls()
                 desc = getattr(inst, "description", "")
                 schema = getattr(inst, "config_schema", {})
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 desc = f"<could not instantiate: {exc}>"
                 schema = {}
             marker = " *" if active_name and active_name == name else ""
