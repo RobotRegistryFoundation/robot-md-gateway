@@ -60,3 +60,21 @@ def load_signing_identity_from_env() -> SigningIdentity | None:
         return None
     logger.info("attestation enabled: kid=%s ran=%s", kid, ran or "<unset>")
     return SigningIdentity(priv=priv, kid=kid, ran=ran)
+
+
+def outcome_status(*, decision: str, success: bool | None, error_kind: str | None) -> str:
+    """Map a gateway decision to an S3 status enum value (§3.5).
+
+    deny (any gate)            -> "denied"
+    allow + success            -> "ok"
+    allow + clean failure      -> "failure"   (success is False, no exception)
+    allow + exception          -> "error"     (error_kind set)
+    timeout has no wrapper in v1 and surfaces as "error".
+    """
+    if decision == "deny":
+        return "denied"
+    if success:
+        return "ok"
+    if error_kind is not None:
+        return "error"
+    return "failure"
