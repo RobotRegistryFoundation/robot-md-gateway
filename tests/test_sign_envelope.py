@@ -36,7 +36,7 @@ def test_sign_envelope_round_trips_through_verify_envelope():
 
 
 def test_sign_envelope_signs_over_canonical_json_without_signature_field():
-    priv, pub_pem = _keypair()
+    priv, _ = _keypair()
     body = {"b": 2, "a": 1}
 
     signed = sign_envelope(priv, dict(body), "k")
