@@ -7,7 +7,12 @@ import hashlib
 from rcan.audit_bundle import canonical_json
 
 from robot_md_gateway.actuator import ActuatorOutcome
-from robot_md_gateway.attestation import build_action_trace, outcome_status, telemetry_sha256_of
+from robot_md_gateway.attestation import (
+    build_action_trace,
+    build_outcome,
+    outcome_status,
+    telemetry_sha256_of,
+)
 
 
 def test_status_deny_maps_to_denied():
@@ -76,9 +81,6 @@ def test_build_action_trace_passes_invoke_verbatim():
     assert rec["invoke"] is invoke  # verbatim, no copy/mutation
     assert rec["corr_id"] == "z"
     assert rec["ruri"] is None
-
-
-from robot_md_gateway.attestation import build_outcome
 
 
 def test_build_outcome_allow_ok_has_required_fields_no_error():

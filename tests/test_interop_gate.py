@@ -12,7 +12,13 @@ import base64
 import json
 from pathlib import Path
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from rcan.audit_bundle import canonical_json
+
+from robot_md_gateway.attestation import build_outcome
+from robot_md_gateway.cert.envelope import sign_envelope
 
 FIXTURE = Path(__file__).parent / "fixtures" / "canonical-json-v1.json"
 
@@ -28,14 +34,6 @@ def test_gate1_canonical_json_byte_exact_on_all_vectors():
             f"canonical_json drift on case {case['name']!r}:\n"
             f"  expected: {expected!r}\n  actual:   {actual!r}"
         )
-
-
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-
-from robot_md_gateway.attestation import build_outcome
-from robot_md_gateway.cert.envelope import sign_envelope
 
 
 def _s3_verify_envelope(env: dict, ed25519_pem: bytes) -> str:
