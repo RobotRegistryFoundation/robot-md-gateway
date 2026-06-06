@@ -7,7 +7,7 @@ import hashlib
 from rcan.audit_bundle import canonical_json
 
 from robot_md_gateway.actuator import ActuatorOutcome
-from robot_md_gateway.attestation import outcome_status, telemetry_sha256_of
+from robot_md_gateway.attestation import build_action_trace, outcome_status, telemetry_sha256_of
 
 
 def test_status_deny_maps_to_denied():
@@ -49,9 +49,6 @@ def test_telemetry_sha256_of_returns_none_when_empty():
 
 def test_telemetry_sha256_of_returns_none_when_outcome_is_none():
     assert telemetry_sha256_of(None) is None
-
-
-from robot_md_gateway.attestation import build_action_trace
 
 
 def test_build_action_trace_shape_and_hints():
