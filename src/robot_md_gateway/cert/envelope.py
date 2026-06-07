@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from rcan.audit_bundle import canonical_json
 
 from ..manifest_provenance import RRFResolver
@@ -18,6 +18,7 @@ __all__ = [
     "ReplayCache",
     "canonical_json",
     "check_replay",
+    "sign_envelope",
     "verify_envelope",
 ]
 
@@ -65,6 +66,27 @@ def verify_envelope(envelope: dict, *, resolver: RRFResolver) -> EnvelopeVerific
         evidence={"kid": kid, "msg_id": envelope.get("msg_id")},
     )
     return EnvelopeVerificationResult(accepted=True, kid=kid, reason="ok")
+
+
+def sign_envelope(priv: Ed25519PrivateKey, body: dict, kid: str) -> dict:
+    """Attach a detached Ed25519 ``envelope_signature`` over ``canonical_json(body)``.
+
+    ``body`` MUST NOT already contain an ``envelope_signature`` key. The signature
+    covers the canonical bytes of ``body`` as-is; verification recomputes
+    ``canonical_json(envelope, exclude="envelope_signature")``, which strips the
+    block this function attaches. Standard (not urlsafe) base64; ``alg="Ed25519"``.
+
+    Promoted verbatim from ``scripts/emit_gateway_authority_report.py:_sign_envelope``
+    so the production outcome-signer and the CI evidence-signer share one recipe.
+    Mutates and returns ``body``.
+    """
+    sig = priv.sign(canonical_json(body))
+    body["envelope_signature"] = {
+        "kid": kid,
+        "alg": "Ed25519",
+        "sig": base64.b64encode(sig).decode(),
+    }
+    return body
 
 
 class ReplayCache:

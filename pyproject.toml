@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "robot-md-gateway"
-version = "0.5.0a3"
+version = "0.5.0a4"
 description = "Enforcement gateway for the OpenCastor stack — receives signed RCAN action envelopes, verifies manifest provenance, applies tier policy + tool allowlist, dispatches to drivers. Mandatory exclusive path between agent intent and any actuator."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -46,6 +46,7 @@ dev = [
 [project.scripts]
 robot-md-gateway = "robot_md_gateway.__main__:main"
 robot-md-dispatcher = "robot_md_gateway._legacy_cli:legacy_main"
+platatlas-shipper = "robot_md_gateway.shipper:main"
 
 [project.entry-points."robot_md_gateway.actuators"]
 noop = "robot_md_gateway.actuator:NoOpActuator"

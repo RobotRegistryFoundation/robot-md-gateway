@@ -34,6 +34,34 @@ class TestBearersLegacyListShape:
         assert section == {"name": "noop", "config": {}}
 
 
+class TestBearerTierValidation:
+    """B2 added a `commission` tier (cert/policy.check_tier denies actuate on COMMISSION
+    scope and requires this dedicated tier). The bearer LOADER must accept it too — it was
+    missed, so a commission bearer crashed `from_yaml` and the gateway failed to start."""
+
+    def test_commission_tier_loads(self, tmp_path):
+        path = _write(tmp_path, """\
+bearers:
+  - token: commission-token
+    tier: commission
+    caller: hil-commission
+""")
+        store = BearerStore.from_yaml(path)
+        entry = store.resolve("commission-token")
+        assert entry is not None
+        assert entry.tier == "commission"
+
+    def test_unknown_tier_still_rejected(self, tmp_path):
+        path = _write(tmp_path, """\
+bearers:
+  - token: bogus
+    tier: superuser
+    caller: nope
+""")
+        with pytest.raises(ValueError, match="invalid tier"):
+            BearerStore.from_yaml(path)
+
+
 class TestBearersNewDictShape:
     def test_new_shape_parses_bearers_under_key(self, tmp_path):
         path = _write(tmp_path, """\
