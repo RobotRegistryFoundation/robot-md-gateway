@@ -185,3 +185,38 @@ def test_signature_gate_deny_emits_pre_manifest_with_best_effort_rrn(tmp_path, i
     assert out["corr_id"] == "presig-1"
     assert out["error"]["kind"] == "envelope_signature"
     assert out["rrn"] == ""              # best-effort empty on pre-manifest denies
+
+
+def test_attestation_export_failure_is_best_effort(tmp_path, identity):
+    """A failing attestation export must NOT escalate to a 500 or suppress audit:
+    audit-first + best-effort emit (regression for the pre-merge review finding —
+    a signing/IO error must never turn a real actuation or a clean deny into a 500)."""
+    # Make the export path unwritable: its parent is a regular FILE, so
+    # _emit_attestation's parent.mkdir()/open() raises — which must be swallowed.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file, not a directory")
+    export = blocker / "traces.ndjson"   # .parent is a file -> mkdir/open fails
+    audit = AuditChain()
+    app = make_app(
+        resolver=_Resolver({MANIFEST_KID: MANIFEST_PUB}),
+        tool_allowlist=ToolAllowlist(allowed_tools=("mcp__robot__render",)),
+        audit_chain=audit,
+        signing_identity=identity,
+        attestation_export_file=export,
+    )
+    # Allow path: a successful actuation still returns 200 (not 500)…
+    r = TestClient(app).post("/v1/invoke", json=_base_envelope("besteffort-ok"))
+    assert r.status_code == 200
+    # …the audit entry is still recorded (audit runs BEFORE attestation)…
+    assert len(audit.entries) == 1
+    assert audit.entries[0].msg_id == "besteffort-ok"
+    # …and no trace line was written (the export genuinely failed).
+    assert not export.exists()
+
+    # Deny path: a clean policy deny still returns 403 (not 500), audit still grows.
+    r = TestClient(app).post(
+        "/v1/invoke",
+        json=_base_envelope("besteffort-deny", tool_name="mcp__robot__execute_capability"),
+    )
+    assert r.status_code == 403
+    assert len(audit.entries) == 2

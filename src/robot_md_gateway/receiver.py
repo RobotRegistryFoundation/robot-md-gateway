@@ -28,6 +28,7 @@ Subsequent plans fill in:
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import time
 from datetime import datetime, timezone
@@ -255,44 +256,57 @@ def make_app(
         started_at: str | None = None,
         ended_at: str | None = None,
     ) -> None:
-        _emit_attestation(
-            decision=decision, reason=reason, msg_id=msg_id,
-            envelope_dict=envelope_dict, ruri=ruri, rrn=rrn,
-            started_at=started_at, ended_at=ended_at,
-            outcome=outcome, error_kind=error_kind,
-        )
-        if audit_chain is None:
-            return
-        entry_kwargs = dict(
-            msg_id=msg_id,
-            timestamp_ms=int(time.time() * 1000),
-            decision=decision,
-            decision_reason=reason,
-            envelope_kid=kid,
-        )
-        if outcome is not None:
-            telem_sha: str | None = None
-            telem_path: str | None = None
-            if outcome.telemetry_path is not None:
-                # Hash the file's bytes for tamper-evidence; record path as string.
-                telem_path = str(outcome.telemetry_path)
-                if outcome.telemetry_path.exists():
-                    telem_sha = hashlib.sha256(
-                        outcome.telemetry_path.read_bytes()
-                    ).hexdigest()
-            elif outcome.telemetry:
-                # Hash the canonical JSON of the in-memory telemetry dict.
-                telem_sha = hashlib.sha256(
-                    canonical_json(outcome.telemetry)
-                ).hexdigest()
-            entry_kwargs.update(
-                actuator_name=actuator_name,
-                actuator_outcome_kind=outcome.outcome_kind,
-                actuator_telemetry_sha256=telem_sha,
-                actuator_telemetry_path=telem_path,
-                actuator_error_kind=error_kind,
+        # Audit FIRST — tamper-evident evidence (EV-001) must never be suppressed
+        # by a downstream attestation failure.
+        if audit_chain is not None:
+            entry_kwargs = dict(
+                msg_id=msg_id,
+                timestamp_ms=int(time.time() * 1000),
+                decision=decision,
+                decision_reason=reason,
+                envelope_kid=kid,
             )
-        audit_chain.append(AuditEntry(**entry_kwargs))
+            if outcome is not None:
+                telem_sha: str | None = None
+                telem_path: str | None = None
+                if outcome.telemetry_path is not None:
+                    # Hash the file's bytes for tamper-evidence; record path as string.
+                    telem_path = str(outcome.telemetry_path)
+                    if outcome.telemetry_path.exists():
+                        telem_sha = hashlib.sha256(
+                            outcome.telemetry_path.read_bytes()
+                        ).hexdigest()
+                elif outcome.telemetry:
+                    # Hash the canonical JSON of the in-memory telemetry dict.
+                    telem_sha = hashlib.sha256(
+                        canonical_json(outcome.telemetry)
+                    ).hexdigest()
+                entry_kwargs.update(
+                    actuator_name=actuator_name,
+                    actuator_outcome_kind=outcome.outcome_kind,
+                    actuator_telemetry_sha256=telem_sha,
+                    actuator_telemetry_path=telem_path,
+                    actuator_error_kind=error_kind,
+                )
+            audit_chain.append(AuditEntry(**entry_kwargs))
+        # Attestation LAST + BEST-EFFORT: it fires even when audit_chain is None
+        # (independent observability), but a signing / file-I/O error here must
+        # NEVER propagate into the invoke result or alter actuation. A real
+        # actuation that already executed must not be reported as a 500, and a
+        # clean deny must not become a 500. The shipper + backfill backstop any
+        # dropped record.
+        try:
+            _emit_attestation(
+                decision=decision, reason=reason, msg_id=msg_id,
+                envelope_dict=envelope_dict, ruri=ruri, rrn=rrn,
+                started_at=started_at, ended_at=ended_at,
+                outcome=outcome, error_kind=error_kind,
+            )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "attestation emit failed (non-fatal; audit already recorded)",
+                exc_info=True,
+            )
 
     # Backward-compat shim: existing deny-path call sites still call _record.
     def _record(
