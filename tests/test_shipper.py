@@ -100,3 +100,29 @@ def test_ship_once_no_file_is_noop(tmp_path):
         export_file=tmp_path / "absent.ndjson", offset_file=tmp_path / "absent.offset",
     )
     assert ship_once(cfg, post=lambda *a, **k: 200) == 0
+
+
+def test_ship_once_resets_stale_offset_after_truncation(tmp_path):
+    """If the NDJSON is truncated/rotated (persisted offset > file size), the shipper
+    must reset to 0 and re-deliver — never seek past EOF and stall forever."""
+    export = tmp_path / "traces.ndjson"
+    offset = tmp_path / "traces.offset"
+    line = json.dumps({"corr_id": "m1"}) + "\n"
+    export.write_text(line)            # small, freshly-rotated file
+    offset.write_text("99999")         # stale offset far past the new EOF
+
+    posted = []
+
+    def fake_post(url, headers, data):
+        posted.append(data)
+        return 200
+
+    cfg = ShipperConfig(
+        ingest_key="sk_live_abc", org_slug="opencastor", base_url=None,
+        export_file=export, offset_file=offset,
+    )
+    shipped = ship_once(cfg, post=fake_post)
+
+    assert shipped == 1                                       # re-delivered, not stalled
+    assert posted == [line.encode("utf-8")]
+    assert int(offset.read_text()) == len(line.encode("utf-8"))
