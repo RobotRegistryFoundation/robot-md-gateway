@@ -95,6 +95,22 @@ def ship_once(cfg: ShipperConfig, *, post: PostFn = _http_post) -> int:
     if not cfg.export_file.exists():
         return 0
     offset = _read_offset(cfg)
+    # Truncation/rotation guard: a persisted offset past the current EOF (logrotate,
+    # manual wipe, file re-created smaller) would seek past the end and stall forever.
+    # Reset to 0 and re-deliver from the start (S3 ingest is idempotent per trace row).
+    try:
+        size = cfg.export_file.stat().st_size
+    except OSError:
+        size = 0
+    if offset > size:
+        logger.warning(
+            "platatlas-shipper: persisted offset %d > file size %d (truncated/rotated?); "
+            "resetting to 0 and re-delivering",
+            offset,
+            size,
+        )
+        offset = 0
+        _write_offset(cfg, 0)
     headers = {
         "Authorization": f"Bearer {cfg.ingest_key}",
         "Content-Type": "application/x-ndjson",
@@ -131,8 +147,8 @@ def main() -> None:
     backoff = poll_s
     while True:
         try:
-            n = ship_once(cfg)
-            backoff = poll_s if n >= 0 else backoff
+            ship_once(cfg)
+            backoff = poll_s  # reset backoff after a clean poll
         except Exception as exc:  # sidecar must not die on a transient error
             logger.warning("platatlas-shipper: ship_once error: %s", exc)
             backoff = min(backoff * 2, 60.0)

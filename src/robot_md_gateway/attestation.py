@@ -54,7 +54,9 @@ def load_signing_identity_from_env() -> SigningIdentity | None:
         return None
     try:
         priv = serialization.load_pem_private_key(path.read_bytes(), password=None)
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, TypeError) as exc:
+        # TypeError: an encrypted PKCS8 key loaded with password=None. Any
+        # missing/invalid input -> graceful verifier-only (per the docstring).
         logger.warning("attestation disabled: cannot load key file %s: %s", key_file, exc)
         return None
     if not isinstance(priv, Ed25519PrivateKey):
