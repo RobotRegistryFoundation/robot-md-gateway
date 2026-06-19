@@ -1,9 +1,11 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  # Manual-only: all CI runs LOCALLY (operator directive 2026-06-19 — the org's
+  # GitHub Actions are billing-blocked and we keep CI/deploys off Actions). Run:
+  #   pip install -e ".[dev]" && pytest -q && ruff check src tests
+  # Restore [push, pull_request] if Actions billing is healthy again.
+  workflow_dispatch:
 
 permissions:
   contents: read

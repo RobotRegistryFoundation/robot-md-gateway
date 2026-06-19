@@ -14,3 +14,4 @@ venv/
 .env
 .env.local
 dist/
+signed_refusal.json
