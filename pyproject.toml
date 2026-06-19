@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "robot-md-gateway"
-version = "0.5.0a4"
+version = "0.5.0a5"
 description = "Enforcement gateway for the OpenCastor stack — receives signed RCAN action envelopes, verifies manifest provenance, applies tier policy + tool allowlist, dispatches to drivers. Mandatory exclusive path between agent intent and any actuator."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,16 +31,25 @@ dependencies = [
     "python-frontmatter>=1.0",
     "pydantic>=2.6",
     "rcan>=3.4.0",
-    "robot-md>=1.1",
     "jsonschema>=4.0",
 ]
+# NOTE: `robot-md` is intentionally NOT a hard runtime dependency. The gateway
+# core (serve / verify / sign / actuate) never imports it; it is used ONLY by the
+# optional `init` wizard (init_wizard.py::_validate_robot_md), behind a lazy
+# `try: from robot_md ... except ImportError` that already tells the user to
+# `pip install robot-md`. Keeping it hard created a circular dependency
+# (robot-md depends on robot-md-gateway). It now lives in the [init] extra (and
+# [dev] so the wizard tests run). Install the wizard with
+# `pip install robot-md-gateway[init]`.
 
 [project.optional-dependencies]
+init = ["robot-md>=1.1"]  # the `robot-md-gateway init` wizard's ROBOT.md validator
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "httpx>=0.27",
     "ruff>=0.1",
+    "robot-md>=1.1",  # init_wizard tests exercise the real robot_md parser/validator
 ]
 
 [project.scripts]
