@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.5.0a6] — 2026-07-16
+
+### Added
+
+- **Signed receipts on the wire.** `/v1/invoke` now embeds the Ed25519-signed
+  outcome in the HTTP response so a client can verify the receipt without the
+  NDJSON attestation file. ALLOW (200) responses carry a top-level
+  `envelope_signature: {kid, alg, sig}`, the full signed `outcome`, and
+  `attestation: "attested"`; 403 DENY responses carry the same signed record
+  inside `detail`. The signature reuses the exact `build_outcome` +
+  `sign_envelope` recipe as the file trace — the wire receipt is byte-identical
+  to the file's `outcome` (no new crypto).
+- **Explicit unattested marker.** When `ROBOT_MD_ATTESTATION_KEY_FILE`/`KID`
+  are unset the gateway still returns 200/403 (never crashes) with
+  `attestation: "unattested"` and `envelope_signature: null`, so a client can
+  render honestly.
+- **`scripts/verify_receipt.py`.** Standalone third-party verifier (stdlib +
+  `cryptography` only, no gateway import) that verifies a receipt's signature
+  against the kid's public key and proves a one-byte flip fails. Exits 0 only
+  when authentic AND tamper-evident.
+- **Tests.** `test_receiver_signed_wire.py` (signed-allow / signed-deny /
+  unattested-fallback / tamper / wrong-key) and `test_verify_receipt_script.py`
+  (subprocess end-to-end).
+
 ## [0.5.0a3] — 2026-05-11
 
 ### Added
