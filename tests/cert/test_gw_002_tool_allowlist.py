@@ -28,19 +28,29 @@ def _reset_cert_report():
     yield
 
 
+# Behavior change (T-003 anon fail-open fix): the tier gate now runs BEFORE the
+# tool-allowlist gate, and anon (no/unknown bearer) is denied actuation. These
+# tests exercise the GW-002 tool allowlist on the MANIPULATE scope, so they must
+# present an actuate-tier bearer to reach the tool gate at all — otherwise they'd
+# stop at tier_policy. The bearer is incidental to what they assert (the tool
+# allowlist), so it is baked into the client helper.
+ACTUATE_HEADERS = {"Authorization": "Bearer gw-002-actuate"}
+
+
 def _client_with_allowlist(allowed: tuple[str, ...]):
     kid = (FIXTURES / "signing-key.kid").read_text().strip()
     pub = (FIXTURES / "signing-key.pub").read_bytes()
     app = make_app(
         resolver=_FakeResolver({kid: pub}),
         tool_allowlist=ToolAllowlist(allowed_tools=allowed),
+        bearer_tiers={"gw-002-actuate": "actuate"},
     )
     return TestClient(app)
 
 
 def test_gw_002_unallowlisted_tool_denied():
     client = _client_with_allowlist(allowed=("mcp__robot__render", "mcp__robot__validate"))
-    response = client.post("/v1/invoke", json={
+    response = client.post("/v1/invoke", headers=ACTUATE_HEADERS, json={
         "msg_id": "msg-gw-002-1",
         "type": "INVOKE",
         "ruri": "rcan://lab.local/test/bot/00000999",
@@ -57,7 +67,7 @@ def test_gw_002_allowlisted_tool_accepted():
     client = _client_with_allowlist(
         allowed=("mcp__robot__render", "mcp__robot__execute_capability"),
     )
-    response = client.post("/v1/invoke", json={
+    response = client.post("/v1/invoke", headers=ACTUATE_HEADERS, json={
         "msg_id": "msg-gw-002-2",
         "type": "INVOKE",
         "ruri": "rcan://lab.local/test/bot/00000999",
@@ -71,7 +81,7 @@ def test_gw_002_allowlisted_tool_accepted():
 
 def test_gw_002_pass_recorded():
     client = _client_with_allowlist(allowed=("mcp__robot__render",))
-    client.post("/v1/invoke", json={
+    client.post("/v1/invoke", headers=ACTUATE_HEADERS, json={
         "msg_id": "msg-gw-002-3", "type": "INVOKE",
         "ruri": "rcan://lab.local/test/bot/00000999",
         "scope": "MANIPULATE",

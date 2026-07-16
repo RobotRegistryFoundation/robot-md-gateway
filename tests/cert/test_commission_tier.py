@@ -32,3 +32,22 @@ def test_existing_flows_unchanged():
     assert check_tier("read", "READ", msg_id="m")[0] is True
     assert check_tier("actuate", "MANIPULATE", msg_id="m")[0] is True
     assert check_tier("read", "MANIPULATE", msg_id="m")[0] is False
+
+
+# T-003 — anon fail-open fix. `anon` (no/unknown bearer) must be denied actuation
+# exactly like `read`, while read/discover on non-actuation scopes stays open.
+def test_anon_tier_denied_actuation():
+    for scope in ("MANIPULATE", "NAVIGATE", "ACTUATE", "EXECUTE"):
+        ok, reason = check_tier("anon", scope, msg_id="m")
+        assert not ok, f"anon should be denied {scope}"
+        assert "anon-tier" in reason
+
+
+def test_anon_tier_denied_commission():
+    ok, _reason = check_tier("anon", "COMMISSION", msg_id="m")
+    assert not ok
+
+
+def test_anon_tier_allows_read_scope():
+    # read/discover on a non-actuation scope stays open for anon.
+    assert check_tier("anon", "READ", msg_id="m")[0] is True

@@ -178,26 +178,31 @@ def make_app(
     app.state.actuator_configs = actuator_configs
     app.state.multi_actuator_mode = multi_actuator_mode
 
-    def _emit_attestation(
+    def _build_signed_outcome(
         *,
         decision: str,
         reason: str,
         msg_id: str,
-        envelope_dict: dict | None,
-        ruri: str | None,
         rrn: str | None,
         started_at: str | None,
         ended_at: str | None,
         outcome: ActuatorOutcome | None,
         error_kind: str | None,
-    ) -> None:
-        # Attestation is independent of the audit chain: it must fire even when
-        # audit_chain is None. Disabled when no signing identity / no export path.
-        if signing_identity is None or attestation_export_file is None:
-            return
-        # An unparseable invoke (422) never reaches a _record call, so any
-        # envelope_dict here has at least the signed fields we were given.
-        invoke = envelope_dict if envelope_dict is not None else {"msg_id": msg_id}
+    ) -> tuple[dict | None, str]:
+        """Build the Ed25519-signed outcome for BOTH the wire receipt and the
+        NDJSON attestation export.
+
+        Returns ``(signed_outcome, marker)``. ``marker`` is ``"attested"`` when a
+        signing identity is configured (ROBOT_MD_ATTESTATION_KEY_FILE/KID) and a
+        signature was produced, else ``"unattested"`` (the gateway runs
+        verifier-only; the wire carries ``envelope_signature: null``).
+
+        Reuses the exact ``build_outcome`` + ``sign_envelope`` recipe the file
+        export used, so the wire receipt is byte-identical to the file trace's
+        ``outcome`` — no new crypto is introduced.
+        """
+        if signing_identity is None:
+            return None, "unattested"
         status = outcome_status(
             decision=decision,
             success=(outcome.success if outcome is not None else None),
@@ -233,13 +238,49 @@ def make_app(
             error=error,
             result_summary=None,
         )
-        signed_outcome = sign_envelope(signing_identity.priv, body, signing_identity.kid)
+        signed = sign_envelope(signing_identity.priv, body, signing_identity.kid)
+        return signed, "attested"
+
+    def _emit_attestation(
+        *,
+        signed_outcome: dict | None,
+        msg_id: str,
+        envelope_dict: dict | None,
+        ruri: str | None,
+        rrn: str | None,
+    ) -> None:
+        # Attestation export is independent of the audit chain: it must fire even
+        # when audit_chain is None. Disabled when no signing identity / no export
+        # path / nothing was signed.
+        if signing_identity is None or attestation_export_file is None:
+            return
+        if signed_outcome is None:
+            return
+        # An unparseable invoke (422) never reaches a _record call, so any
+        # envelope_dict here has at least the signed fields we were given.
+        invoke = envelope_dict if envelope_dict is not None else {"msg_id": msg_id}
         record = build_action_trace(
             invoke=invoke, outcome=signed_outcome, ruri=ruri, rrn=rrn or "",
         )
         attestation_export_file.parent.mkdir(parents=True, exist_ok=True)
         with attestation_export_file.open("a", encoding="utf-8") as fh:
             fh.write(canonical_json(record).decode("utf-8") + "\n")
+
+    def _attach_signature(target: dict, signed_outcome: dict | None, marker: str) -> None:
+        """Attach the wire-receipt signature to a response/deny-detail dict IN PLACE.
+
+        Always sets ``attestation`` (``attested``|``unattested``). When attested,
+        embeds the full signed ``outcome`` receipt and lifts its
+        ``envelope_signature`` ({kid, alg, sig}) to the top level so a client can
+        read it directly; when unattested, sets ``envelope_signature: null`` so the
+        client can render honestly.
+        """
+        target["attestation"] = marker
+        if signed_outcome is not None:
+            target["outcome"] = signed_outcome
+            target["envelope_signature"] = signed_outcome["envelope_signature"]
+        else:
+            target["envelope_signature"] = None
 
     def _record_with_outcome(
         decision: str,
@@ -255,7 +296,23 @@ def make_app(
         rrn: str | None = None,
         started_at: str | None = None,
         ended_at: str | None = None,
-    ) -> None:
+    ) -> tuple[dict | None, str]:
+        # Sign the outcome ONCE for both the wire receipt and the file export.
+        # Best-effort: a signing failure must never crash the request (mirrors the
+        # file-export best-effort contract) — fall back to an explicit unattested
+        # marker so the caller can still return a well-formed (unsigned) response.
+        try:
+            signed_outcome, marker = _build_signed_outcome(
+                decision=decision, reason=reason, msg_id=msg_id, rrn=rrn,
+                started_at=started_at, ended_at=ended_at,
+                outcome=outcome, error_kind=error_kind,
+            )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "wire outcome signing failed (non-fatal; returning unattested)",
+                exc_info=True,
+            )
+            signed_outcome, marker = None, "unattested"
         # Audit FIRST — tamper-evident evidence (EV-001) must never be suppressed
         # by a downstream attestation failure.
         if audit_chain is not None:
@@ -297,16 +354,15 @@ def make_app(
         # dropped record.
         try:
             _emit_attestation(
-                decision=decision, reason=reason, msg_id=msg_id,
+                signed_outcome=signed_outcome, msg_id=msg_id,
                 envelope_dict=envelope_dict, ruri=ruri, rrn=rrn,
-                started_at=started_at, ended_at=ended_at,
-                outcome=outcome, error_kind=error_kind,
             )
         except Exception:
             logging.getLogger(__name__).warning(
                 "attestation emit failed (non-fatal; audit already recorded)",
                 exc_info=True,
             )
+        return signed_outcome, marker
 
     # Backward-compat shim: existing deny-path call sites still call _record.
     def _record(
@@ -320,8 +376,8 @@ def make_app(
         rrn: str | None = None,
         started_at: str | None = None,
         ended_at: str | None = None,
-    ) -> None:
-        _record_with_outcome(
+    ) -> tuple[dict | None, str]:
+        return _record_with_outcome(
             decision=decision, reason=reason, kid=kid, msg_id=msg_id,
             envelope_dict=envelope_dict, ruri=ruri, rrn=rrn,
             started_at=started_at, ended_at=ended_at,
@@ -349,20 +405,19 @@ def make_app(
             safety_monitor.tick()
             if not safety_monitor.can_actuate():
                 reason = f"gateway state={safety_monitor.state.value}"
-                _record(
+                signed, marker = _record(
                     "deny", f"safety_state: {reason}", None, raw_msg_id,
                     envelope_dict=envelope_dict, ruri=envelope_dict.get("ruri"),
                     rrn="", started_at=started_at,
                 )
-                raise HTTPException(status_code=403, detail={
-                    "deny": "safety_state",
-                    "reason": reason,
-                })
+                detail = {"deny": "safety_state", "reason": reason}
+                _attach_signature(detail, signed, marker)
+                raise HTTPException(status_code=403, detail=detail)
 
         if require_envelope_signature:
             env_result = verify_envelope(envelope_dict, resolver=resolver)
             if not env_result.accepted:
-                _record(
+                signed, marker = _record(
                     "deny",
                     f"envelope_signature: {env_result.reason}",
                     env_result.kid,
@@ -370,21 +425,19 @@ def make_app(
                     envelope_dict=envelope_dict, ruri=envelope_dict.get("ruri"),
                     rrn="", started_at=started_at,
                 )
-                raise HTTPException(status_code=403, detail={
-                    "deny": "envelope_signature",
-                    "reason": env_result.reason,
-                })
+                detail = {"deny": "envelope_signature", "reason": env_result.reason}
+                _attach_signature(detail, signed, marker)
+                raise HTTPException(status_code=403, detail=detail)
             ok, reason = check_replay(envelope_dict, replay_cache)
             if not ok:
-                _record(
+                signed, marker = _record(
                     "deny", f"replay: {reason}", env_result.kid, raw_msg_id,
                     envelope_dict=envelope_dict, ruri=envelope_dict.get("ruri"),
                     rrn="", started_at=started_at,
                 )
-                raise HTTPException(status_code=403, detail={
-                    "deny": "replay",
-                    "reason": reason,
-                })
+                detail = {"deny": "replay", "reason": reason}
+                _attach_signature(detail, signed, marker)
+                raise HTTPException(status_code=403, detail=detail)
             if (
                 revocation_resolver is not None
                 and env_result.kid
@@ -392,7 +445,7 @@ def make_app(
                     env_result.kid, resolver=revocation_resolver,
                 )
             ):
-                _record(
+                signed, marker = _record(
                     "deny",
                     f"revoked_key: kid={env_result.kid}",
                     env_result.kid,
@@ -400,10 +453,12 @@ def make_app(
                     envelope_dict=envelope_dict, ruri=envelope_dict.get("ruri"),
                     rrn="", started_at=started_at,
                 )
-                raise HTTPException(status_code=403, detail={
+                detail = {
                     "deny": "revoked_key",
                     "reason": f"kid {env_result.kid} is revoked",
-                })
+                }
+                _attach_signature(detail, signed, marker)
+                raise HTTPException(status_code=403, detail=detail)
 
         try:
             envelope = InvokeEnvelope(**envelope_dict)
@@ -421,7 +476,7 @@ def make_app(
                     "msg_id": envelope.msg_id,
                 },
             )
-            _record(
+            signed, marker = _record(
                 "deny",
                 f"manifest_provenance: {manifest_result.reason}",
                 manifest_result.kid,
@@ -429,11 +484,13 @@ def make_app(
                 envelope_dict=envelope_dict, ruri=envelope.ruri,
                 rrn="", started_at=started_at,
             )
-            raise HTTPException(status_code=403, detail={
+            detail = {
                 "deny": "manifest_provenance",
                 "reason": manifest_result.reason,
                 "kid": manifest_result.kid,
-            })
+            }
+            _attach_signature(detail, signed, marker)
+            raise HTTPException(status_code=403, detail=detail)
 
         cert_report.record_property_pass(
             property_id="MF-001",
@@ -454,44 +511,41 @@ def make_app(
         if require_rrn_binding:
             rb = verify_rrn_binding(envelope.ruri, manifest_rrn, msg_id=envelope.msg_id)
             if not rb.accepted:
-                _record(
+                signed, marker = _record(
                     "deny", f"rrn_binding: {rb.reason}", manifest_result.kid, envelope.msg_id,
                     envelope_dict=envelope_dict, ruri=envelope.ruri,
                     rrn=manifest_rrn, started_at=started_at,
                 )
-                raise HTTPException(status_code=403, detail={
-                    "deny": "rrn_binding",
-                    "reason": rb.reason,
-                })
+                detail = {"deny": "rrn_binding", "reason": rb.reason}
+                _attach_signature(detail, signed, marker)
+                raise HTTPException(status_code=403, detail=detail)
 
         ok, reason = check_tier(tier, envelope.scope, msg_id=envelope.msg_id)
         if not ok:
-            _record(
+            signed, marker = _record(
                 "deny", f"tier_policy: {reason}", manifest_result.kid, envelope.msg_id,
                 envelope_dict=envelope_dict, ruri=envelope.ruri,
                 rrn=manifest_rrn, started_at=started_at,
             )
-            raise HTTPException(status_code=403, detail={
-                "deny": "tier_policy",
-                "reason": reason,
-            })
+            detail = {"deny": "tier_policy", "reason": reason}
+            _attach_signature(detail, signed, marker)
+            raise HTTPException(status_code=403, detail=detail)
 
         allowed, reason = check_tool(envelope.tool_name, tool_allowlist, msg_id=envelope.msg_id)
         if not allowed:
-            _record(
+            signed, marker = _record(
                 "deny", f"tool_allowlist: {reason}", manifest_result.kid, envelope.msg_id,
                 envelope_dict=envelope_dict, ruri=envelope.ruri,
                 rrn=manifest_rrn, started_at=started_at,
             )
-            raise HTTPException(status_code=403, detail={
-                "deny": "tool_allowlist",
-                "reason": reason,
-            })
+            detail = {"deny": "tool_allowlist", "reason": reason}
+            _attach_signature(detail, signed, marker)
+            raise HTTPException(status_code=403, detail=detail)
 
         if confidence_policy is not None:
             ok, reason = check_confidence(envelope_dict, confidence_policy)
             if not ok:
-                _record(
+                signed, marker = _record(
                     "deny",
                     f"confidence_threshold: {reason}",
                     manifest_result.kid,
@@ -499,10 +553,9 @@ def make_app(
                     envelope_dict=envelope_dict, ruri=envelope.ruri,
                     rrn=manifest_rrn, started_at=started_at,
                 )
-                raise HTTPException(status_code=403, detail={
-                    "deny": "confidence_threshold",
-                    "reason": reason,
-                })
+                detail = {"deny": "confidence_threshold", "reason": reason}
+                _attach_signature(detail, signed, marker)
+                raise HTTPException(status_code=403, detail=detail)
 
         # RC-004 — HiTL. When hitl_from_manifest is on, the manifest's declared
         # safety.hitl_gates are authoritative (built per-request, cached by mtime);
@@ -515,7 +568,7 @@ def make_app(
         if effective_hitl is not None:
             ok, reason = check_hitl(envelope_dict, effective_hitl)
             if not ok:
-                _record(
+                signed, marker = _record(
                     "deny",
                     f"hitl_required: {reason}",
                     manifest_result.kid,
@@ -523,10 +576,9 @@ def make_app(
                     envelope_dict=envelope_dict, ruri=envelope.ruri,
                     rrn=manifest_rrn, started_at=started_at,
                 )
-                raise HTTPException(status_code=403, detail={
-                    "deny": "hitl_required",
-                    "reason": reason,
-                })
+                detail = {"deny": "hitl_required", "reason": reason}
+                _attach_signature(detail, signed, marker)
+                raise HTTPException(status_code=403, detail=detail)
 
         # All gates passed — pick the actuator. In multi-actuator mode, route
         # by `envelope.actuator_name`. In single-actuator mode, use the one
@@ -570,7 +622,7 @@ def make_app(
             error_kind = type(exc).__name__
         ended_at = datetime.now(tz=timezone.utc).isoformat()
 
-        _record_with_outcome(
+        signed_outcome, marker = _record_with_outcome(
             decision="allow", reason="ok",
             kid=manifest_result.kid, msg_id=envelope.msg_id,
             outcome=outcome, error_kind=error_kind,
@@ -585,7 +637,7 @@ def make_app(
                 "actuator_error_kind": error_kind,
             })
 
-        return {
+        response = {
             "ok": True,
             "manifest_kid": manifest_result.kid,
             "scope": envelope.scope,
@@ -594,6 +646,11 @@ def make_app(
             "outcome_kind": outcome.outcome_kind,
             "telemetry": outcome.telemetry,
         }
+        # Embed the Ed25519-signed outcome so the client can verify the receipt on
+        # the wire (envelope_signature: {kid, alg, sig}). When attestation is not
+        # configured, this attaches attestation="unattested" + envelope_signature=null.
+        _attach_signature(response, signed_outcome, marker)
+        return response
 
     @app.get("/v1/audit/last")
     def audit_last(authorization: str | None = Header(default=None)):

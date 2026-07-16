@@ -41,14 +41,21 @@ def check_tool(tool_name: str, allowlist: ToolAllowlist, *, msg_id: str) -> tupl
 ACTUATION_SCOPES = {"MANIPULATE", "NAVIGATE", "ACTUATE", "EXECUTE", "COMMISSION"}
 
 
+# Tiers that carry no actuation credential. `anon` is the receiver's fallback for
+# a request with no bearer OR an unknown/insufficient bearer — it must be denied
+# actuation just like `read` (fixing an anon fail-open where COMMAND-class scopes
+# slipped through). Read/discover on non-actuation scopes stays open for both.
+NON_ACTUATING_TIERS = {"read", "anon"}
+
+
 def check_tier(tier: str, scope: str, *, msg_id: str) -> tuple[bool, str]:
-    """GW-003 — read-tier principal denied actuation; COMMISSION needs the commission tier."""
-    if tier == "read" and scope in ACTUATION_SCOPES:
+    """GW-003 — read/anon principals denied actuation; COMMISSION needs the commission tier."""
+    if tier in NON_ACTUATING_TIERS and scope in ACTUATION_SCOPES:
         cert_report.record_property_pass(
             property_id="GW-003",
             evidence={"tier": tier, "scope": scope, "msg_id": msg_id, "outcome": "denied"},
         )
-        return False, f"read-tier principal cannot invoke {scope}"
+        return False, f"{tier}-tier principal cannot invoke {scope}"
     if scope == "COMMISSION" and tier != "commission":
         cert_report.record_property_pass(
             property_id="GW-003",

@@ -83,3 +83,67 @@ def test_gw_003_read_token_allows_read_scope():
         },
     )
     assert r.status_code == 200
+
+
+# T-003 — anon fail-open regression. Before the fix, an unauthenticated (anon)
+# actuation invoke slipped past check_tier (which only denied tier=='read'),
+# under-gating COMMAND-class calls. These assert the gate is now closed while the
+# legitimate anon read/discover path stays open.
+def test_gw_003_anon_denied_manipulate():
+    client = _client()
+    r = client.post(  # NO Authorization header -> tier 'anon'
+        "/v1/invoke",
+        json={
+            "msg_id": "anon-1", "type": "INVOKE", "ruri": "rcan://x/y/z/0",
+            "scope": "MANIPULATE",
+            "tool_name": "mcp__robot__execute_capability", "tool_args": {},
+            "manifest_path": str(FIXTURES / "signed-good.md"),
+        },
+    )
+    assert r.status_code == 403
+    assert r.json()["detail"]["deny"] == "tier_policy"
+
+
+def test_gw_003_anon_denied_commission():
+    client = _client()
+    r = client.post(  # no credential + COMMISSION scope
+        "/v1/invoke",
+        json={
+            "msg_id": "anon-2", "type": "INVOKE", "ruri": "rcan://x/y/z/0",
+            "scope": "COMMISSION",
+            "tool_name": "mcp__robot__execute_capability", "tool_args": {},
+            "manifest_path": str(FIXTURES / "signed-good.md"),
+        },
+    )
+    assert r.status_code == 403
+    assert r.json()["detail"]["deny"] == "tier_policy"
+
+
+def test_gw_003_unknown_bearer_denied_manipulate():
+    client = _client()
+    r = client.post(  # unknown/insufficient bearer maps to 'anon'
+        "/v1/invoke",
+        headers={"Authorization": "Bearer not-a-real-token"},
+        json={
+            "msg_id": "anon-3", "type": "INVOKE", "ruri": "rcan://x/y/z/0",
+            "scope": "MANIPULATE",
+            "tool_name": "mcp__robot__execute_capability", "tool_args": {},
+            "manifest_path": str(FIXTURES / "signed-good.md"),
+        },
+    )
+    assert r.status_code == 403
+    assert r.json()["detail"]["deny"] == "tier_policy"
+
+
+def test_gw_003_anon_allows_read_scope():
+    # The legitimate anon read/discover path must stay open (not broken by the fix).
+    client = _client()
+    r = client.post(  # no Authorization header, READ scope
+        "/v1/invoke",
+        json={
+            "msg_id": "anon-4", "type": "INVOKE", "ruri": "rcan://x/y/z/0", "scope": "READ",
+            "tool_name": "mcp__robot__render", "tool_args": {},
+            "manifest_path": str(FIXTURES / "signed-good.md"),
+        },
+    )
+    assert r.status_code == 200
