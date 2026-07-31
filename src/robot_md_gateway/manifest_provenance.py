@@ -48,7 +48,17 @@ class ManifestProvenanceResult:
 
 
 def verify_manifest(path: Path, *, resolver: RRFResolver) -> ManifestProvenanceResult:
-    text = path.read_text()
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        # An unreadable manifest_path is a caller-supplied value: a missing file,
+        # a directory, or an empty string must fail closed as an audited, signed
+        # DENY — never an unhandled 500, which yields no receipt and no audit
+        # entry (and which clients such as the iOS app cannot consume at all).
+        return ManifestProvenanceResult(
+            accepted=False, kid=None,
+            reason=f"manifest unreadable: {type(exc).__name__}",
+        )
     match = _SIG_RE.search(text)
     if match is None:
         return ManifestProvenanceResult(

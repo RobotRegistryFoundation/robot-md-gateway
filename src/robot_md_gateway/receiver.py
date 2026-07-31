@@ -51,7 +51,7 @@ from .cert import report as cert_report
 from .cert.audit import AuditChain, AuditEntry
 from .cert.envelope import ReplayCache, check_replay, sign_envelope, verify_envelope
 from .cert.gates import ConfidencePolicy, HiTLPolicy, check_confidence, check_hitl
-from .cert.policy import ToolAllowlist, check_tier, check_tool
+from .cert.policy import ToolAllowlist, check_tier, check_tool, check_tool_tier
 from .cert.revocation import RevocationCache, RRFRevocationResolver
 from .cert.rrn_binding import verify_rrn_binding
 from .cert.safety import SafetyMonitor
@@ -116,6 +116,7 @@ def make_app(
     *,
     resolver: RRFResolver,
     tool_allowlist: ToolAllowlist | None = None,
+    tool_tier_requirements: dict[str, frozenset[str]] | None = None,
     bearer_tiers: dict[str, str] | None = None,
     require_envelope_signature: bool = False,
     replay_cache: ReplayCache | None = None,
@@ -136,6 +137,7 @@ def make_app(
 ) -> FastAPI:
     if tool_allowlist is None:
         tool_allowlist = _DEFAULT_ALLOWLIST
+    tool_tier_requirements = tool_tier_requirements or {}
     bearer_tiers = bearer_tiers or {}
     # Multi-actuator mode is on when `actuators` is provided (even if empty
     # dict — that's a misconfiguration the operator made; loud failure at
@@ -539,6 +541,19 @@ def make_app(
                 rrn=manifest_rrn, started_at=started_at,
             )
             detail = {"deny": "tool_allowlist", "reason": reason}
+            _attach_signature(detail, signed, marker)
+            raise HTTPException(status_code=403, detail=detail)
+
+        allowed, reason = check_tool_tier(
+            envelope.tool_name, tier, tool_tier_requirements, msg_id=envelope.msg_id
+        )
+        if not allowed:
+            signed, marker = _record(
+                "deny", f"tool_tier: {reason}", manifest_result.kid, envelope.msg_id,
+                envelope_dict=envelope_dict, ruri=envelope.ruri,
+                rrn=manifest_rrn, started_at=started_at,
+            )
+            detail = {"deny": "tool_tier", "reason": reason}
             _attach_signature(detail, signed, marker)
             raise HTTPException(status_code=403, detail=detail)
 

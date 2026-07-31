@@ -74,6 +74,33 @@ def _build_tool_allowlist_from_env() -> ToolAllowlist | None:
     return ToolAllowlist(allowed_tools=tools)
 
 
+def _build_tool_tier_requirements_from_env() -> dict[str, frozenset[str]]:
+    """Read ROBOT_MD_TOOL_MIN_TIER into a {tool: {allowed tiers}} mapping.
+
+    Format: comma-separated ``tool:tier|tier`` pairs, e.g.
+        ROBOT_MD_TOOL_MIN_TIER=arm.home:actuate|commission,status.report:read|actuate
+
+    This binds a tier to the TOOL rather than to the envelope's self-declared
+    ``scope``. Without it, a caller naming an actuating tool under
+    ``scope: "OBSERVE"`` passes both the tier gate (which sees only the scope)
+    and the allowlist gate (which sees only the tool name). Unset means no
+    tool/tier bindings — existing deployments are unchanged.
+    """
+    raw = os.environ.get("ROBOT_MD_TOOL_MIN_TIER")
+    if not raw:
+        return {}
+    out: dict[str, frozenset[str]] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        tool, _, tiers = pair.partition(":")
+        allowed = frozenset(t.strip() for t in tiers.split("|") if t.strip())
+        if tool.strip() and allowed:
+            out[tool.strip()] = allowed
+    return out
+
+
 class _LegacyByokAction(argparse.Action):
     """Print a deprecation banner to stderr the moment --legacy-byok-launcher is parsed.
 
@@ -187,6 +214,7 @@ def main() -> None:
             from .receiver import make_app
 
             tool_allowlist = _build_tool_allowlist_from_env()
+            tool_tier_requirements = _build_tool_tier_requirements_from_env()
             require_envelope_signature = _require_envelope_signature_from_env()
             hitl_from_manifest = _hitl_from_manifest_from_env()
             require_rrn_binding = _require_rrn_binding_from_env()
@@ -226,6 +254,7 @@ def main() -> None:
                 fastapi_app = make_app(
                     resolver=RRFResolverFromEnv.from_env(),
                     tool_allowlist=tool_allowlist,
+                    tool_tier_requirements=tool_tier_requirements,
                     require_envelope_signature=require_envelope_signature,
                     hitl_from_manifest=hitl_from_manifest,
                     require_rrn_binding=require_rrn_binding,
@@ -251,6 +280,7 @@ def main() -> None:
                 fastapi_app = make_app(
                     resolver=RRFResolverFromEnv.from_env(),
                     tool_allowlist=tool_allowlist,
+                    tool_tier_requirements=tool_tier_requirements,
                     require_envelope_signature=require_envelope_signature,
                     hitl_from_manifest=hitl_from_manifest,
                     require_rrn_binding=require_rrn_binding,
