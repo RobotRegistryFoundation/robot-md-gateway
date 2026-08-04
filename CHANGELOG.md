@@ -2,6 +2,25 @@
 
 ## [0.5.0a6] — 2026-07-16
 
+### Security
+- **Tools are now bound to caller tiers** (`ROBOT_MD_TOOL_MIN_TIER`). The tier
+  gate keys off the envelope's self-declared `scope`, which the caller controls,
+  while the allowlist gate never sees the tier — so an envelope naming an
+  actuating tool under `scope: "OBSERVE"` cleared both. Binding tiers to the
+  TOOL closes that. Unset preserves prior behaviour.
+- **An unreadable `manifest_path` now fails closed** as a signed, audited
+  `manifest_provenance` denial. Previously a missing file, a directory, or an
+  empty string raised through as a bare HTTP 500 with no receipt and no audit
+  entry — and clients that accept only 200/403 could not consume it at all.
+- Adds the `commission` tier and includes `COMMISSION` in the actuation scopes.
+- **An actuator's own policy refusal is now a signed 403**, not a bare 500.
+  A driver that declines on policy (`outcome_kind="denied"` — e.g. an RC car
+  asked to move with no drive approval open) was falling into the generic
+  actuator-failure path: unsigned, and unreadable to clients that accept only
+  200/403. It now returns `deny: actuator_policy` with the signed outcome
+  attached, like every other gate. An actuator that CRASHES still returns 500 —
+  a fault must never be dressed up as a decision.
+
 ### Added
 
 - **Signed receipts on the wire.** `/v1/invoke` now embeds the Ed25519-signed

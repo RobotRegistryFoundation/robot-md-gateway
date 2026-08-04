@@ -646,6 +646,26 @@ def make_app(
             started_at=started_at, ended_at=ended_at,
         )
 
+        if not outcome.success and outcome.outcome_kind == "denied":
+            # A driver refusing on POLICY is a decision, not a fault, and it must
+            # reach the caller the way every other decision does: a signed 403 the
+            # client can render, verify, and keep. It used to fall into the 500
+            # below — unsigned, and unreadable to clients that accept only
+            # 200/403, so "no drive approval is open" arrived as a transport
+            # error indistinguishable from the gateway falling over. Same fix as
+            # the one made for an unreadable manifest_path.
+            #
+            # Only outcome_kind == "denied" takes this path. An actuator that
+            # crashed still 500s: a fault dressed as a policy refusal would tell
+            # the operator the robot decided something when in fact it broke.
+            detail = {
+                "deny": "actuator_policy",
+                "reason": outcome.error_message,
+                "actuator_name": target_actuator.name,
+            }
+            _attach_signature(detail, signed_outcome, marker)
+            raise HTTPException(status_code=403, detail=detail)
+
         if not outcome.success:
             raise HTTPException(status_code=500, detail={
                 "actuator_error": outcome.error_message,

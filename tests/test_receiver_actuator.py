@@ -329,3 +329,80 @@ def test_invoke_response_includes_outcome_telemetry(tmp_path, monkeypatch):
     body = resp.json()
     assert body["outcome_kind"] == "executed"
     assert body["telemetry"] == {"reached": True, "elapsed_s": 0.42, "thing": "value"}
+
+
+class _DenyingActuator:
+    """An actuator that REFUSES on policy — the drive-envelope case.
+
+    Distinct from _RaisingActuator: nothing broke here. The driver looked at its
+    own rules and said no.
+    """
+    name = "refuser"
+    description = "test policy refuser"
+    config_schema: dict = {}
+
+    def execute(self, *, envelope, manifest_path, tier, config):
+        return ActuatorOutcome(
+            success=False,
+            outcome_kind="denied",
+            error_message="no drive approval is open",
+        )
+
+
+class TestActuatorPolicyDenial:
+    """A driver's refusal must arrive as a signed 403, not a bare 500.
+
+    Actuator-level refusals used to fall through to the generic 500 path:
+    unsigned, and unreadable to clients (the iOS app accepts only 200 and 403),
+    so "the car has no approval to move" reached the operator as a transport
+    error indistinguishable from the gateway crashing. Same class of defect as
+    the unreadable-manifest 500 that became a signed manifest_provenance deny.
+    """
+
+    def test_denied_outcome_returns_403_with_reason(self, tmp_path):
+        chain = AuditChain()
+        app = _make_test_app(actuator=_DenyingActuator(), audit_chain=chain)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/invoke",
+                json=_valid_envelope(tmp_path),
+                headers={"Authorization": "Bearer actuate-token"},
+            )
+
+        assert response.status_code == 403
+        detail = response.json()["detail"]
+        assert detail["deny"] == "actuator_policy"
+        assert detail["reason"] == "no drive approval is open"
+        assert detail["actuator_name"] == "refuser"
+
+        # The refusal is still a first-class audited outcome, not a dropped call.
+        assert len(chain.entries) == 1
+        entry = chain.entries[0]
+        assert entry.decision == "allow"          # the GATES allowed it
+        assert entry.actuator_name == "refuser"   # the DRIVER refused it
+        assert entry.actuator_outcome_kind == "denied"
+
+    def test_actuator_crash_still_returns_500(self, tmp_path, monkeypatch):
+        """A fault must never be dressed up as a policy decision.
+
+        Reporting a crash as a refusal would tell the operator the robot decided
+        something when in fact it broke.
+        """
+        from robot_md_gateway import manifest_provenance
+        monkeypatch.setattr(
+            manifest_provenance, "verify_manifest",
+            lambda path, *, resolver: type("R", (), {
+                "accepted": True, "kid": "fake-kid", "reason": "ok",
+            })(),
+        )
+        app = _make_test_app(actuator=_RaisingActuator(), audit_chain=AuditChain())
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/invoke",
+                json=_valid_envelope(tmp_path),
+                headers={"Authorization": "Bearer actuate-token"},
+            )
+
+        assert response.status_code == 500
