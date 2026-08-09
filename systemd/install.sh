@@ -26,6 +26,37 @@ REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_DIR="/opt/robot-md-dispatcher"
 CONFIG_DIR="/etc/robot-md-dispatcher"
 LOG_DIR="/var/log/robot-md-dispatcher"
+SERIAL_GROUP="dialout"
+
+ADD_INTERACTIVE_USER=1
+for arg in "$@"; do
+    case "$arg" in
+        --no-interactive-user)
+            ADD_INTERACTIVE_USER=0
+            ;;
+        -h|--help)
+            cat <<EOF
+Usage: $0 [--no-interactive-user]
+
+Installs robot-md-dispatcher under /opt/robot-md-dispatcher with config at
+/etc/robot-md-dispatcher and the robot-md-dispatcher.service unit. (Package
++ repo were renamed to robot-md-gateway; the on-disk paths and service unit
+still use the legacy 'dispatcher' name and will be migrated in a separate
+release.)
+
+By default, also adds the invoking user (\$SUDO_USER) to the
+'${SERIAL_GROUP}' group so they can talk to /dev/ttyACM* from an interactive
+shell (e.g. running 'robot-md-mcp' or 'robot-md init' as themselves). Pass
+--no-interactive-user for a strictly service-only install.
+EOF
+            exit 0
+            ;;
+        *)
+            echo "error: unknown argument: $arg" >&2
+            exit 2
+            ;;
+    esac
+done
 
 if [[ $EUID -ne 0 ]]; then
     echo "error: run as root (use sudo)" >&2
@@ -33,7 +64,28 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 id robot >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin robot
-usermod -aG dialout robot
+usermod -aG "$SERIAL_GROUP" robot
+
+# Symmetric treatment for the interactive operator: the human who ran
+# 'sudo ./install.sh' typically also wants to run 'robot-md-mcp' or
+# 'robot-md init' from their own shell, which means their UID needs to be
+# able to open /dev/ttyACM*. Without this, backend.open silently fails with
+# EACCES and the MCP server falls through to no-backend mode (issue #21).
+INTERACTIVE_USER_ADDED=""
+if [[ $ADD_INTERACTIVE_USER -eq 1 ]]; then
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        if id "$SUDO_USER" >/dev/null 2>&1; then
+            usermod -aG "$SERIAL_GROUP" "$SUDO_USER"
+            INTERACTIVE_USER_ADDED="$SUDO_USER"
+            echo "added $SUDO_USER to group '$SERIAL_GROUP' (log out and back in for it to take effect)"
+        else
+            echo "warning: SUDO_USER=$SUDO_USER does not exist; skipping interactive-user group add" >&2
+        fi
+    else
+        echo "note: no SUDO_USER detected (running as root directly?); skipping interactive-user group add."
+        echo "      to add a human user later: sudo usermod -aG $SERIAL_GROUP <username>"
+    fi
+fi
 
 install -d -o robot -g robot -m 0755 "$INSTALL_DIR" "$LOG_DIR"
 install -d -o root -g robot -m 0750 "$CONFIG_DIR"
@@ -88,3 +140,21 @@ echo "  1. edit $CONFIG_DIR/bearers.yaml and place ROBOT.md at $CONFIG_DIR/ROBOT
 echo "  2. systemctl daemon-reload && systemctl enable --now robot-md-dispatcher"
 echo "  3. tailscale serve --bg --https=443 http://127.0.0.1:8080"
 echo "  4. tailscale funnel 443 on"
+
+if [[ -n "$INTERACTIVE_USER_ADDED" ]]; then
+    cat <<EOF
+
+operator onboarding (interactive shell access to /dev/ttyACM*):
+  $INTERACTIVE_USER_ADDED has been added to the '$SERIAL_GROUP' group, but
+  the group membership only applies to NEW login sessions. Log out and back
+  in (or 'newgrp $SERIAL_GROUP' in a single shell) before running 'robot-md',
+  'robot-md-mcp', or 'robot-md-gateway' as $INTERACTIVE_USER_ADDED.
+
+  After re-login, verify with:
+    groups | grep -E '$SERIAL_GROUP|robot-md-gateway' && ls -l /dev/ttyACM0 && echo OK
+
+  If /dev/ttyACM0 is owned by a custom group (e.g. via a udev rule), add
+  $INTERACTIVE_USER_ADDED to that group too:
+    sudo usermod -aG <group> $INTERACTIVE_USER_ADDED
+EOF
+fi
