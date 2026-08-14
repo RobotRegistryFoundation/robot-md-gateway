@@ -104,7 +104,12 @@ class TestMultiActuatorDispatch:
         assert [c["msg_id"] for c in a.calls] == ["r1"]
         assert [c["msg_id"] for c in b.calls] == ["r2"]
 
-    def test_missing_actuator_name_returns_422(self):
+    def test_a_lone_actuator_needs_no_name(self):
+        # CHANGED DELIBERATELY. This used to assert a 422, which encoded a
+        # limitation rather than a safety property: with exactly one actuator
+        # registered there is precisely one place the envelope could go, and
+        # refusing gave the operator nothing to act on. Ambiguity still refuses
+        # — see test_two_catch_alls_are_ambiguous_and_refuse.
         a = _NamedSpy("oak-d", "x")
         app = _make_app({"oak-d": a})
 
@@ -115,10 +120,8 @@ class TestMultiActuatorDispatch:
                 headers={"Authorization": "Bearer actuate-token"},
             )
 
-        assert r.status_code == 422
-        body = r.json()
-        assert body["detail"]["deny"] == "actuator_name_required"
-        assert a.calls == []
+        assert r.status_code == 200, r.text
+        assert len(a.calls) == 1
 
     def test_unknown_actuator_name_returns_404(self):
         a = _NamedSpy("oak-d", "x")
@@ -203,3 +206,141 @@ class TestSingleActuatorBackwardCompat:
         assert r.status_code == 200, r.text
         assert r.json()["actuator_name"] == "the-only"
         assert a.calls[0]["config"] == {"k": "v"}
+
+
+class _CapableSpy(_NamedSpy):
+    """A spy that declares which tools it implements, as real actuators do."""
+
+    def __init__(self, name: str, marker: str, capabilities: tuple[str, ...]):
+        super().__init__(name, marker)
+        self.rcan_tools = capabilities
+
+
+class TestCapabilityRouting:
+    """Routing with no actuator_name, by which actuator declares the tool.
+
+    Turning on a second actuator used to be a BREAKING CHANGE for every client:
+    the gateway refused any envelope without a name, at the parser, before any
+    gate ran — and routing failures are not audited, so there was not even a
+    receipt explaining why the robot had gone silent. Actuators already declare
+    disjoint capability sets, so the name is only genuinely needed to break a
+    tie.
+    """
+
+    def test_an_unnamed_envelope_routes_to_the_actuator_that_declares_the_tool(self):
+        arm = _CapableSpy("so-arm101", "arm", ("mcp__robot__render",))
+        host = _CapableSpy("host", "host", ("host.status",))
+        app = _make_app({"so-arm101": arm, "host": host})
+
+        with TestClient(app) as client:
+            r = client.post("/v1/invoke", json=_envelope(actuator_name=None),
+                            headers={"Authorization": "Bearer actuate-token"})
+
+        assert r.status_code == 200, r.text
+        assert len(arm.calls) == 1, "the arm declares this tool"
+        assert host.calls == [], "the host actuator must not see an arm command"
+
+    def test_an_explicit_name_still_wins_over_inference(self):
+        # A client that knows which actuator it means is never second-guessed.
+        arm = _CapableSpy("so-arm101", "arm", ("mcp__robot__render",))
+        other = _CapableSpy("spare", "spare", ("mcp__robot__render",))
+        app = _make_app({"so-arm101": arm, "spare": other})
+
+        with TestClient(app) as client:
+            r = client.post("/v1/invoke", json=_envelope(actuator_name="spare"),
+                            headers={"Authorization": "Bearer actuate-token"})
+
+        assert r.status_code == 200, r.text
+        assert len(other.calls) == 1
+        assert arm.calls == []
+
+    def test_a_genuine_TIE_is_the_only_thing_that_still_refuses(self):
+        both_a = _CapableSpy("a", "a", ("mcp__robot__render",))
+        both_b = _CapableSpy("b", "b", ("mcp__robot__render",))
+        app = _make_app({"a": both_a, "b": both_b})
+
+        with TestClient(app) as client:
+            r = client.post("/v1/invoke", json=_envelope(actuator_name=None),
+                            headers={"Authorization": "Bearer actuate-token"})
+
+        assert r.status_code == 422
+        body = r.json()
+        assert body["detail"]["deny"] == "actuator_name_required"
+        # Names the candidates, so the fix is obvious rather than a guess.
+        assert sorted(body["detail"]["candidates"]) == ["a", "b"]
+        assert both_a.calls == [] and both_b.calls == []
+
+    def test_an_actuator_that_declares_nothing_still_receives_its_tools(self):
+        # The built-in no-op declares no capabilities, and every actuator
+        # written before that attribute existed declares none either. They must
+        # keep working untouched.
+        plain = _NamedSpy("legacy", "legacy")
+        app = _make_app({"legacy": plain})
+
+        with TestClient(app) as client:
+            r = client.post("/v1/invoke", json=_envelope(actuator_name=None),
+                            headers={"Authorization": "Bearer actuate-token"})
+
+        assert r.status_code == 200, r.text
+        assert len(plain.calls) == 1
+
+    def test_adding_a_host_actuator_does_not_break_existing_arm_clients(self):
+        # THE MIGRATION THIS EXISTS FOR, stated as the scenario: a working robot
+        # gains host configuration, and every client that has never heard of
+        # actuator_name keeps working untouched.
+        arm = _CapableSpy("so-arm101", "arm", ("mcp__robot__render",))
+        before = _make_app({"so-arm101": arm})
+        with TestClient(before) as client:
+            first = client.post("/v1/invoke", json=_envelope(msg_id="before"),
+                                headers={"Authorization": "Bearer actuate-token"})
+
+        host = _CapableSpy("host", "host", ("host.status",))
+        after = _make_app({"so-arm101": arm, "host": host})
+        with TestClient(after) as client:
+            second = client.post("/v1/invoke", json=_envelope(msg_id="after"),
+                                 headers={"Authorization": "Bearer actuate-token"})
+
+        assert first.status_code == 200
+        assert second.status_code == 200, "adding an actuator must not break the old client"
+
+    def test_an_actuator_declaring_NOTHING_is_the_catch_all(self):
+        # THE REGRESSION THIS RULE EXISTS FOR, found on live hardware. Bob's
+        # so-arm101 driver predates the capabilities attribute and declares
+        # none; adding the host actuator made every arm command 422 with
+        # "no actuator declares this tool". An actuator that has made no claim
+        # about what it does not handle stays a candidate for anything.
+        legacy = _NamedSpy("so-arm101", "arm")            # declares nothing
+        host = _CapableSpy("host", "host", ("host.status",))
+        app = _make_app({"so-arm101": legacy, "host": host})
+
+        with TestClient(app) as client:
+            r = client.post("/v1/invoke", json=_envelope(actuator_name=None),
+                            headers={"Authorization": "Bearer actuate-token"})
+
+        assert r.status_code == 200, r.text
+        assert len(legacy.calls) == 1
+        assert host.calls == [], "a declared actuator is only offered what it declares"
+
+    def test_the_catch_all_does_not_steal_a_tool_someone_DOES_declare(self):
+        legacy = _NamedSpy("legacy", "legacy")
+        owner = _CapableSpy("owner", "owner", ("mcp__robot__render",))
+        app = _make_app({"legacy": legacy, "owner": owner})
+
+        with TestClient(app) as client:
+            r = client.post("/v1/invoke", json=_envelope(actuator_name=None),
+                            headers={"Authorization": "Bearer actuate-token"})
+
+        assert r.status_code == 200, r.text
+        assert len(owner.calls) == 1
+        assert legacy.calls == []
+
+    def test_two_catch_alls_are_ambiguous_and_refuse(self):
+        a, b = _NamedSpy("a", "a"), _NamedSpy("b", "b")
+        app = _make_app({"a": a, "b": b})
+
+        with TestClient(app) as client:
+            r = client.post("/v1/invoke", json=_envelope(actuator_name=None),
+                            headers={"Authorization": "Bearer actuate-token"})
+
+        assert r.status_code == 422
+        assert a.calls == [] and b.calls == []

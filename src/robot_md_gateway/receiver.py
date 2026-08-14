@@ -600,21 +600,90 @@ def make_app(
         # configured at make_app time. Routing failures are 4xx (parser-level)
         # and not audited; gate failures above are audit-tracked.
         if multi_actuator_mode:
-            if envelope.actuator_name is None:
-                raise HTTPException(status_code=422, detail={
-                    "deny": "actuator_name_required",
-                    "reason": "gateway is configured for multiple actuators; "
-                              "envelope must set actuator_name",
-                })
-            target_actuator = actuators.get(envelope.actuator_name)
-            if target_actuator is None:
-                raise HTTPException(status_code=404, detail={
-                    "deny": "unknown_actuator",
-                    "reason": f"no actuator named {envelope.actuator_name!r} is "
-                              f"registered on this gateway",
-                    "known": sorted(actuators.keys()),
-                })
-            target_config = actuator_configs.get(envelope.actuator_name, {})
+            # An explicit name always wins: a client that knows which actuator
+            # it means is never second-guessed.
+            if envelope.actuator_name is not None:
+                target_actuator = actuators.get(envelope.actuator_name)
+                if target_actuator is None:
+                    raise HTTPException(status_code=404, detail={
+                        "deny": "unknown_actuator",
+                        "reason": f"no actuator named {envelope.actuator_name!r} is "
+                                  f"registered on this gateway",
+                        "known": sorted(actuators.keys()),
+                    })
+                target_config = actuator_configs.get(envelope.actuator_name, {})
+            else:
+                # NO NAME: ROUTE BY WHICH ACTUATOR DECLARES THE TOOL.
+                #
+                # This used to be a flat 422, and that made turning on a second
+                # actuator a BREAKING CHANGE for every existing client — an
+                # operator adding a host actuator to a working robot would find
+                # every arm and drive command refused at the parser, before any
+                # gate ran, and routing failures are not audited so there would
+                # not even be a receipt saying why. The upgrade path was "change
+                # all your clients first", which nobody discovers until after.
+                #
+                # Actuators already declare their capabilities, and those sets
+                # are disjoint in every real deployment (an arm driver does not
+                # implement host.package.install). So the name is only actually
+                # needed to break a TIE, and that is the only case left that
+                # refuses.
+                # `rcan_tools`, NOT `capabilities`. The existing attribute
+                # already means different things in different actuators: the
+                # rc-car driver lists RCAN tool names, while the so-arm101
+                # driver lists internal verbs ("move", "home", "read_state").
+                # Routing on it would be guessing at a vocabulary that is not
+                # guaranteed to be tool names — and on this bench it guessed
+                # wrong and 422'd every arm command. A new, single-purpose
+                # attribute is an explicit OPT-IN whose meaning cannot drift.
+                candidates = [
+                    (name, act) for name, act in sorted(actuators.items())
+                    if envelope.tool_name in getattr(act, "rcan_tools", ())
+                ]
+                if not candidates:
+                    # NOTHING CLAIMS THE TOOL, SO FALL BACK TO WHATEVER CANNOT
+                    # BE RULED OUT. An actuator that has not opted in — every
+                    # actuator written before `rcan_tools` existed, which today
+                    # is all of them but the host one — has made no claim about
+                    # what it does NOT handle, so it stays a candidate for
+                    # anything.
+                    #
+                    # Found by testing the regression rather than the feature:
+                    # adding the host actuator to Bob broke `status.report` with
+                    # a 422, which is exactly the breakage this whole branch
+                    # exists to prevent. An actuator that declares its
+                    # capabilities is only offered what it declares; one that
+                    # declares nothing is the catch-all.
+                    candidates = [
+                        (name, act) for name, act in sorted(actuators.items())
+                        if not getattr(act, "rcan_tools", ())
+                    ]
+                if len(candidates) == 1:
+                    chosen, target_actuator = candidates[0]
+                    target_config = actuator_configs.get(chosen, {})
+                elif not candidates:
+                    # Unchanged from before: inference simply did not apply.
+                    # NOT a 404 — an actuator is free to declare no capabilities
+                    # at all (the built-in no-op does, and third-party ones may),
+                    # and "nothing advertises this tool" is indistinguishable
+                    # from "nothing advertises anything". Turning that into "no
+                    # such tool" would break working deployments on an inference
+                    # that was never available to them.
+                    raise HTTPException(status_code=422, detail={
+                        "deny": "actuator_name_required",
+                        "reason": "gateway is configured for multiple actuators "
+                                  "and none declares this tool; envelope must "
+                                  "set actuator_name",
+                        "known": sorted(actuators.keys()),
+                    })
+                else:
+                    raise HTTPException(status_code=422, detail={
+                        "deny": "actuator_name_required",
+                        "reason": f"{len(candidates)} actuators declare "
+                                  f"{envelope.tool_name!r}; envelope must set "
+                                  f"actuator_name to choose one",
+                        "candidates": [name for name, _ in candidates],
+                    })
         else:
             target_actuator = actuator
             target_config = actuator_config
