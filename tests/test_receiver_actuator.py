@@ -383,6 +383,56 @@ class TestActuatorPolicyDenial:
         assert entry.actuator_name == "refuser"   # the DRIVER refused it
         assert entry.actuator_outcome_kind == "denied"
 
+    def test_a_structured_refusal_reaches_the_client_alongside_the_sentence(self, tmp_path):
+        """`reason` is prose for a person. A driver that also produced a
+        machine-readable account of WHY must get that to the caller, or every
+        client ends up regexing the sentence and the message becomes an
+        accidental API that can never be reworded.
+
+        The structure is not new information on the wire: telemetry is already
+        hashed into the signed outcome, so it is bound to the same signature the
+        sentence is, and the allow path has always returned it verbatim.
+        """
+        class _StructuredRefuser(_DenyingActuator):
+            def execute(self, *, envelope, manifest_path, tier, config):
+                return ActuatorOutcome(
+                    success=False,
+                    outcome_kind="denied",
+                    error_message="unsafe_pose: shoulder_lift would sit outside its range",
+                    telemetry={"deny": "unsafe_pose",
+                               "reason": "shoulder_lift would sit outside its range"},
+                )
+
+        app = _make_test_app(actuator=_StructuredRefuser(), audit_chain=AuditChain())
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/invoke",
+                json=_valid_envelope(tmp_path),
+                headers={"Authorization": "Bearer actuate-token"},
+            )
+
+        assert response.status_code == 403
+        detail = response.json()["detail"]
+        assert detail["deny"] == "actuator_policy"        # the gateway's verdict
+        assert detail["telemetry"]["deny"] == "unsafe_pose"  # the driver's
+        # Still signed: a structured refusal is evidence like any other.
+        assert detail["attestation"] in ("attested", "unattested")
+
+    def test_a_refusal_with_nothing_structured_to_say_omits_the_key(self, tmp_path):
+        """Absent, not empty. `telemetry: {}` would read as "the driver said
+        nothing about it", which is a claim; leaving the key out says the
+        driver has no structured account at all."""
+        app = _make_test_app(actuator=_DenyingActuator(), audit_chain=AuditChain())
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/invoke",
+                json=_valid_envelope(tmp_path),
+                headers={"Authorization": "Bearer actuate-token"},
+            )
+
+        assert response.status_code == 403
+        assert "telemetry" not in response.json()["detail"]
+
     def test_actuator_crash_still_returns_500(self, tmp_path, monkeypatch):
         """A fault must never be dressed up as a policy decision.
 

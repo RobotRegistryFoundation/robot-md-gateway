@@ -120,6 +120,54 @@ Environment variables (also settable via CLI flags — flags win):
 | `ROBOT_MD_MCP_ARGS` | Space-separated args for the MCP command | (none) |
 | `ROBOT_MD_LOG_LEVEL` | Python log level | `INFO` |
 
+## What a client gets back
+
+`/v1/invoke` answers with exactly three shapes. A client that handles these
+three handles every tool on every actuator.
+
+**Allowed and executed — `200`:**
+
+```json
+{
+  "ok": true,
+  "manifest_kid": "bob-manifest-2026",
+  "scope": "MANIPULATE",
+  "tool_name": "arm.move_to",
+  "actuator_name": "so-arm101",
+  "outcome_kind": "executed",
+  "telemetry": {"...": "whatever the driver measured"},
+  "attestation": "attested",
+  "outcome": {"...": "the signed receipt"},
+  "envelope_signature": {"kid": "...", "alg": "Ed25519", "sig": "..."}
+}
+```
+
+**Denied — `403`.** By a gateway gate, or by the driver's own policy. Either
+way it is signed, audited, and safe to keep as evidence:
+
+```json
+{
+  "detail": {
+    "deny": "actuator_policy",
+    "reason": "out_of_workspace: x=500mm is outside the declared workspace (-200 to 340mm)",
+    "actuator_name": "so-arm101",
+    "telemetry": {"deny": "out_of_workspace", "reason": "x=500mm is outside ..."},
+    "attestation": "attested",
+    "envelope_signature": {"kid": "...", "alg": "Ed25519", "sig": "..."}
+  }
+}
+```
+
+`detail.deny` names which gate refused (`tier_policy`, `tool_allowlist`,
+`manifest_provenance`, `safety_state`, `actuator_policy`, …). For
+`actuator_policy` — the driver's own refusal — `detail.telemetry` carries the
+driver's machine-readable code when it produced one; branch on that, not on the
+wording of `reason`. The key is absent when the driver had nothing structured to
+say.
+
+**Broken — `500`.** The driver raised. A fault is never dressed up as a
+decision, so it does not arrive as a deny and carries no receipt.
+
 ## Development
 
 ```bash

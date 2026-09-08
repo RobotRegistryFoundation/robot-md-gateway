@@ -1,5 +1,50 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **A driver's structured refusal now reaches the client.** An actuator that
+  declines on policy (`outcome_kind="denied"`) already returned a signed 403
+  with `deny: actuator_policy` and a `reason` sentence. When the driver also
+  produced telemetry — a machine-readable account of *why* — that account is now
+  returned under `detail.telemetry`.
+
+  `reason` is prose for a person, and prose gets reworded. A client deciding
+  what to do next needs a code it can branch on; without one, every client ends
+  up regexing the sentence and the message becomes an accidental API that can
+  never change. This is not new information on the wire: telemetry is already
+  hashed into the signed outcome (`telemetry_sha256`), so the structure returned
+  here is bound to the same signature the sentence is, and the ALLOW path has
+  always returned it verbatim.
+
+  The key is **absent**, not empty, when the driver had nothing structured to
+  say — `telemetry: {}` would read as a claim that the driver considered the
+  question and said nothing about it.
+
+  The first consumer is `so-arm101-actuator` ≥ 0.3.0, whose `arm.move_to`
+  refuses an unholdable Cartesian target with codes such as `unreachable`,
+  `joint_limits` and `unsafe_pose`:
+
+  ```json
+  {
+    "detail": {
+      "deny": "actuator_policy",
+      "reason": "out_of_workspace: x=500mm is outside the declared workspace (-200 to 340mm)",
+      "actuator_name": "so-arm101",
+      "telemetry": {
+        "deny": "out_of_workspace",
+        "reason": "x=500mm is outside the declared workspace (-200 to 340mm)"
+      },
+      "attestation": "attested",
+      "envelope_signature": {"kid": "...", "alg": "Ed25519", "sig": "..."}
+    }
+  }
+  ```
+
+  An actuator that CRASHES still returns 500 — unchanged, and still the line
+  that keeps a fault from being dressed up as a decision.
+
 ## [0.5.0a6] — 2026-07-16
 
 ### Security
