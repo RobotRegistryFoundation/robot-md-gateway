@@ -732,6 +732,17 @@ def make_app(
                 "reason": outcome.error_message,
                 "actuator_name": target_actuator.name,
             }
+            # The driver's own structured account of the refusal, when it has
+            # one. `reason` is a sentence for a person; a harness deciding what
+            # to do next needs a code it can branch on, and regexing the prose
+            # is how a message becomes an accidental API.
+            #
+            # This is not new information reaching the client: telemetry is
+            # already hashed into the signed outcome above (telemetry_sha256),
+            # so the structure returned here is bound to the same signature the
+            # sentence is — and the allow path has always returned it verbatim.
+            if outcome.telemetry:
+                detail["telemetry"] = outcome.telemetry
             _attach_signature(detail, signed_outcome, marker)
             raise HTTPException(status_code=403, detail=detail)
 
