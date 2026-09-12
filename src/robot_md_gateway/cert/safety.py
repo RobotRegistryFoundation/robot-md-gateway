@@ -93,11 +93,14 @@ class SafetyMonitor:
         self.state = GatewayState.READY
         reason = f"safety.clear: {prev.value} -> {self.state.value}"
         self._audit_clear(audit_chain, decision="allow", reason=reason, msg_id=msg_id)
-        cert_report.record_property_pass(
-            property_id="SF-001",
-            evidence={"prev_state": prev.value, "new_state": self.state.value,
-                      "msg_id": msg_id, "tier": tier, "outcome": "estop cleared"},
-        )
+        # Deliberately records NO cert property. SF-001 is the claim that an
+        # ESTOP wire trip preempts everything else (docs/hil/track-3-test-plan.md:
+        # "100% of 10 trip events stop actuation within 100ms"), and a clear is
+        # the opposite transition. Filing a clear as an SF-001 pass would let a
+        # gateway that never once tripped accumulate SF-001 evidence, which is a
+        # conformance claim it has not earned. The audit chain above is the
+        # record of a clear; there is no cert property for one, and inventing a
+        # pass for it would be the software asserting more than it knows.
         return True, reason
 
     @staticmethod

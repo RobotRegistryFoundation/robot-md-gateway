@@ -93,3 +93,25 @@ def test_safety_monitor_clear_without_an_audit_chain_still_works():
     cleared, _ = sm.clear(tier="commission")
     assert cleared is True
     assert sm.state == GatewayState.READY
+
+
+def test_safety_monitor_clear_records_no_cert_property():
+    """A clear is not evidence for SF-001.
+
+    SF-001 is the claim that an ESTOP wire trip preempts everything else. The
+    clear is the opposite transition, so filing it as an SF-001 pass would let a
+    gateway that never once tripped accumulate SF-001 evidence it has not
+    earned. The audit chain is the record of a clear; the cert report is not.
+    """
+    from robot_md_gateway.cert import report as cert_report
+
+    cert_report.reset()
+    sm = SafetyMonitor()
+    sm.on_estop_wire(tripped=True, msg_id="trip")
+    before = [p.property_id for p in cert_report._GLOBAL_REPORT.properties]
+    assert before == ["SF-001"]
+
+    sm.clear(tier="read")          # refused
+    sm.clear(tier="commission")    # allowed
+    after = [p.property_id for p in cert_report._GLOBAL_REPORT.properties]
+    assert after == before, "clear() must not add cert-property records"
