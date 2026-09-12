@@ -51,7 +51,13 @@ from .cert import report as cert_report
 from .cert.audit import AuditChain, AuditEntry
 from .cert.envelope import ReplayCache, check_replay, sign_envelope, verify_envelope
 from .cert.gates import ConfidencePolicy, HiTLPolicy, check_confidence, check_hitl
-from .cert.policy import ToolAllowlist, check_tier, check_tool, check_tool_tier
+from .cert.policy import (
+    ToolAllowlist,
+    audit_allowlist_for_stop,
+    check_tier,
+    check_tool,
+    check_tool_tier,
+)
 from .cert.revocation import RevocationCache, RRFRevocationResolver
 from .cert.rrn_binding import verify_rrn_binding
 from .cert.safety import SafetyMonitor
@@ -157,6 +163,27 @@ def make_app(
             actuator_config = {}
         actuators = {}
         actuator_configs = {}
+    # Startup invariant: a gateway allowlisted to MOVE a robot and not to STOP
+    # it is a misconfiguration, and it is the one this whole change exists to
+    # stop recurring. Logged loudly under a named reason, NOT refused: the
+    # gateway that refuses to start is a gateway an operator restarts without
+    # the check, and a robot that will not answer `status.report` is not safer
+    # than one that will. The stop is what has to be reachable, not the boot.
+    _stop_findings = audit_allowlist_for_stop(
+        tool_allowlist,
+        list(actuators.items()) if multi_actuator_mode
+        else ([(getattr(actuator, "name", "actuator"), actuator)] if actuator is not None else []),
+    )
+    for _finding in _stop_findings:
+        logging.getLogger(__name__).error(
+            "%s: actuator %r is allowlisted for motion (%s) but the allowlist "
+            "carries none of its stop tools (%s). Add a stop to "
+            "ROBOT_MD_TOOL_ALLOWLIST and restart the gateway.",
+            _finding["reason"],
+            _finding["actuator"],
+            ", ".join(_finding["allowed_motion_tools"]),
+            ", ".join(_finding["stop_tools_declared"]) or "none declared",
+        )
     if replay_cache is None:
         replay_cache = ReplayCache()
     # Default the revocation cache at make_app level (parallel to replay_cache):
@@ -179,6 +206,9 @@ def make_app(
     app.state.actuators = actuators
     app.state.actuator_configs = actuator_configs
     app.state.multi_actuator_mode = multi_actuator_mode
+    # Kept so an operator (or a test) can read the boot-time finding back
+    # rather than having to have been watching the log when it scrolled by.
+    app.state.allowlist_stop_findings = _stop_findings
 
     def _build_signed_outcome(
         *,

@@ -37,3 +37,59 @@ def test_sf_001_re_trip_while_active_is_idempotent():
     assert sm.state == GatewayState.ESTOP_ACTIVE
     assert first_count == 1
     assert second_count == 1, "Re-trips while already ESTOP_ACTIVE should not record"
+
+
+def test_safety_monitor_clear_returns_ready():
+    """The exit from ESTOP_ACTIVE that is not a process restart.
+
+    Before this, the only way out of ESTOP_ACTIVE was to restart the gateway -
+    and the restart also wiped the in-memory audit chain, so recovering from a
+    stop cost the record of why the robot stopped. The clear is gated at the
+    `commission` tier (making a robot movable again is an actuation-class
+    decision, not an observation) and both the allow and the refusal are written
+    into the chain, because a refused clear is exactly the event an operator
+    later needs to find.
+    """
+    from robot_md_gateway.cert.audit import AuditChain
+
+    chain = AuditChain()
+    sm = SafetyMonitor()
+    sm.on_estop_wire(tripped=True, msg_id="estop-1")
+    assert sm.state == GatewayState.ESTOP_ACTIVE
+
+    # Refused below commission, and the refusal does not move the state.
+    for tier in ("anon", "read", "actuate"):
+        cleared, reason = sm.clear(tier=tier, audit_chain=chain, msg_id=f"clear-{tier}")
+        assert cleared is False, tier
+        assert "commission" in reason
+        assert sm.state == GatewayState.ESTOP_ACTIVE
+        assert not sm.can_actuate()
+
+    cleared, reason = sm.clear(tier="commission", audit_chain=chain, msg_id="clear-ok")
+    assert cleared is True
+    assert sm.state == GatewayState.READY
+    assert sm.can_actuate()
+
+    # Every decision landed in the hash-linked chain, in order, and the chain
+    # still links: the refusals are entries, not silence.
+    decisions = [(e.msg_id, e.decision) for e in chain.entries]
+    assert decisions == [
+        ("clear-anon", "deny"),
+        ("clear-read", "deny"),
+        ("clear-actuate", "deny"),
+        ("clear-ok", "allow"),
+    ]
+    assert chain.entries[0].chain_prev == "0" * 64
+    for prev, entry in zip(chain.entries, chain.entries[1:]):
+        assert entry.chain_prev == prev.chain_hash
+    assert "safety.clear" in chain.entries[-1].decision_reason
+
+
+def test_safety_monitor_clear_without_an_audit_chain_still_works():
+    """An operator with no chain configured must still be able to get out of a
+    stop. The chain is evidence, not a precondition."""
+    sm = SafetyMonitor()
+    sm.on_estop_wire(tripped=True)
+    cleared, _ = sm.clear(tier="commission")
+    assert cleared is True
+    assert sm.state == GatewayState.READY

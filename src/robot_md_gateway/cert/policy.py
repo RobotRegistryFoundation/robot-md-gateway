@@ -19,6 +19,52 @@ class ToolAllowlist:
         return tool_name in self.allowed_tools
 
 
+#: Named reason logged when a gateway is configured to MOVE a robot it has no
+#: allowlisted way to STOP. Named rather than prose because the thing an
+#: operator does with it is grep for it, and the thing that made this necessary
+#: was a hand-maintained allowlist that carried twelve tools and no stop at all.
+ALLOWLIST_HAS_NO_STOP = "allowlist_has_no_stop"
+
+
+def audit_allowlist_for_stop(
+    allowlist: ToolAllowlist,
+    actuators,  # noqa: ANN001 - iterable of (name, actuator instance)
+) -> list[dict]:
+    """Find every actuator this gateway can move and cannot stop.
+
+    An actuator declares its own classes - `motion_capabilities` and
+    `stop_capabilities` - because only the driver knows which of its tool names
+    move the machine. Nothing is inferred from the spelling of a tool name: a
+    guess that `arm.home` is motion would be right here and wrong on the next
+    robot, and a startup check that is sometimes wrong is a check operators
+    learn to ignore.
+
+    The honest limit: an actuator that declares NEITHER set is invisible to this
+    check and is reported as nothing. Silence here means "not declared", never
+    "verified safe".
+
+    Returns one finding dict per offending actuator; an empty list is the
+    healthy case.
+    """
+    findings: list[dict] = []
+    for name, actuator in actuators:
+        motion = frozenset(getattr(actuator, "motion_capabilities", ()) or ())
+        stop = frozenset(getattr(actuator, "stop_capabilities", ()) or ())
+        if not motion:
+            # Nothing that moves, so nothing that needs stopping.
+            continue
+        allowed_motion = sorted(t for t in allowlist.allowed_tools if t in motion)
+        allowed_stop = sorted(t for t in allowlist.allowed_tools if t in stop)
+        if allowed_motion and not allowed_stop:
+            findings.append({
+                "reason": ALLOWLIST_HAS_NO_STOP,
+                "actuator": name,
+                "allowed_motion_tools": allowed_motion,
+                "stop_tools_declared": sorted(stop),
+            })
+    return findings
+
+
 def check_tool(tool_name: str, allowlist: ToolAllowlist, *, msg_id: str) -> tuple[bool, str]:
     if allowlist.is_allowed(tool_name):
         cert_report.record_property_pass(

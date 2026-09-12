@@ -54,5 +54,65 @@ class SafetyMonitor:
                 },
             )
 
+    def clear(
+        self,
+        *,
+        tier: str,
+        audit_chain=None,  # noqa: ANN001 - duck-typed AuditChain
+        msg_id: str | None = None,
+    ) -> tuple[bool, str]:
+        """Leave ESTOP_ACTIVE without restarting the process.
+
+        Until this existed the only exit from ESTOP_ACTIVE was a restart, and a
+        restart also throws away the in-memory audit chain - so the record of
+        why the robot stopped died with the stop. Recovering from a stop must
+        not cost the evidence of it.
+
+        Gated at the `commission` tier, which is the same bearer that authorises
+        bring-up motion: clearing a stop is the act of making a robot movable
+        again, so it is an actuation-class decision, not an observation.
+
+        The decision is written into `audit_chain` when one is supplied, allow
+        or deny alike - a refused clear is exactly the event an operator later
+        needs to find.
+
+        Returns ``(cleared, reason)``. Honest about what it does NOT do: it
+        restores this state machine only. It does not touch an actuator's own
+        latch (each driver clears its own), it does not refresh the heartbeat,
+        and a gateway whose heartbeat is still stale drops back to SAFE_STOP on
+        the next `tick`.
+        """
+        prev = self.state
+        if tier != "commission":
+            reason = (
+                f"safety.clear: {tier!r}-tier principal cannot clear "
+                f"{prev.value}; requires the 'commission' tier"
+            )
+            self._audit_clear(audit_chain, decision="deny", reason=reason, msg_id=msg_id)
+            return False, reason
+        self.state = GatewayState.READY
+        reason = f"safety.clear: {prev.value} -> {self.state.value}"
+        self._audit_clear(audit_chain, decision="allow", reason=reason, msg_id=msg_id)
+        cert_report.record_property_pass(
+            property_id="SF-001",
+            evidence={"prev_state": prev.value, "new_state": self.state.value,
+                      "msg_id": msg_id, "tier": tier, "outcome": "estop cleared"},
+        )
+        return True, reason
+
+    @staticmethod
+    def _audit_clear(audit_chain, decision: str, reason: str, msg_id: str | None) -> None:
+        if audit_chain is None:
+            return
+        from .audit import AuditEntry
+
+        audit_chain.append(AuditEntry(
+            msg_id=msg_id or "safety.clear",
+            timestamp_ms=int(time.time() * 1000),
+            decision=decision,
+            decision_reason=reason,
+            envelope_kid=None,
+        ))
+
     def can_actuate(self) -> bool:
         return self.state == GatewayState.READY
