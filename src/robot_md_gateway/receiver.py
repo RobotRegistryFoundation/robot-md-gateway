@@ -386,7 +386,13 @@ def make_app(
         # attestation failure.
         try:
             if audit_chain is not None:
-                audit_chain.append(AuditEntry(
+                # Read the hash off the RETURNED entry, never off
+                # ``audit_chain.entries[-1]``. Two invokes run in two Starlette
+                # worker threads; by the time this thread reads the tail, the
+                # other one's intent may already be sitting on it, and this
+                # outcome would then carry a pointer to somebody else's dispatch.
+                # An evidence link that is wrong is worse than one that is absent.
+                stored = audit_chain.append(AuditEntry(
                     msg_id=msg_id,
                     timestamp_ms=int(time.time() * 1000),
                     decision="allow",
@@ -400,7 +406,7 @@ def make_app(
                     nonce=nonce if isinstance(nonce, str) else None,
                     actuator_name=actuator_name,
                 ))
-                intent_hash = audit_chain.entries[-1].chain_hash
+                intent_hash = stored.chain_hash
         except Exception:
             logging.getLogger(__name__).warning(
                 "intent audit entry failed (non-fatal; dispatch proceeds)", exc_info=True

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -80,15 +81,46 @@ class AuditEntry:
 @dataclass
 class AuditChain:
     entries: list[AuditEntry] = field(default_factory=list)
+    #: Serialises `append`. NOT a dataclass comparison or repr field: it is
+    #: machinery, not content.
+    #:
+    #: WHY A LOCK IS NEEDED AT ALL. The gateway's `/v1/invoke` is a SYNC FastAPI
+    #: path operation, so Starlette runs it in a worker thread and two invokes
+    #: with different msg_ids are genuinely concurrent. `append` reads
+    #: `entries[-1].chain_hash`, hashes, and then appends: three steps with
+    #: bytecode boundaries between them, and the interpreter may switch threads
+    #: at any of them. Without the lock two threads read the SAME predecessor
+    #: hash and both link to it, which forks the chain. Measured on this Pi with
+    #: 16 threads appending 25 entries each: 257 to 302 of 400 entries ended up
+    #: with a `chain_prev` that was not the previous entry's `chain_hash`, so a
+    #: reader walking the chain sees a break on most lines. The entries were all
+    #: still there; it was their ORDER that stopped being provable, which is the
+    #: one thing a hash chain is for.
+    #:
+    #: `threading.Lock` and not an asyncio lock, because the contending callers
+    #: are OS threads from Starlette's threadpool, not coroutines on one loop.
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False,
+    )
 
-    def append(self, entry: AuditEntry) -> None:
-        if not self.entries:
-            entry = AuditEntry(**{**entry.__dict__, "chain_prev": "0" * 64})
-        else:
-            entry = AuditEntry(**{**entry.__dict__, "chain_prev": self.entries[-1].chain_hash})
-        canon = canonical_json({k: v for k, v in entry.__dict__.items() if k != "chain_hash"})
-        h = hashlib.sha256(canon).hexdigest()
-        self.entries.append(AuditEntry(**{**entry.__dict__, "chain_hash": h}))
+    def append(self, entry: AuditEntry) -> AuditEntry:
+        """Link and store one entry. Returns THE STORED ENTRY, chain hash filled.
+
+        Returning it is not a convenience. A caller that needs the hash of the
+        entry it just wrote (the intent record does, so the outcome can point at
+        it) cannot get it from `entries[-1]`: by the time that read runs, another
+        thread's invoke may have appended. Read the return value, never the tail.
+        """
+        with self._lock:
+            if not self.entries:
+                entry = AuditEntry(**{**entry.__dict__, "chain_prev": "0" * 64})
+            else:
+                entry = AuditEntry(**{**entry.__dict__, "chain_prev": self.entries[-1].chain_hash})
+            canon = canonical_json({k: v for k, v in entry.__dict__.items() if k != "chain_hash"})
+            h = hashlib.sha256(canon).hexdigest()
+            stored = AuditEntry(**{**entry.__dict__, "chain_hash": h})
+            self.entries.append(stored)
+            return stored
 
     def export_signed(self, *, signing_key_pem: bytes, kid: str) -> dict:
         priv = serialization.load_pem_private_key(signing_key_pem, password=None)

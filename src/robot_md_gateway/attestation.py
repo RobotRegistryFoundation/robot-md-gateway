@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -375,7 +376,15 @@ def write_trace_head(export_file: Path, *, seq: int, chain_hash: str) -> None:
     which is the exact thing this file exists to make impossible.
     """
     path = head_file_for(export_file)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # A UNIQUE temp name per writer. A fixed ``<export>.head.tmp`` is a shared
+    # mutable file: two threads both open it, the first renames it away, and the
+    # second's ``os.replace`` raises FileNotFoundError, which propagates out of
+    # ``append_trace_line`` into the best-effort wrapper and SILENTLY DROPS THE
+    # TRACE LINE. Measured on this Pi before the fix: 8 threads writing 6 lines
+    # each left 6 of 48 lines in the file. The lock below is what makes the
+    # sequence correct; this name is what keeps a second process sharing the
+    # same export from destroying a line instead of merely renumbering one.
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
     body = {
         "v": TRACE_HEAD_VERSION,
         "seq": seq,
@@ -401,14 +410,54 @@ def write_trace_head(export_file: Path, *, seq: int, chain_hash: str) -> None:
         os.close(dir_fd)
 
 
+#: One lock per export file, so two invokes cannot both read seq N and both
+#: write N+1. Keyed by the RESOLVED path, because the gateway unit and a test
+#: can name the same file two ways and a lock that does not cover both is not a
+#: lock. ``_LOCKS_GUARD`` only protects the registry itself; it is never held
+#: across the file IO.
+_APPEND_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _append_lock(export_file: Path) -> threading.Lock:
+    try:
+        key = str(export_file.resolve())
+    except OSError:
+        key = str(export_file)
+    with _LOCKS_GUARD:
+        lock = _APPEND_LOCKS.get(key)
+        if lock is None:
+            lock = _APPEND_LOCKS[key] = threading.Lock()
+        return lock
+
+
 def append_trace_line(export_file: Path, record: dict) -> dict:
     """Number, link and append one rcan-action-trace/1 line. Returns the line.
 
     The line's chain hash is ``sha256`` of its own canonical bytes WITHOUT the
     trailing newline, which is exactly the bytes written to the file, so a
     verifier can recompute it from the file and nothing else.
+
+    SERIALISED, because the gateway's ``/v1/invoke`` is a sync FastAPI path
+    operation and Starlette runs those in a worker thread: two invokes with
+    different msg_ids really do run at the same time. Read-head, write-head and
+    append have to be one step. Without the lock two threads both read seq N,
+    both write a head saying N+1, and both append a line numbered N+1, whose
+    ``chain_prev`` each points at whatever the file looked like when they
+    started. A walk then reports a duplicate seq and a chain break on a file
+    nobody touched, which is the worst possible failure for evidence: an
+    integrity report that is not about integrity.
+
+    The lock is held across the head write and the line write, which is the
+    reason the fsync count below matters as much as it does: the critical
+    section is the hot path of every invoke on this gateway.
     """
     export_file.parent.mkdir(parents=True, exist_ok=True)
+    with _append_lock(export_file):
+        return _append_trace_line_locked(export_file, record)
+
+
+def _append_trace_line_locked(export_file: Path, record: dict) -> dict:
     seq, chain_prev, note = next_trace_link(export_file)
     line_record = dict(record)
     line_record["seq"] = seq

@@ -82,6 +82,34 @@
   file authoritative again. This is a report, not a defence. Nothing here
   prevents tampering and nothing here can.
 
+### Fixed
+
+- **Two invokes at once no longer fork the chain or lose a line.** `/v1/invoke`
+  is a sync FastAPI path operation, so Starlette runs it in a worker thread and
+  two invokes with different msg_ids are genuinely concurrent. Three things were
+  not safe under that, and record-before-dispatch made all three twice as likely
+  by writing twice per invoke:
+
+  - `AuditChain.append` read `entries[-1].chain_hash`, hashed, then appended.
+    Two threads read the same predecessor and both linked to it. Measured on a
+    Pi 5 with 8 threads appending 25 entries each and the interpreter switch
+    interval turned down: 257 to 302 of 400 entries ended up with a `chain_prev`
+    that was not the previous entry's `chain_hash`. The entries were all still
+    there; their ORDER stopped being provable, which is what a hash chain is
+    for. `append` now holds a `threading.Lock` and RETURNS the stored entry.
+  - the intent path read the hash back off `audit_chain.entries[-1]`, which
+    under two invokes can be the other request's intent. It reads the returned
+    entry now. An evidence link that points at the wrong dispatch is worse than
+    one that is absent.
+  - `append_trace_line` read the head, wrote the head and appended the line as
+    three separate steps, and `write_trace_head` staged through one shared
+    `<export>.head.tmp`. Two threads both got seq N, and the second's
+    `os.replace` raised `FileNotFoundError` because the first had already
+    renamed the temp file away, which the best-effort wrapper swallows: the
+    request succeeded and THE TRACE LINE WAS SILENTLY GONE. 8 threads writing 6
+    lines each left 6 of 48 lines in the file. Appends are now serialised by a
+    per-export-file lock and each writer stages through its own temp name.
+
 ### Deliberately not in this release
 
 - **`ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE` is still off, and the flip is

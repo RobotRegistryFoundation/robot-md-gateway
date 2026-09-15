@@ -320,3 +320,86 @@ def test_intent_trace_line_has_no_outcome_key():
     assert rec["record_kind"] == "intent"
     assert "outcome" not in rec
     assert rec["corr_id"] == "m1"
+
+
+# ---------------------------------------------------------------------------
+# Two invokes at once. `/v1/invoke` is a SYNC FastAPI path operation, so
+# Starlette runs it in a worker thread and two invokes with different msg_ids
+# are genuinely concurrent OS threads. Everything below is about that.
+# ---------------------------------------------------------------------------
+
+
+def _append_from_threads(export: Path, *, threads: int, per_thread: int) -> list[bytes]:
+    import threading as _t
+
+    start = _t.Barrier(threads)
+    errors: list[BaseException] = []
+
+    def worker(i: int) -> None:
+        start.wait()
+        for j in range(per_thread):
+            try:
+                append_trace_line(
+                    export,
+                    {"v": "rcan-action-trace/1", "record_kind": "outcome",
+                     "corr_id": f"{i}-{j}"},
+                )
+            except BaseException as exc:  # noqa: BLE001 - the test is the report
+                errors.append(exc)
+
+    ts = [_t.Thread(target=worker, args=(i,)) for i in range(threads)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert not errors, f"append_trace_line raised under concurrency: {errors[:3]}"
+    return [ln for ln in export.read_bytes().split(b"\n") if ln.strip()]
+
+
+def test_concurrent_appends_do_not_lose_a_line(tmp_path):
+    """EVERY line lands. Before the lock and the per-writer temp name, two
+    threads shared one `<export>.head.tmp`: the first renamed it away and the
+    second's os.replace raised FileNotFoundError, which the gateway's
+    best-effort wrapper swallows. The request still succeeded and the record
+    was simply gone. 8 threads x 6 lines left 6 of 48 on this Pi."""
+    export = tmp_path / "e.ndjsonl"
+    lines = _append_from_threads(export, threads=8, per_thread=6)
+    assert len(lines) == 48
+
+
+def test_concurrent_appends_do_not_reuse_a_seq(tmp_path):
+    """No two lines carry the same seq, and the numbering is 1..N with no hole.
+    Without the lock, two threads both read seq N and both wrote N+1, and a walk
+    then reports a duplicate on a file nobody touched."""
+    export = tmp_path / "e.ndjsonl"
+    lines = _append_from_threads(export, threads=8, per_thread=6)
+    seqs = [json.loads(ln)["seq"] for ln in lines]
+    assert sorted(seqs) == list(range(1, 49))
+    assert seqs == sorted(seqs), "lines are not in seq order in the file"
+
+
+def test_concurrent_appends_leave_no_chain_break(tmp_path):
+    """Every chain_prev is the sha256 of the line physically before it, so
+    `--walk` on a concurrently written file reports nothing. An integrity
+    report that is not about integrity is the worst failure this file has."""
+    export = tmp_path / "e.ndjsonl"
+    lines = _append_from_threads(export, threads=8, per_thread=6)
+    prev = None
+    for ln in lines:
+        want = hashlib.sha256(prev).hexdigest() if prev is not None else GENESIS_CHAIN_PREV
+        assert json.loads(ln)["chain_prev"] == want
+        prev = ln
+
+
+def test_concurrent_appends_leave_the_head_on_the_last_line(tmp_path):
+    export = tmp_path / "e.ndjsonl"
+    lines = _append_from_threads(export, threads=8, per_thread=6)
+    head = json.loads(head_file_for(export).read_text())
+    assert head["seq"] == 48
+    assert head["chain_hash"] == hashlib.sha256(lines[-1]).hexdigest()
+
+
+def test_no_stray_temp_files_are_left_behind(tmp_path):
+    export = tmp_path / "e.ndjsonl"
+    _append_from_threads(export, threads=8, per_thread=6)
+    assert not list(tmp_path.glob("*.tmp"))

@@ -269,3 +269,77 @@ def test_signing_failure_does_not_block_actuation(tmp_path):
     # says unattested rather than pretending.
     assert not export.exists()
     assert r.json()["attestation"] == "unattested"
+
+
+# ---------------------------------------------------------------------------
+# 5. Two invokes at once. The pair only means anything if the outcome points at
+#    ITS OWN intent, and the chain only means anything if it does not fork.
+# ---------------------------------------------------------------------------
+
+
+def test_audit_chain_append_returns_the_entry_it_stored():
+    """The receiver has to read the hash off the RETURNED entry. `entries[-1]`
+    is whatever landed last, which under two concurrent invokes is not
+    necessarily this thread's intent, and an outcome pointing at somebody
+    else's dispatch is worse evidence than an outcome pointing at nothing."""
+    from robot_md_gateway.cert.audit import AuditEntry
+
+    chain = AuditChain()
+    stored = chain.append(AuditEntry(
+        msg_id="m1", timestamp_ms=0, decision="allow", decision_reason="d",
+        envelope_kid=None, entry_kind="intent",
+    ))
+    assert stored is chain.entries[-1]
+    assert stored.msg_id == "m1"
+    assert len(stored.chain_hash) == 64
+    assert stored.chain_prev == "0" * 64
+
+
+def test_concurrent_appends_do_not_fork_the_audit_chain():
+    """Every entry's chain_prev is the previous entry's chain_hash.
+
+    `append` used to read `entries[-1].chain_hash`, hash, and then append, with
+    bytecode boundaries between the three. Two Starlette worker threads read the
+    same predecessor and both linked to it. Measured on this Pi with the switch
+    interval turned down: 257 to 302 of 400 entries carried a chain_prev that was
+    not the previous entry's chain_hash. The entries were all still there; what
+    stopped being provable was their order, which is the one thing a hash chain
+    is for.
+    """
+    import sys as _sys
+    import threading as _t
+
+    from robot_md_gateway.cert.audit import AuditEntry
+
+    chain = AuditChain()
+    n_threads, per_thread = 8, 25
+    start = _t.Barrier(n_threads)
+    mine_came_back: list[bool] = []
+
+    def worker(i: int) -> None:
+        start.wait()
+        for j in range(per_thread):
+            stored = chain.append(AuditEntry(
+                msg_id=f"{i}-{j}", timestamp_ms=0, decision="allow",
+                decision_reason="d" * 200, envelope_kid="k", entry_kind="intent",
+            ))
+            mine_came_back.append(stored.msg_id == f"{i}-{j}")
+
+    old = _sys.getswitchinterval()
+    _sys.setswitchinterval(1e-6)  # make the interleaving reliable, not lucky
+    try:
+        ts = [_t.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+    finally:
+        _sys.setswitchinterval(old)
+
+    assert len(chain.entries) == n_threads * per_thread
+    assert all(mine_came_back), "append returned another thread's entry"
+    breaks = [
+        k for k in range(1, len(chain.entries))
+        if chain.entries[k].chain_prev != chain.entries[k - 1].chain_hash
+    ]
+    assert not breaks, f"the chain forked at {len(breaks)} entries"
