@@ -72,6 +72,11 @@ order:
    the entry that says what happened, and it carries the intent entry's chain
    hash so the pair is one hop apart.
 
+Read the pair through that hash and the shared `corr_id`, **never off the chain
+by position**. Two invokes at once are two threads, and A-intent, B-intent,
+A-outcome, B-outcome is an ordinary interleaving: the entries stay correctly
+linked and correctly ordered, but a pair need not be adjacent.
+
 The record used to be written only after the dispatch, on purpose, so that it
 could say what actually happened. That reason is still true, which is why the
 late record stayed. What the late record could never cover is the case where

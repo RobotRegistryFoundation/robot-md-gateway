@@ -14,6 +14,13 @@
   entry's `intent_chain_hash` is the intent entry's chain hash, so the pair is
   one hop apart.
 
+  **The pointer is the linkage; adjacency is not.** With one invoke in flight
+  the two entries do sit next to each other, but two invokes are two Starlette
+  worker threads and A-intent, B-intent, A-outcome, B-outcome is an ordinary
+  interleaving. Read the pair through `intent_chain_hash` and `corr_id`, never
+  off the chain by position. There is a test that forces the interleaving rather
+  than hoping for it.
+
   **Nothing that already exists stops verifying.** `verify_audit_bundle`
   recomputes each entry's hash from the dict in the bundle rather than from an
   `AuditEntry` rebuilt out of it, so a bundle signed before these fields existed

@@ -162,7 +162,10 @@ def test_outcome_references_intent_hash(identity, tmp_path):
     assert outcome.entry_kind == "outcome"
     assert intent.intent_chain_hash is None       # an intent points at nothing
     assert outcome.intent_chain_hash == intent.chain_hash
-    assert outcome.chain_prev == intent.chain_hash  # and they are adjacent
+    # Adjacent HERE, with one invoke in flight. Adjacency is NOT the contract
+    # and must not be relied on: see
+    # test_two_invokes_at_once_are_linked_by_the_pointer_not_by_adjacency.
+    assert outcome.chain_prev == intent.chain_hash
 
     # The NDJSON side carries the same pointer as an UNSIGNED HINT (it is not
     # inside the outcome's signed bytes, and the docstring says so). The signed
@@ -479,3 +482,71 @@ def test_the_audit_last_route_is_not_a_fixed_field_set():
 
     src = inspect.getsource(rcv.make_app)
     assert "return last.__dict__" in src
+
+
+def test_two_invokes_at_once_are_linked_by_the_pointer_not_by_adjacency(identity, tmp_path):
+    """With one invoke in flight the pair is physically adjacent in the chain.
+    WITH TWO IT IS NOT, and it was never going to be: A's intent, B's intent,
+    A's outcome, B's outcome is a perfectly ordinary interleaving of two
+    Starlette worker threads.
+
+    So `intent_chain_hash` is the linkage and adjacency is a coincidence. This
+    test holds the actuator open until both requests are inside it, which forces
+    the interleaving rather than hoping for it, and then asserts that each
+    outcome points at ITS OWN intent across the gap.
+    """
+    import threading
+
+    from robot_md_gateway.actuator import ActuatorOutcome
+
+    both_in = threading.Barrier(2, timeout=10)
+
+    class _Slow:
+        name = "slow"
+
+        def execute(self, **kw):
+            both_in.wait()          # neither returns until both have dispatched
+            return ActuatorOutcome(success=True, outcome_kind="executed", telemetry={})
+
+    chain = AuditChain()
+    export = tmp_path / "traces.ndjson"
+    client = TestClient(_app(_Slow(), chain, identity=identity, export=export))
+
+    results: list[int] = []
+
+    def go(msg_id: str) -> None:
+        results.append(client.post("/v1/invoke", json=_envelope(msg_id)).status_code)
+
+    ts = [threading.Thread(target=go, args=(m,)) for m in ("msg-a", "msg-b")]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert results == [200, 200]
+
+    kinds = [e.entry_kind for e in chain.entries]
+    assert kinds == ["intent", "intent", "outcome", "outcome"], (
+        "the actuator held both requests open, so the interleaving is forced"
+    )
+    by_id: dict[str, dict[str, object]] = {}
+    for e in chain.entries:
+        by_id.setdefault(e.msg_id, {})[e.entry_kind] = e
+    adjacent = []
+    for msg_id in ("msg-a", "msg-b"):
+        intent, outcome = by_id[msg_id]["intent"], by_id[msg_id]["outcome"]
+        # THE POINTER IS ALWAYS RIGHT. This is the whole contract.
+        assert outcome.intent_chain_hash == intent.chain_hash
+        adjacent.append(outcome.chain_prev == intent.chain_hash)
+    # ADJACENCY IS NOT. With this interleaving the inner pair happens to sit
+    # together and the outer pair cannot: at least one outcome has another
+    # request's entry between it and its own intent. Nothing may read the pair
+    # off the chain by position.
+    assert not all(adjacent), "the interleaving did not separate either pair"
+
+    # The chain itself is still unbroken, and the export still has four lines
+    # numbered 1..4 with no duplicate and no break.
+    assert all(
+        chain.entries[k].chain_prev == chain.entries[k - 1].chain_hash
+        for k in range(1, 4)
+    )
+    assert [ln["seq"] for ln in _lines(export)] == [1, 2, 3, 4]
