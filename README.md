@@ -119,7 +119,7 @@ Environment variables (also settable via CLI flags — flags win):
 | `ROBOT_MD_MCP_COMMAND` | Stdio MCP command the gateway dispatches to | `robot-md-mcp` |
 | `ROBOT_MD_MCP_ARGS` | Space-separated args for the MCP command | (none) |
 | `ROBOT_MD_LOG_LEVEL` | Python log level | `INFO` |
-| `ROBOT_MD_ENVELOPE_MAX_SKEW_S` | Half-width of the envelope freshness window, in seconds, both directions | `300` |
+| `ROBOT_MD_ENVELOPE_MAX_SKEW_S` | Half-width of the envelope freshness window, in seconds, both directions. Unparseable, zero or negative values log a warning and fall back to the default, because a zero window would deny every envelope that carries a timestamp | `300` |
 | `ROBOT_MD_REQUIRE_ENVELOPE_TIMESTAMP` | Deny an envelope that carries no `timestamp_ms` instead of letting it through unchecked | off |
 
 ## What a client gets back

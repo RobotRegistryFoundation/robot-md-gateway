@@ -73,15 +73,32 @@ def _freshness_policy_from_env():
     An unparseable skew value falls back to the default rather than refusing to
     boot; a gateway that will not start is a gateway an operator starts without
     the check.
+
+    So does a skew of zero or less, and that one is the sharper foot-gun: the
+    window is a half-width compared with ``abs(skew)``, so 0 denies every
+    envelope that carries a timestamp at all, and a negative value denies all
+    of them unconditionally. An operator typing 0 means "turn the window off",
+    which is the opposite of what it would do, and the failure would look like
+    a robot that stopped answering the phone. Fall back and say so.
     """
     from .cert.envelope import FreshnessPolicy
 
+    log = logging.getLogger(__name__)
     raw = os.environ.get("ROBOT_MD_ENVELOPE_MAX_SKEW_S", "").strip()
     try:
         max_skew_s = float(raw) if raw else 300.0
     except ValueError:
-        logging.getLogger(__name__).warning(
+        log.warning(
             "ROBOT_MD_ENVELOPE_MAX_SKEW_S=%r is not a number; using 300s", raw,
+        )
+        max_skew_s = 300.0
+    if max_skew_s <= 0:
+        log.warning(
+            "ROBOT_MD_ENVELOPE_MAX_SKEW_S=%r is not positive; that would deny "
+            "every envelope carrying a timestamp_ms. Using 300s. To accept an "
+            "envelope of any age, leave ROBOT_MD_REQUIRE_ENVELOPE_TIMESTAMP "
+            "off and do not send timestamp_ms.",
+            raw,
         )
         max_skew_s = 300.0
     require = os.environ.get(
