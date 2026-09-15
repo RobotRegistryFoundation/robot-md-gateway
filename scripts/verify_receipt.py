@@ -54,7 +54,13 @@ What walk mode reports, and what each report is worth:
                  They carry no links and THEY BIND NOTHING. Walk mode says how
                  many and refuses to imply otherwise.
     chain_note   a line says its own link was rebuilt because the head file was
-                 missing. Reported by name; read it with an off-box copy.
+                 missing, or because the line above it was a partial write.
+                 Reported by name; read it with an off-box copy.
+    PARTIAL LINE the file's LAST line has no newline after it: the writer died
+                 between the first byte of a record and the end of it. Nothing
+                 is missing that the file claims, so it is a finding and not a
+                 gap. Read with an off-box copy: the same shape is what cutting
+                 the tail off a file leaves.
     dispatch never reported
                  an intent line with no outcome line for the same corr_id. The
                  gateway recorded that it was about to dispatch and no outcome
@@ -233,12 +239,19 @@ def walk(path: str) -> int:
     """
     try:
         with open(path, "rb") as fh:
-            raw_lines = fh.read().split(b"\n")
+            data = fh.read()
     except OSError as exc:
         print(f"ERROR: cannot read {path}: {exc}", file=sys.stderr)
         return 2
 
-    lines = [ln for ln in raw_lines if ln.strip()]
+    lines = [ln for ln in data.split(b"\n") if ln.strip()]
+    # A last line with no newline after it is a PARTIAL WRITE, and it is a
+    # different animal from corruption in the middle of the file: the writer was
+    # interrupted between the first byte of a record and the end of it. Nothing
+    # the file claims is missing, so it does not make the walk fail; it is named
+    # and it is left to a person, because the same shape is what somebody cutting
+    # the tail off a file leaves behind.
+    partial_tail = bool(lines) and not data.endswith(b"\n")
     print(f"walking {path}: {len(lines)} lines")
     if not lines:
         print("=> empty file: nothing to check, and nothing is claimed.")
@@ -256,7 +269,18 @@ def walk(path: str) -> int:
         try:
             rec = json.loads(raw)
         except ValueError as exc:
-            failures.append(f"line {lineno}: not JSON ({exc})")
+            if partial_tail and lineno == len(lines):
+                findings.append(
+                    f"PARTIAL LINE: line {lineno} is the last line and has no "
+                    f"newline after it, and it does not parse. A record was being "
+                    f"written when the writer stopped. Nothing this file claims is "
+                    f"missing, so this is not a gap; the next line written will "
+                    f"carry chain_note 'previous_line_partial'. Cutting the tail "
+                    f"off a file looks the same from here, so compare with an "
+                    f"off-box copy before concluding which it was."
+                )
+            else:
+                failures.append(f"line {lineno}: not JSON ({exc})")
             prev_bytes = raw
             continue
         if not isinstance(rec, dict):
@@ -327,6 +351,11 @@ def walk(path: str) -> int:
                     "This is the first numbered line after unnumbered history; "
                     "every line before it carries no links and binds nothing."
                     if note == "unnumbered_history"
+                    else "The line above this one is a partial write, so its own "
+                         "number could not be read; this line continues from the "
+                         "last line whose number could be, and binds the partial "
+                         "line's bytes as they sit in the file."
+                    if note == "previous_line_partial"
                     else "The head file was missing, so seq and chain_prev were "
                          "rebuilt from this file's own last line. If the tail was "
                          "removed along with the head, only an off-box copy shows it."

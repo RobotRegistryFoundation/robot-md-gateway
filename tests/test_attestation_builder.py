@@ -12,6 +12,7 @@ from robot_md_gateway import attestation
 from robot_md_gateway.actuator import ActuatorOutcome
 from robot_md_gateway.attestation import (
     CHAIN_NOTE_HEAD_RECOVERED,
+    CHAIN_NOTE_PARTIAL_PREVIOUS,
     CHAIN_NOTE_UNNUMBERED_HISTORY,
     GENESIS_CHAIN_PREV,
     append_trace_line,
@@ -470,3 +471,73 @@ def test_a_failed_head_write_does_not_stop_the_line_from_being_attempted(tmp_pat
         assert exc.errno == 28
     else:
         raise AssertionError("expected the OSError to reach the caller")
+
+
+# ---------------------------------------------------------------------------
+# A torn last line. The process died between the first byte of a record and its
+# newline. More likely since the per-line fsync went, and it used to destroy
+# evidence twice: it restarted the sequence at 1 on a numbered file, and the
+# next record was welded onto the broken one.
+# ---------------------------------------------------------------------------
+
+
+def _torn(tmp_path, *, lines: int = 5, lose_head: bool = True) -> Path:
+    export = tmp_path / "e.ndjsonl"
+    for i in range(lines):
+        append_trace_line(export, {"v": "rcan-action-trace/1", "corr_id": f"m{i}"})
+    export.write_bytes(export.read_bytes()[:-40])   # crash mid-line
+    if lose_head:
+        head_file_for(export).unlink()              # and lose the head with it
+    return export
+
+
+def test_a_torn_last_line_does_not_restart_the_sequence(tmp_path):
+    """seq 1..5 with a torn line 5 used to come back as (1, unnumbered_history):
+    a numbered file silently restarting at 1 AND saying on the record that it had
+    never been numbered. It continues from the last line whose number can be
+    read, and names why."""
+    export = _torn(tmp_path)
+    seq, _chain_prev, note = attestation.next_trace_link(export)
+    assert seq == 5, "the sequence restarted on a numbered file"
+    assert note == CHAIN_NOTE_PARTIAL_PREVIOUS
+    assert note != CHAIN_NOTE_UNNUMBERED_HISTORY
+
+
+def test_a_torn_last_line_binds_its_own_bytes_not_the_line_above_it(tmp_path):
+    """chain_prev has to be the bytes PHYSICALLY last in the file, torn or not,
+    or a walk comparing each line with the one above it reports a chain break on
+    a file nobody touched."""
+    export = _torn(tmp_path)
+    _seq, chain_prev, _note = attestation.next_trace_link(export)
+    torn_bytes = export.read_bytes().split(b"\n")[-1]
+    assert chain_prev == hashlib.sha256(torn_bytes).hexdigest()
+
+
+def test_the_next_record_is_not_welded_onto_a_torn_line(tmp_path):
+    """Appending onto a file that does not end in a newline used to join the
+    torn record and the whole new record into one unparseable line, so a crash
+    cost two records instead of one."""
+    export = _torn(tmp_path)
+    written = append_trace_line(export, {"v": "rcan-action-trace/1", "corr_id": "after"})
+    lines = [ln for ln in export.read_bytes().split(b"\n") if ln.strip()]
+    assert json.loads(lines[-1])["corr_id"] == "after"
+    assert json.loads(lines[-1])["seq"] == written["seq"] == 5
+    # The torn line is still its own line, still broken, and still there to be
+    # reported. It is not silently repaired and it is not silently removed.
+    try:
+        json.loads(lines[-2])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("the torn line was rewritten; it must be left alone")
+
+
+def test_ends_with_newline_reads_the_last_byte(tmp_path):
+    export = tmp_path / "e.ndjsonl"
+    assert attestation.ends_with_newline(export)          # missing file
+    export.write_bytes(b"")
+    assert attestation.ends_with_newline(export)          # empty file
+    export.write_bytes(b'{"a":1}\n')
+    assert attestation.ends_with_newline(export)
+    export.write_bytes(b'{"a":1}')
+    assert not attestation.ends_with_newline(export)

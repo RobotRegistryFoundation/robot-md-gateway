@@ -133,6 +133,30 @@
   cannot make it wrong, and unsetting `ROBOT_MD_ATTESTATION_EXPORT_FILE` takes
   the export off the path entirely.
 
+- **A partial last line no longer restarts the sequence or eats the next
+  record.** A crash between the first byte of a trace line and its newline
+  leaves a torn tail, and dropping the per-line `fsync` above makes that shape
+  likelier. Two things went wrong on such a file and both are fixed:
+
+  - `next_trace_link` could not read a seq off the torn line, concluded the file
+    had never been numbered, and returned `seq: 1` with
+    `chain_note: "unnumbered_history"`. A numbered file restarted at 1 AND said
+    on the record that it had never been numbered, which is precisely the silent
+    restart this format exists to end. It now looks further back for the last
+    line whose number can be read, continues from there, and marks the line
+    `chain_note: "previous_line_partial"`. The torn line's own number is
+    unreadable and is not guessed.
+  - `append_trace_line` wrote straight onto a file that did not end in a
+    newline, welding the torn record and the whole new record into one
+    unparseable line, so a crash cost two records instead of one. It writes a
+    separating newline and leaves the torn line exactly as it is, broken and
+    reportable.
+
+  `--walk` names a partial last line as `PARTIAL LINE` and exits 3 rather than
+  1: nothing the file claims is missing. The message says that cutting the tail
+  off a file looks the same from here and that only an off-box copy separates
+  the two.
+
 ### Deliberately not in this release
 
 - **`ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE` is still off, and the flip is

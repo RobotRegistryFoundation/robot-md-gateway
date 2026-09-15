@@ -225,3 +225,56 @@ def test_a_bare_intent_record_is_refused_by_the_receipt_path(tmp_path):
     )
     assert r.returncode == 2
     assert "INTENT record" in r.stderr
+
+
+def test_walk_names_a_partial_last_line_instead_of_a_traceback(tmp_path):
+    """A crash between the first byte of a record and its newline. It is not a
+    gap (nothing the file claims is missing) and it is not a traceback."""
+    f = tmp_path / "torn.ndjson"
+    lines = _write(f, [_outcome(1, "m1"), _outcome(2, "m2"), _outcome(3, "m3")])
+    f.write_bytes(("\n".join(lines) + "\n").encode("utf-8")[:-40])
+    r = _walk(f)
+    assert "Traceback" not in (r.stdout + r.stderr)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "PARTIAL LINE" in r.stdout
+    assert "not a gap" in r.stdout
+    assert "off-box copy" in r.stdout
+    assert "GAP" not in r.stdout.replace("not a gap", "")
+
+
+def test_walk_names_a_line_the_head_promised_and_the_file_never_got(tmp_path):
+    """The crash window the design deliberately chose: the head file is written
+    first, so a crash between the head write and the line write leaves the head
+    one AHEAD. The next append takes head+1 and LEAVES THE HOLE rather than
+    reusing the number, and the walk names the missing seq."""
+    import json
+
+    from robot_md_gateway.attestation import (
+        append_trace_line,
+        head_file_for,
+        read_trace_head,
+    )
+
+
+    f = tmp_path / "ahead.ndjson"
+    append_trace_line(f, {"v": "rcan-action-trace/1", "corr_id": "m1"})
+    append_trace_line(f, {"v": "rcan-action-trace/1", "corr_id": "m2"})
+    # Crash simulated exactly: the head for seq 3 lands, the line never does.
+    head_file_for(f).write_text(json.dumps({
+        "v": "rcan-trace-head/1", "seq": 3, "chain_hash": "a" * 64,
+        "export": f.name, "updated_at": "2026-09-14T00:00:00+00:00",
+    }, sort_keys=True, separators=(",", ":")))
+    assert read_trace_head(f)["seq"] == 3
+
+    after = append_trace_line(f, {"v": "rcan-action-trace/1", "corr_id": "m3"})
+    assert after["seq"] == 4, "a promised seq must not be reused by the next line"
+    # It also binds the head's chain_hash, which is the hash of a line that is
+    # not in the file, so the break is visible as well as the hole.
+    assert after["chain_prev"] == "a" * 64
+
+    r = _walk(f)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "GAP" in r.stdout
+    assert "missing seq 3" in r.stdout
+    assert "CHAIN BREAK" in r.stdout
+    assert "Traceback" not in (r.stdout + r.stderr)

@@ -279,8 +279,18 @@ GENESIS_CHAIN_PREV = "0" * 64
 #:                     were removed together, the rebuilt seq is the truncated
 #:                     file's, and only an off-box copy can show it. The marker
 #:                     is what tells a reader to go and compare.
+#: previous_line_partial  the line physically before this one is a PARTIAL
+#:                     WRITE: the process died between the first byte and the
+#:                     newline. Its own seq could not be read back, so this line
+#:                     continues from the last line whose number could be, and
+#:                     binds the partial line's bytes as they actually sit in
+#:                     the file. Without this branch a torn last line looked
+#:                     like no number at all and the sequence RESTARTED AT 1
+#:                     while claiming unnumbered_history, which is the silent
+#:                     restart this whole file exists to make impossible.
 CHAIN_NOTE_UNNUMBERED_HISTORY = "unnumbered_history"
 CHAIN_NOTE_HEAD_RECOVERED = "head_recovered_from_file"
+CHAIN_NOTE_PARTIAL_PREVIOUS = "previous_line_partial"
 
 
 def head_file_for(export_file: Path) -> Path:
@@ -311,14 +321,53 @@ def read_trace_head(export_file: Path) -> dict | None:
     return head
 
 
-def _last_line_bytes(export_file: Path) -> bytes | None:
-    """The last non-empty line of the export, without its newline."""
+def _read_lines(export_file: Path) -> list[bytes]:
+    """Every non-empty line of the export, without newlines."""
     try:
         data = export_file.read_bytes()
     except OSError:
-        return None
-    lines = [ln for ln in data.split(b"\n") if ln.strip()]
+        return []
+    return [ln for ln in data.split(b"\n") if ln.strip()]
+
+
+def _last_line_bytes(export_file: Path) -> bytes | None:
+    """The last non-empty line of the export, without its newline."""
+    lines = _read_lines(export_file)
     return lines[-1] if lines else None
+
+
+def _seq_of(raw: bytes) -> int | None:
+    """The seq a line carries, or None if it carries none or does not parse."""
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    seq = parsed.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+        return None
+    return seq
+
+
+def ends_with_newline(export_file: Path) -> bool:
+    """Whether the export's last byte is a newline.
+
+    False on a non-empty file means the last line is a PARTIAL WRITE: the
+    process died between the first byte of a record and its newline. That is a
+    likelier shape since v0.5.0a8 stopped fsyncing each line, and it has to be
+    handled in two places or it destroys evidence twice over. See
+    ``next_trace_link`` (do not restart the sequence) and ``append_trace_line``
+    (do not weld the next record onto the torn one).
+    """
+    try:
+        with export_file.open("rb") as fh:
+            if fh.seek(0, os.SEEK_END) == 0:
+                return True
+            fh.seek(-1, os.SEEK_END)
+            return fh.read(1) == b"\n"
+    except OSError:
+        return True
 
 
 def next_trace_link(export_file: Path) -> tuple[int, str, str | None]:
@@ -350,19 +399,25 @@ def next_trace_link(export_file: Path) -> tuple[int, str, str | None]:
     head = read_trace_head(export_file)
     if head is not None:
         return int(head["seq"]) + 1, str(head["chain_hash"]), None
-    last = _last_line_bytes(export_file)
-    if last is None:
+    lines = _read_lines(export_file)
+    if not lines:
         return 1, GENESIS_CHAIN_PREV, None
-    prev_hash = hashlib.sha256(last).hexdigest()
-    last_seq = None
-    try:
-        parsed = json.loads(last)
-        if isinstance(parsed, dict):
-            last_seq = parsed.get("seq")
-    except ValueError:
-        last_seq = None
-    if isinstance(last_seq, int) and not isinstance(last_seq, bool) and last_seq >= 1:
+    # chain_prev always binds the bytes PHYSICALLY last in the file, torn or
+    # not, so a walk comparing each line against the one above it matches.
+    prev_hash = hashlib.sha256(lines[-1]).hexdigest()
+    last_seq = _seq_of(lines[-1])
+    if last_seq is not None:
         return last_seq + 1, prev_hash, CHAIN_NOTE_HEAD_RECOVERED
+    # The last line carries no readable seq. Before concluding this file has no
+    # numbering, LOOK FURTHER BACK: a partial write leaves a tail that parses as
+    # nothing while the lines above it are numbered perfectly well. Treating that
+    # as "unnumbered history" restarted the sequence at 1 on a numbered file and
+    # said so on the record, which is the silent restart this format exists to
+    # end. The torn line's own number is unreadable and is not guessed.
+    for raw in reversed(lines[:-1]):
+        seq = _seq_of(raw)
+        if seq is not None:
+            return seq + 1, prev_hash, CHAIN_NOTE_PARTIAL_PREVIOUS
     return 1, prev_hash, CHAIN_NOTE_UNNUMBERED_HISTORY
 
 
@@ -489,6 +544,11 @@ def _append_trace_line_locked(export_file: Path, record: dict) -> dict:
     if note is not None:
         line_record["chain_note"] = note
     canon = canonical_json(line_record)
+    # If the file does not end in a newline its last record is a partial write,
+    # and appending straight onto it WELDS the two into one unparseable line:
+    # the torn record and this whole new record both become unreadable. One
+    # newline keeps the damage to the line that was already damaged.
+    separator = "" if ends_with_newline(export_file) else "\n"
     write_trace_head(
         export_file, seq=seq, chain_hash=hashlib.sha256(canon).hexdigest()
     )
@@ -498,7 +558,7 @@ def _append_trace_line_locked(export_file: Path, record: dict) -> dict:
     # the head file already names. `flush` still matters, so the bytes are in
     # the page cache and the shipper's next poll sees them.
     with export_file.open("a", encoding="utf-8") as fh:
-        fh.write(canon.decode("utf-8") + "\n")
+        fh.write(separator + canon.decode("utf-8") + "\n")
         fh.flush()
     return line_record
 
