@@ -46,6 +46,17 @@ def _read_lines(export: Path):
     return [json.loads(x) for x in export.read_text().splitlines() if x.strip()]
 
 
+def _outcome_lines(export: Path):
+    """Only the outcome lines. Since v0.5.0a8 (OC-M-04) the allow path also
+    writes an INTENT line before dispatch, and these tests are about what the
+    gateway reports AFTER the actuator answered."""
+    return [r for r in _read_lines(export) if r.get("record_kind") != "intent"]
+
+
+def _intent_lines(export: Path):
+    return [r for r in _read_lines(export) if r.get("record_kind") == "intent"]
+
+
 def _verify_outcome(outcome: dict, pub_pem: bytes) -> bool:
     pub = serialization.load_pem_public_key(pub_pem)
     sig = base64.b64decode(outcome["envelope_signature"]["sig"])
@@ -86,10 +97,22 @@ def test_allow_path_writes_one_signed_ok_trace(tmp_path, identity, gateway_keypa
     r = TestClient(app).post("/v1/invoke", json=_base_envelope("allow-1"))
     assert r.status_code == 200
 
-    lines = _read_lines(export)
+    # One intent line (before dispatch) and one outcome line (after it).
+    assert len(_read_lines(export)) == 2
+    intents = _intent_lines(export)
+    assert len(intents) == 1
+    assert intents[0]["corr_id"] == "allow-1"
+    assert "outcome" not in intents[0]          # an intent is not an outcome
+    assert intents[0]["intent"]["status"] == "dispatching"
+    assert intents[0]["seq"] == 1               # numbered from the first line
+    assert intents[0]["chain_prev"] == "0" * 64
+
+    lines = _outcome_lines(export)
     assert len(lines) == 1
     rec = lines[0]
     assert rec["v"] == "rcan-action-trace/1"
+    assert rec["record_kind"] == "outcome"
+    assert rec["seq"] == 2
     assert rec["corr_id"] == "allow-1"
     out = rec["outcome"]
     assert out["corr_id"] == "allow-1"
@@ -119,7 +142,7 @@ def test_tool_allowlist_deny_writes_one_signed_denied_trace(tmp_path, identity, 
     )
     assert r.status_code == 403
 
-    lines = _read_lines(export)
+    lines = _outcome_lines(export)
     assert len(lines) == 1
     out = lines[0]["outcome"]
     assert out["status"] == "denied"
@@ -148,7 +171,10 @@ def test_actuator_exception_writes_error_status(tmp_path, identity):
     )
     r = TestClient(app).post("/v1/invoke", json=_base_envelope("err-1"))
     assert r.status_code == 500
-    out = _read_lines(export)[0]["outcome"]
+    # The intent line came first and it does NOT say the action happened; the
+    # outcome line is the one that says it raised.
+    assert _intent_lines(export)[0]["intent"]["status"] == "dispatching"
+    out = _outcome_lines(export)[0]["outcome"]
     assert out["status"] == "error"
     assert out["error"]["kind"] == "RuntimeError"
 
@@ -207,8 +233,8 @@ def test_attestation_export_failure_is_best_effort(tmp_path, identity):
     # Allow path: a successful actuation still returns 200 (not 500)…
     r = TestClient(app).post("/v1/invoke", json=_base_envelope("besteffort-ok"))
     assert r.status_code == 200
-    # …the audit entry is still recorded (audit runs BEFORE attestation)…
-    assert len(audit.entries) == 1
+    # …the audit entries are still recorded (audit runs BEFORE attestation)…
+    assert len(audit.entries) == 2          # intent + outcome
     assert audit.entries[0].msg_id == "besteffort-ok"
     # …and no trace line was written (the export genuinely failed).
     assert not export.exists()
@@ -219,4 +245,4 @@ def test_attestation_export_failure_is_best_effort(tmp_path, identity):
         json=_base_envelope("besteffort-deny", tool_name="mcp__robot__execute_capability"),
     )
     assert r.status_code == 403
-    assert len(audit.entries) == 2
+    assert len(audit.entries) == 3          # intent + outcome + the deny

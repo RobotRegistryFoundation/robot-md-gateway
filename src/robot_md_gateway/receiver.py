@@ -42,7 +42,10 @@ from rcan.audit_bundle import canonical_json
 from .actuator import Actuator, ActuatorOutcome, NoOpActuator
 from .attestation import (
     SigningIdentity,
+    append_trace_line,
     build_action_trace,
+    build_intent,
+    build_intent_trace,
     build_outcome,
     outcome_status,
     telemetry_sha256_of,
@@ -323,6 +326,7 @@ def make_app(
         envelope_dict: dict | None,
         ruri: str | None,
         rrn: str | None,
+        intent_chain_hash: str | None = None,
     ) -> None:
         # Attestation export is independent of the audit chain: it must fire even
         # when audit_chain is None. Disabled when no signing identity / no export
@@ -336,10 +340,100 @@ def make_app(
         invoke = envelope_dict if envelope_dict is not None else {"msg_id": msg_id}
         record = build_action_trace(
             invoke=invoke, outcome=signed_outcome, ruri=ruri, rrn=rrn or "",
+            intent_chain_hash=intent_chain_hash,
         )
-        attestation_export_file.parent.mkdir(parents=True, exist_ok=True)
-        with attestation_export_file.open("a", encoding="utf-8") as fh:
-            fh.write(canonical_json(record).decode("utf-8") + "\n")
+        append_trace_line(attestation_export_file, record)
+
+    def _record_intent(
+        *,
+        msg_id: str,
+        envelope_dict: dict,
+        ruri: str | None,
+        rrn: str | None,
+        tool_name: str | None,
+        actuator_name: str | None,
+        kid: str | None,
+        caller: str | None,
+        tier: str | None,
+    ) -> str | None:
+        """Write the RECORD BEFORE DISPATCH, and return its audit chain hash.
+
+        Called once, after every gate has passed and before the actuator is
+        touched. It writes two things by the same recipes the outcome uses: an
+        AuditEntry with ``entry_kind="intent"`` into the hash-linked chain, and a
+        signed intent line into the NDJSON export.
+
+        WHAT AN INTENT ENTRY MEANS, exactly: the gateway cleared every gate and
+        was about to call this actuator with this tool on behalf of this
+        credential. It does not say the actuator ran. It does not say anything
+        succeeded. An intent with no outcome beside it is a dispatch that never
+        reported back, and ``scripts/verify_receipt.py --walk`` names it as
+        exactly that rather than counting it as an action.
+
+        BEST EFFORT, verbatim the same contract the outcome path has carried
+        since the export existed: every failure in here is caught, logged and
+        swallowed. A signing error, a full disk or an unwritable export must
+        never crash the request and must never change whether the robot moves.
+        A record is evidence, not enforcement, and the day it becomes a new way
+        to stop a robot is the day operators start turning it off.
+        """
+        intent_hash: str | None = None
+        recorded_at = datetime.now(tz=timezone.utc).isoformat()
+        envelope_id = envelope_dict.get("envelope_id")
+        nonce = envelope_dict.get("nonce")
+        # Audit FIRST, for the same reason the outcome path does it first:
+        # tamper-evident evidence must not be suppressed by a downstream
+        # attestation failure.
+        try:
+            if audit_chain is not None:
+                audit_chain.append(AuditEntry(
+                    msg_id=msg_id,
+                    timestamp_ms=int(time.time() * 1000),
+                    decision="allow",
+                    decision_reason="dispatching: all gates passed, actuator not yet called",
+                    envelope_kid=kid,
+                    caller=caller,
+                    tier=tier,
+                    entry_kind="intent",
+                    tool_name=tool_name,
+                    envelope_id=envelope_id if isinstance(envelope_id, str) else None,
+                    nonce=nonce if isinstance(nonce, str) else None,
+                    actuator_name=actuator_name,
+                ))
+                intent_hash = audit_chain.entries[-1].chain_hash
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "intent audit entry failed (non-fatal; dispatch proceeds)", exc_info=True
+            )
+        try:
+            if signing_identity is not None and attestation_export_file is not None:
+                intent = build_intent(
+                    corr_id=msg_id,
+                    envelope_id=envelope_id if isinstance(envelope_id, str) else None,
+                    rrn=rrn or "",
+                    tool=tool_name,
+                    actuator=actuator_name,
+                    nonce=nonce if isinstance(nonce, str) else None,
+                    caller=caller,
+                    tier=tier,
+                    recorded_at=recorded_at,
+                )
+                signed_intent = sign_envelope(
+                    signing_identity.priv, intent, signing_identity.kid
+                )
+                append_trace_line(
+                    attestation_export_file,
+                    build_intent_trace(
+                        invoke=envelope_dict, intent=signed_intent,
+                        ruri=ruri, rrn=rrn or "",
+                    ),
+                )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "intent attestation emit failed (non-fatal; dispatch proceeds)",
+                exc_info=True,
+            )
+        return intent_hash
 
     def _attach_signature(target: dict, signed_outcome: dict | None, marker: str) -> None:
         """Attach the wire-receipt signature to a response/deny-detail dict IN PLACE.
@@ -373,6 +467,7 @@ def make_app(
         ended_at: str | None = None,
         caller: str | None = None,
         tier: str | None = None,
+        intent_chain_hash: str | None = None,
     ) -> tuple[dict | None, str]:
         # Sign the outcome ONCE for both the wire receipt and the file export.
         # Best-effort: a signing failure must never crash the request (mirrors the
@@ -402,6 +497,10 @@ def make_app(
                 envelope_kid=kid,
                 caller=caller,
                 tier=tier,
+                # entry_kind defaults to "outcome"; spelled out here so the pair
+                # reads as a pair at the one place both halves are written.
+                entry_kind="outcome",
+                intent_chain_hash=intent_chain_hash,
             )
             if outcome is not None:
                 telem_sha: str | None = None
@@ -436,6 +535,7 @@ def make_app(
             _emit_attestation(
                 signed_outcome=signed_outcome, msg_id=msg_id,
                 envelope_dict=envelope_dict, ruri=ruri, rrn=rrn,
+                intent_chain_hash=intent_chain_hash,
             )
         except Exception:
             logging.getLogger(__name__).warning(
@@ -784,6 +884,27 @@ def make_app(
             target_actuator = actuator
             target_config = actuator_config
 
+        # RECORD BEFORE DISPATCH (RCAN 6.3). Every gate above has passed and the
+        # actuator has been chosen; the next statement is the one that can move
+        # the robot. This is the last moment at which a record can be written
+        # that does not depend on the dispatch coming back, and that is exactly
+        # why the spec puts it here: a driver that hangs, a process that is
+        # killed mid-motion, or a robot that is unplugged all used to leave no
+        # trace that anything had been attempted at all.
+        #
+        # THE LATE RECORD STAYS. The outcome entry below is not replaced by
+        # this one, because the reason the late record existed is still true:
+        # only a record written after the dispatch can say what happened. The
+        # pair is the answer. The intent says what was about to be attempted,
+        # the outcome says how it went, and the outcome carries the intent's
+        # chain hash so the two are one hop apart.
+        intent_chain_hash = _record_intent(
+            msg_id=envelope.msg_id, envelope_dict=envelope_dict,
+            ruri=envelope.ruri, rrn=manifest_rrn,
+            tool_name=envelope.tool_name, actuator_name=target_actuator.name,
+            kid=manifest_result.kid, caller=caller, tier=tier,
+        )
+
         # Capture outcome regardless of success so the audit entry records
         # what actually happened.
         try:
@@ -809,6 +930,7 @@ def make_app(
             actuator_name=target_actuator.name,
             envelope_dict=envelope_dict, ruri=envelope.ruri, rrn=manifest_rrn,
             started_at=started_at, ended_at=ended_at, caller=caller, tier=tier,
+            intent_chain_hash=intent_chain_hash,
         )
 
         if not outcome.success and outcome.outcome_kind == "denied":

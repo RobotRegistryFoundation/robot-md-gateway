@@ -120,12 +120,17 @@ class TestActuatorCalledAfterGates:
         assert spy.calls[0]["envelope_msg_id"] == "test-msg-1"
         assert spy.calls[0]["tier"] == "actuate"
 
-        # Audit chain has one entry with actuator outcome captured.
-        assert len(chain.entries) == 1
-        entry = chain.entries[0]
+        # Audit chain: the intent written before dispatch (OC-M-04), then the
+        # outcome written after it with the actuator result captured. Only the
+        # second one carries an outcome kind, because only it knows one.
+        assert len(chain.entries) == 2
+        assert [e.entry_kind for e in chain.entries] == ["intent", "outcome"]
+        assert chain.entries[0].actuator_outcome_kind is None
+        entry = chain.entries[-1]
         assert entry.decision == "allow"
         assert entry.actuator_name == "spy"
         assert entry.actuator_outcome_kind == "executed"
+        assert entry.intent_chain_hash == chain.entries[0].chain_hash
 
     def test_actuator_not_called_when_gate_denies(self, tmp_path, monkeypatch):
         # Manifest provenance fails → gate denies → actuator must NOT be called.
@@ -193,9 +198,11 @@ class TestActuatorErrorHandling:
         assert body["detail"]["actuator_error"] == "simulated driver failure"
         assert body["detail"]["actuator_error_kind"] == "ValueError"
 
-        # Audit entry: gate decision was allow, but actuator outcome is error.
-        assert len(chain.entries) == 1
-        entry = chain.entries[0]
+        # Audit entries: the intent says a dispatch was about to happen, the
+        # outcome says it raised. The intent must NOT read as a success.
+        assert len(chain.entries) == 2
+        entry = chain.entries[-1]
+        assert entry.entry_kind == "outcome"
         assert entry.decision == "allow"
         assert entry.actuator_name == "raises"
         assert entry.actuator_outcome_kind == "error"
@@ -248,7 +255,7 @@ class TestTelemetryPersistence:
             )
 
         expected_sha = hashlib.sha256(canonical_json(telemetry)).hexdigest()
-        entry = chain.entries[0]
+        entry = chain.entries[-1]  # [0] is the pre-dispatch intent
         assert entry.actuator_telemetry_sha256 == expected_sha
         assert entry.actuator_telemetry_path is None
 
@@ -282,7 +289,7 @@ class TestTelemetryPersistence:
                 headers={"Authorization": "Bearer actuate-token"},
             )
 
-        entry = chain.entries[0]
+        entry = chain.entries[-1]  # [0] is the pre-dispatch intent
         # Path is recorded as string.
         assert entry.actuator_telemetry_path == str(telem_file)
         # sha256 reflects FILE BYTES (not the in-memory telemetry dict)
@@ -377,8 +384,10 @@ class TestActuatorPolicyDenial:
         assert detail["actuator_name"] == "refuser"
 
         # The refusal is still a first-class audited outcome, not a dropped call.
-        assert len(chain.entries) == 1
-        entry = chain.entries[0]
+        # Two entries: the driver was dispatched to, and it answered no.
+        assert len(chain.entries) == 2
+        entry = chain.entries[-1]
+        assert entry.entry_kind == "outcome"
         assert entry.decision == "allow"          # the GATES allowed it
         assert entry.actuator_name == "refuser"   # the DRIVER refused it
         assert entry.actuator_outcome_kind == "denied"

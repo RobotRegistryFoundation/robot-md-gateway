@@ -99,8 +99,12 @@ def test_allow_records_one_entry():
         json=_envelope(),
     )
     assert r.status_code == 200
-    assert len(chain.entries) == 1
-    entry = chain.entries[0]
+    # TWO entries on the allow path since v0.5.0a8 (OC-M-04): the intent
+    # written before dispatch, then the outcome written after it. The deny
+    # paths below are still one entry each, because nothing was dispatched.
+    assert len(chain.entries) == 2
+    assert [e.entry_kind for e in chain.entries] == ["intent", "outcome"]
+    entry = chain.entries[-1]
     assert entry.decision == "allow"
     assert entry.msg_id == "msg-audit-1"
     assert entry.envelope_kid is not None  # manifest kid recorded
@@ -171,7 +175,8 @@ def test_chain_export_signed_round_trip_through_receiver():
         headers={"Authorization": "Bearer actuate-token"},
         json=_envelope(msg_id="m-deny-1", tool_name="mcp__robot__not_allowed"),
     )
-    assert len(chain.entries) == 2
+    # intent + outcome for the allow, one entry for the deny.
+    assert len(chain.entries) == 3
 
     priv_pem, pub_pem = _ed25519_pair()
     bundle = chain.export_signed(signing_key_pem=priv_pem, kid="gateway-phase4-test")

@@ -46,6 +46,32 @@ class AuditEntry:
     # an unknown bearer, or a bearer entry with no `caller` declared.
     caller: str | None = None
     tier: str | None = None  # "read" | "actuate" | "commission" | "anon"
+    # NEW v0.5.0a8 (OC-M-04): record before dispatch.
+    #
+    # `entry_kind` says WHEN in the request this entry was written, and it is
+    # the field that keeps an intent from reading as an action that happened:
+    #
+    #   "intent"   written after every gate passed and BEFORE the actuator was
+    #              called. It says the gateway was about to dispatch. It says
+    #              NOTHING about whether the actuator ran, succeeded, or was
+    #              even reachable. An intent entry alone is an open question,
+    #              not a completed action.
+    #   "outcome"  written after the actuator returned (or raised). This is the
+    #              entry that says what happened, and it is the DEFAULT so every
+    #              entry written before this release keeps exactly the meaning
+    #              it already had.
+    #
+    # An intent entry never carries actuator_outcome_kind, telemetry or an
+    # error kind, because at the moment it is written none of those exist yet.
+    entry_kind: str = "outcome"
+    tool_name: str | None = None  # the RCAN tool the envelope asked for
+    envelope_id: str | None = None  # envelope-level id when the client sends one
+    nonce: str | None = None  # the envelope's replay nonce, when it carries one
+    # On an "outcome" entry: the chain_hash of the "intent" entry written for
+    # the same dispatch, so the pair is linkable in one hop. None on an intent
+    # entry, and None on an outcome whose intent could not be written (the
+    # record path is best effort and must never alter actuation).
+    intent_chain_hash: str | None = None
     # Chain linkage — must remain last; AuditChain.append fills these in.
     chain_prev: str = ""  # filled by AuditChain.append; sha256 of prior entry's canonical bytes
     chain_hash: str = ""  # filled by AuditChain.append; sha256 of this entry's canonical bytes

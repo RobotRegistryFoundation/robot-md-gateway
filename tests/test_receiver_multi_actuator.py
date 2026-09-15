@@ -179,8 +179,11 @@ class TestMultiActuatorDispatch:
                 headers={"Authorization": "Bearer actuate-token"},
             )
 
-        assert len(chain.entries) == 1
+        # intent + outcome (OC-M-04); both name the actuator that was chosen.
+        assert len(chain.entries) == 2
+        assert [e.entry_kind for e in chain.entries] == ["intent", "outcome"]
         assert chain.entries[0].actuator_name == "so-arm101"
+        assert chain.entries[-1].actuator_name == "so-arm101"
 
 
 class TestSingleActuatorBackwardCompat:

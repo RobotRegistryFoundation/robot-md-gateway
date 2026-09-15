@@ -37,17 +37,55 @@ not mean the action was safe, correct, or authorised by anyone in particular.
 It is an accountability artifact, and reading it is the check; this script
 asserts, it does not bless.
 
+WALK MODE (--walk <file>) reads a whole NDJSON export instead of one receipt
+and answers a different question: is anything MISSING. Each line written by
+v0.5.0a8 or later carries a ``seq`` (monotonic within one export file) and a
+``chain_prev`` (sha256 of the previous line's bytes), so a deleted or truncated
+line leaves a hole that this mode names. It needs no key and no network: a third
+party handed the file can run it and check the operator's arithmetic.
+
+What walk mode reports, and what each report is worth:
+
+    GAP          a seq is missing. Lines were removed, or a line the head file
+                 promised never landed. This is an integrity failure.
+    CHAIN BREAK  a line's chain_prev does not match the previous line's bytes.
+                 Something was edited or reordered. Integrity failure.
+    UNNUMBERED   the file begins with lines written before this format existed.
+                 They carry no links and THEY BIND NOTHING. Walk mode says how
+                 many and refuses to imply otherwise.
+    chain_note   a line says its own link was rebuilt because the head file was
+                 missing. Reported by name; read it with an off-box copy.
+    dispatch never reported
+                 an intent line with no outcome line for the same corr_id. The
+                 gateway recorded that it was about to dispatch and no outcome
+                 followed: a crash, a kill, a power cut, or a driver that never
+                 returned. IT IS NOT A GAP AND IT IS NOT AN ACTION THAT
+                 HAPPENED. It is an open question, and it is reported as one.
+
+A clean walk means the numbering and the links are consistent with each other.
+It does not mean the file is complete: a line removed from the END of a file,
+with the head file removed too, leaves nothing local to notice. Only comparing
+with an off-box copy answers that, which is the whole point of shipping it.
+
 Usage:
     python scripts/verify_receipt.py --receipt allow.json --pubkey gw.pub
     python scripts/verify_receipt.py --receipt deny.json  --pubkey gw.pub
     # verify only, no tamper assertion:
     python scripts/verify_receipt.py --receipt r.json --pubkey gw.pub --no-tamper-check
+    # order + completeness of a whole export (no key needed):
+    python scripts/verify_receipt.py --walk attestation-export.ndjsonl
 
 Exit codes:
     0  authentic signature verified AND (unless --no-tamper-check) a
        one-byte-flipped copy failed to verify — both directions asserted.
+       In walk mode: no gap, no chain break, no findings.
     1  bad signature / could not verify, or tamper check did not fail as expected.
+       In walk mode: a gap or a chain break.
     2  usage / input error (no receipt, no signature, unreadable key, ...).
+    3  walk mode only: no integrity failure, but named findings a person has to
+       read (a dispatch that never reported, a rebuilt chain link, unnumbered
+       history). Deliberately not 0: "nothing is provably missing" and "nothing
+       needs looking at" are different answers.
 """
 
 from __future__ import annotations
@@ -55,6 +93,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import hashlib
 import json
 import sys
 from typing import Any
@@ -91,6 +130,19 @@ def canonical_json(body: dict, *, exclude: str | None = None) -> bytes:
 
 def extract_outcome(receipt: dict) -> dict:
     """Locate the signed outcome inside any supported receipt shape."""
+    # 0. An INTENT record is not an outcome and must never be checked as one.
+    # It says a dispatch was about to happen; it carries no status for the
+    # action. Refusing here, by name, is the difference between a reader being
+    # told that and a reader seeing "status=dispatching  PASS" and filing it.
+    if receipt.get("record_kind") == "intent" or (
+        isinstance(receipt.get("intent"), dict) and "outcome" not in receipt
+    ):
+        raise SystemExit2(
+            "this is an INTENT record, not an outcome: it says a dispatch was "
+            "about to happen and says nothing about whether it did. Verify the "
+            "outcome record with the same corr_id, or use --walk on the export "
+            "to see whether one exists at all"
+        )
     # 1. ALLOW body (or bare outcome): outcome carries its own signature.
     out = receipt.get("outcome")
     if isinstance(out, dict) and "envelope_signature" in out:
@@ -167,15 +219,187 @@ def verify(outcome: dict, pub: Ed25519PublicKey) -> bool:
         return False
 
 
+#: Exit code for walk mode when nothing is provably missing but something named
+#: needs a person's eyes. See the module docstring.
+EXIT_FINDINGS = 3
+
+
+def walk(path: str) -> int:
+    """Walk an NDJSON export: report the first gap by seq, and any chain break.
+
+    Needs no key. Reads the file's own bytes and its own arithmetic, which is
+    precisely the check a third party can run on a handed-over file without
+    trusting whoever handed it over.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw_lines = fh.read().split(b"\n")
+    except OSError as exc:
+        print(f"ERROR: cannot read {path}: {exc}", file=sys.stderr)
+        return 2
+
+    lines = [ln for ln in raw_lines if ln.strip()]
+    print(f"walking {path}: {len(lines)} lines")
+    if not lines:
+        print("=> empty file: nothing to check, and nothing is claimed.")
+        return 0
+
+    findings: list[str] = []
+    failures: list[str] = []
+    unnumbered = 0
+    expected_seq: int | None = None
+    prev_bytes: bytes | None = None
+    intents: dict[str, int] = {}   # corr_id -> line number of the intent
+    outcomes: set[str] = set()
+
+    for lineno, raw in enumerate(lines, start=1):
+        try:
+            rec = json.loads(raw)
+        except ValueError as exc:
+            failures.append(f"line {lineno}: not JSON ({exc})")
+            prev_bytes = raw
+            continue
+        if not isinstance(rec, dict):
+            failures.append(f"line {lineno}: not a JSON object")
+            prev_bytes = raw
+            continue
+
+        kind = rec.get("record_kind", "outcome")
+        corr = rec.get("corr_id")
+        if isinstance(corr, str):
+            if kind == "intent":
+                intents.setdefault(corr, lineno)
+            else:
+                outcomes.add(corr)
+
+        seq = rec.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            if expected_seq is None:
+                unnumbered += 1
+            else:
+                failures.append(
+                    f"line {lineno}: no seq, after line {lineno - 1} carried one. "
+                    f"Numbering does not restart mid-file."
+                )
+            prev_bytes = raw
+            continue
+
+        if expected_seq is not None and seq != expected_seq:
+            if seq > expected_seq:
+                missing = (
+                    f"{expected_seq}"
+                    if seq == expected_seq + 1
+                    else f"{expected_seq}..{seq - 1}"
+                )
+                failures.append(
+                    f"GAP: line {lineno} has seq {seq}, expected {expected_seq} "
+                    f"(missing seq {missing})"
+                )
+            else:
+                failures.append(
+                    f"GAP: line {lineno} has seq {seq}, expected {expected_seq} "
+                    f"(the sequence went backwards; lines were reordered or "
+                    f"numbering restarted)"
+                )
+
+        chain_prev = rec.get("chain_prev")
+        note = rec.get("chain_note")
+        if prev_bytes is None:
+            # First line of the file. A genesis prev is the only clean answer;
+            # anything else is a claim about a line this file does not contain.
+            if chain_prev not in (None, "0" * 64):
+                findings.append(
+                    f"line {lineno}: first line claims chain_prev {chain_prev} but "
+                    f"there is no line before it in this file. The lines it binds "
+                    f"to are somewhere else, or gone."
+                )
+        else:
+            want = hashlib.sha256(prev_bytes).hexdigest()
+            if chain_prev != want:
+                failures.append(
+                    f"CHAIN BREAK: line {lineno} chain_prev {chain_prev} does not "
+                    f"match sha256 of line {lineno - 1} ({want})"
+                )
+        if note is not None:
+            findings.append(
+                f"line {lineno}: chain_note {note!r}. "
+                + (
+                    "This is the first numbered line after unnumbered history; "
+                    "every line before it carries no links and binds nothing."
+                    if note == "unnumbered_history"
+                    else "The head file was missing, so seq and chain_prev were "
+                         "rebuilt from this file's own last line. If the tail was "
+                         "removed along with the head, only an off-box copy shows it."
+                )
+            )
+        expected_seq = seq + 1
+        prev_bytes = raw
+
+    if unnumbered:
+        print(
+            f"UNNUMBERED: the first {unnumbered} line(s) carry no seq. They were "
+            f"written before this format existed, they carry no links, and THEY "
+            f"BIND NOTHING. Completeness is only checkable from the first "
+            f"numbered line onward."
+        )
+        findings.append(f"{unnumbered} unnumbered line(s) at the head of the file")
+
+    for corr, lineno in sorted(intents.items(), key=lambda kv: kv[1]):
+        if corr not in outcomes:
+            findings.append(
+                f"dispatch never reported: line {lineno} records an intent for "
+                f"corr_id {corr} and no outcome line follows it. The gateway was "
+                f"about to dispatch; nothing in this file says it did."
+            )
+
+    for f in failures:
+        print(f)
+    for f in findings:
+        print(f"FINDING: {f}")
+
+    if failures:
+        print(f"=> {len(failures)} integrity failure(s): this file is not whole.",
+              file=sys.stderr)
+        return 1
+    if findings:
+        print(
+            f"=> no gap and no chain break, and {len(findings)} finding(s) above "
+            f"that a person has to read."
+        )
+        return EXIT_FINDINGS
+    print(
+        "=> seq is unbroken and every chain_prev matches. That is consistency, "
+        "not completeness: compare with an off-box copy to check the tail."
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--receipt", required=True, help="path to receipt JSON")
-    ap.add_argument("--pubkey", required=True, help="path to the kid's Ed25519 PUBLIC key PEM")
+    ap.add_argument("--receipt", help="path to receipt JSON")
+    ap.add_argument("--pubkey", help="path to the kid's Ed25519 PUBLIC key PEM")
+    ap.add_argument(
+        "--walk", metavar="FILE",
+        help="walk an NDJSON export and report the first gap by seq and any "
+             "chain break (no key needed)",
+    )
     ap.add_argument(
         "--no-tamper-check", action="store_true",
         help="verify only; do not also assert a flipped byte fails",
     )
     args = ap.parse_args(argv)
+
+    if args.walk:
+        if args.receipt:
+            print("ERROR: --walk and --receipt do different jobs; pass one",
+                  file=sys.stderr)
+            return 2
+        return walk(args.walk)
+
+    if not args.receipt or not args.pubkey:
+        print("ERROR: --receipt and --pubkey are both required (or use --walk)",
+              file=sys.stderr)
+        return 2
 
     try:
         with open(args.receipt, encoding="utf-8") as fh:

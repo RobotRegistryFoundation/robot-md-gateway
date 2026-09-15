@@ -56,6 +56,66 @@ If all checks pass, the gateway dispatches to a local actuation tool
 emits a **signed audit bundle** entry per action. If any check fails,
 the action is denied and the failure is logged + signed.
 
+### Record before dispatch, and record again after
+
+The gateway writes its record before dispatch. **This is implemented, not spec
+text.** Since v0.5.0a8 the allow path writes **two** entries per invoke, in this
+order:
+
+1. an **intent** entry, written after every check above has passed and
+   **before** `target_actuator.execute()` is called. It carries the tool, the
+   envelope id and msg id, the caller and tier, the nonce and the name of the
+   actuator about to be driven, signed with the same Ed25519 recipe the outcome
+   uses. It says the gateway was about to dispatch. **It says nothing about
+   whether the dispatch happened.**
+2. an **outcome** entry, written after the actuator returned or raised. This is
+   the entry that says what happened, and it carries the intent entry's chain
+   hash so the pair is one hop apart.
+
+The record used to be written only after the dispatch, on purpose, so that it
+could say what actually happened. That reason is still true, which is why the
+late record stayed. What the late record could never cover is the case where
+nothing comes back at all: a driver that hangs, a process killed mid-motion, a
+robot unplugged between the gate and the wire. Those used to leave no trace that
+anything had been attempted. RCAN 6.3 makes the write before driver dispatch
+normative, and the pair is how both halves are true at once.
+
+An intent with no outcome beside it is **a dispatch that never reported**. It is
+not an action that happened, and `scripts/verify_receipt.py --walk` names it in
+exactly those words rather than counting it either way.
+
+Both writes are **best effort**, unchanged from the contract the outcome record
+has always had: a signing failure, a full disk or an unwritable export is logged
+and swallowed. It never crashes the request and it never changes whether the
+robot moves. A record is evidence, not enforcement.
+
+### Is anything missing? `--walk`
+
+Every NDJSON trace line written from v0.5.0a8 carries a `seq` (monotonic within
+one export file) and a `chain_prev` (sha256 of the previous line's bytes), with
+the head persisted in a sibling `<export>.head` file written **before** the line
+it describes. Deleting or truncating a line now leaves a hole:
+
+```bash
+python scripts/verify_receipt.py --walk attestation-export.ndjsonl
+```
+
+No key and no network needed, so a third party handed the file can run it.
+Exit 0 is a clean walk, 1 is a gap or a chain break, 3 is named findings a
+person has to read. A clean walk means the numbering and the links agree with
+each other; it does **not** mean the file is complete. A line cut from the end,
+with the head file taken too, leaves nothing local to notice, which is the whole
+reason there is an off-box copy.
+
+Lines written before v0.5.0a8 carry no `seq` and **bind nothing**; the walk says
+how many there are and refuses to imply otherwise. The first numbered line after
+them binds the last unnumbered line's bytes and is marked `unnumbered_history`.
+A missing head file beside a numbered export is reported the same way, on the
+line, as `head_recovered_from_file`: the gateway continues from what the file
+itself still proves rather than refusing to append (which would destroy evidence
+to protect the appearance of an unbroken chain) or silently restarting at 1
+(which is the failure this whole format exists to end).
+
 ## What it does not do
 
 - ❌ **Spawn LLM planners.** That was the v0.2.x mode; it now ships as `--legacy-byok-launcher` for backward compat (deprecation-warned), removed in v0.4.0. Planners run in agent runtimes (Layer 2), separately, and produce signed envelopes that come *to* the gateway.
