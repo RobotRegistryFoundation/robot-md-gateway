@@ -95,7 +95,12 @@ def test_build_outcome_allow_ok_has_required_fields_no_error():
         error=None,
         result_summary=None,
     )
+    # v2 receipt shape: receipt_version + caller + tier are ALWAYS written,
+    # null included, so a reader can tell "no caller declared for that bearer"
+    # from "this gateway was not recording callers at all". Everything else
+    # keeps the omit-when-None rule.
     assert out == {
+        "receipt_version": 2,
         "corr_id": "m1",
         "rrn": "RRN-000000000011",
         "status": "ok",
@@ -103,6 +108,8 @@ def test_build_outcome_allow_ok_has_required_fields_no_error():
         "ended_at": "2026-06-06T00:00:00.120000+00:00",
         "duration_ms": 120,
         "telemetry_sha256": "0" * 64,
+        "caller": None,
+        "tier": None,
     }
     assert "error" not in out
     assert "envelope_signature" not in out
@@ -141,5 +148,6 @@ def test_build_outcome_omits_all_none_optionals():
         result_summary="partial",
     )
     assert set(out) == {
-        "corr_id", "rrn", "status", "started_at", "ended_at", "error", "result_summary",
+        "receipt_version", "corr_id", "rrn", "status", "started_at", "ended_at",
+        "error", "result_summary", "caller", "tier",
     }

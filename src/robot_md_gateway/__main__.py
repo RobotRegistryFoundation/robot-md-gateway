@@ -57,6 +57,39 @@ def _require_rrn_binding_from_env() -> bool:
     return os.environ.get("ROBOT_MD_REQUIRE_RRN_BINDING", "").strip().lower() in _TRUTHY
 
 
+def _freshness_policy_from_env():
+    """Build the envelope freshness policy from env. Generous by default.
+
+    ROBOT_MD_ENVELOPE_MAX_SKEW_S  - half-width of the acceptance window in
+                                    seconds (default 300, both directions).
+    ROBOT_MD_REQUIRE_ENVELOPE_TIMESTAMP - when true, an envelope with no
+                                    `timestamp_ms` is denied instead of being
+                                    let through unchecked. OFF by default: the
+                                    iOS client signs the field, the bring-up
+                                    harness and older CLI signers do not send
+                                    it at all, and refusing them all would be a
+                                    silent break for a check they never had.
+
+    An unparseable skew value falls back to the default rather than refusing to
+    boot; a gateway that will not start is a gateway an operator starts without
+    the check.
+    """
+    from .cert.envelope import FreshnessPolicy
+
+    raw = os.environ.get("ROBOT_MD_ENVELOPE_MAX_SKEW_S", "").strip()
+    try:
+        max_skew_s = float(raw) if raw else 300.0
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "ROBOT_MD_ENVELOPE_MAX_SKEW_S=%r is not a number; using 300s", raw,
+        )
+        max_skew_s = 300.0
+    require = os.environ.get(
+        "ROBOT_MD_REQUIRE_ENVELOPE_TIMESTAMP", "",
+    ).strip().lower() in _TRUTHY
+    return FreshnessPolicy(max_skew_s=max_skew_s, require_timestamp=require)
+
+
 def _build_tool_allowlist_from_env() -> ToolAllowlist | None:
     """Read ROBOT_MD_TOOL_ALLOWLIST (comma-separated) into a ToolAllowlist.
 
@@ -216,6 +249,7 @@ def main() -> None:
             tool_allowlist = _build_tool_allowlist_from_env()
             tool_tier_requirements = _build_tool_tier_requirements_from_env()
             require_envelope_signature = _require_envelope_signature_from_env()
+            freshness_policy = _freshness_policy_from_env()
             hitl_from_manifest = _hitl_from_manifest_from_env()
             require_rrn_binding = _require_rrn_binding_from_env()
             # In-memory audit chain so executed invokes are recorded (and /v1/audit/last
@@ -228,12 +262,19 @@ def main() -> None:
             _export = os.environ.get("ROBOT_MD_ATTESTATION_EXPORT_FILE")
             attestation_export_file = _P(_export) if _export else None
 
-            # Load bearer tiers from bearers.yaml if provided.
-            bearer_tiers: dict[str, str] = {}
+            # Load the WHOLE bearer entries from bearers.yaml if provided.
+            #
+            # This used to collapse the store to `{token: entry.tier}` and throw
+            # the caller away one step before the receipt gets signed, so every
+            # record said "an actuate-tier principal did this" and none said
+            # which of the robot's credentials it was. The receiver now takes
+            # the entries and carries `caller` into the audit entry and into the
+            # signed receipt payload. `caller` names a CREDENTIAL, never a
+            # person.
+            bearers: dict[str, object] = {}
             if args.bearers:
                 store = BearerStore.from_yaml(_P(args.bearers))
-                # _by_token is the canonical map; build a name → tier dict.
-                bearer_tiers = {token: entry.tier for token, entry in store._by_token.items()}
+                bearers = dict(store._by_token)
 
             # Prefer the list-shape `actuators:` section if present — that
             # turns on multi-actuator routing in the receiver. Fall back to the
@@ -256,12 +297,13 @@ def main() -> None:
                     tool_allowlist=tool_allowlist,
                     tool_tier_requirements=tool_tier_requirements,
                     require_envelope_signature=require_envelope_signature,
+                    freshness_policy=freshness_policy,
                     hitl_from_manifest=hitl_from_manifest,
                     require_rrn_binding=require_rrn_binding,
                     audit_chain=audit_chain,
                     actuators=actuators,
                     actuator_configs=actuator_configs,
-                    bearer_tiers=bearer_tiers,
+                    bearers=bearers,
                     signing_identity=signing_identity,
                     attestation_export_file=attestation_export_file,
                 )
@@ -282,12 +324,13 @@ def main() -> None:
                     tool_allowlist=tool_allowlist,
                     tool_tier_requirements=tool_tier_requirements,
                     require_envelope_signature=require_envelope_signature,
+                    freshness_policy=freshness_policy,
                     hitl_from_manifest=hitl_from_manifest,
                     require_rrn_binding=require_rrn_binding,
                     audit_chain=audit_chain,
                     actuator=actuator_instance,
                     actuator_config=actuator_section["config"],
-                    bearer_tiers=bearer_tiers,
+                    bearers=bearers,
                     signing_identity=signing_identity,
                     attestation_export_file=attestation_export_file,
                 )

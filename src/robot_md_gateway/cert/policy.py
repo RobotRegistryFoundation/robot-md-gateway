@@ -67,13 +67,15 @@ def audit_allowlist_for_stop(
 
 def check_tool(tool_name: str, allowlist: ToolAllowlist, *, msg_id: str) -> tuple[bool, str]:
     if allowlist.is_allowed(tool_name):
-        cert_report.record_property_pass(
+        cert_report.record_property(
             property_id="GW-002",
+            outcome="pass",
             evidence={"tool_name": tool_name, "msg_id": msg_id, "outcome": "allowed"},
         )
         return True, "ok"
-    cert_report.record_property_pass(
+    cert_report.record_property(
         property_id="GW-002",
+        outcome="fail",
         evidence={"tool_name": tool_name, "msg_id": msg_id, "outcome": "denied (not in allowlist)"},
     )
     return False, f"tool {tool_name} not in operator allowlist"
@@ -124,20 +126,23 @@ def check_tool_tier(
 def check_tier(tier: str, scope: str, *, msg_id: str) -> tuple[bool, str]:
     """GW-003 — read/anon principals denied actuation; COMMISSION needs the commission tier."""
     if tier in NON_ACTUATING_TIERS and scope in ACTUATION_SCOPES:
-        cert_report.record_property_pass(
+        cert_report.record_property(
             property_id="GW-003",
+            outcome="fail",
             evidence={"tier": tier, "scope": scope, "msg_id": msg_id, "outcome": "denied"},
         )
         return False, f"{tier}-tier principal cannot invoke {scope}"
     if scope == "COMMISSION" and tier != "commission":
-        cert_report.record_property_pass(
+        cert_report.record_property(
             property_id="GW-003",
+            outcome="fail",
             evidence={"tier": tier, "scope": scope, "msg_id": msg_id,
                       "outcome": "denied (commission tier required)"},
         )
         return False, f"scope COMMISSION requires the 'commission' tier, not {tier!r}"
-    cert_report.record_property_pass(
+    cert_report.record_property(
         property_id="GW-003",
+        outcome="pass",
         evidence={"tier": tier, "scope": scope, "msg_id": msg_id, "outcome": "allowed"},
     )
     return True, "ok"

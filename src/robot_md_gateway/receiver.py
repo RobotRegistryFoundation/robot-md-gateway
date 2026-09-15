@@ -49,7 +49,14 @@ from .attestation import (
 )
 from .cert import report as cert_report
 from .cert.audit import AuditChain, AuditEntry
-from .cert.envelope import ReplayCache, check_replay, sign_envelope, verify_envelope
+from .cert.envelope import (
+    FreshnessPolicy,
+    ReplayCache,
+    check_freshness,
+    check_replay,
+    sign_envelope,
+    verify_envelope,
+)
 from .cert.gates import ConfidencePolicy, HiTLPolicy, check_confidence, check_hitl
 from .cert.policy import (
     ToolAllowlist,
@@ -124,8 +131,10 @@ def make_app(
     tool_allowlist: ToolAllowlist | None = None,
     tool_tier_requirements: dict[str, frozenset[str]] | None = None,
     bearer_tiers: dict[str, str] | None = None,
+    bearers: dict[str, object] | None = None,
     require_envelope_signature: bool = False,
     replay_cache: ReplayCache | None = None,
+    freshness_policy: FreshnessPolicy | None = None,
     confidence_policy: ConfidencePolicy | None = None,
     hitl_policy: HiTLPolicy | None = None,
     hitl_from_manifest: bool = False,
@@ -145,6 +154,34 @@ def make_app(
         tool_allowlist = _DEFAULT_ALLOWLIST
     tool_tier_requirements = tool_tier_requirements or {}
     bearer_tiers = bearer_tiers or {}
+    # THE BEARER INDEX: token -> (tier, caller). `bearers` carries whole bearer
+    # entries (anything with .tier and .caller_id, i.e. auth._BearerEntry) and is
+    # what the serve path now passes; `bearer_tiers` is the old {token: tier}
+    # shape, kept because tests and embedders pass it and it must keep working.
+    # An entry in `bearers` wins over the same token in `bearer_tiers`.
+    #
+    # The collapse this replaces threw the caller away one step before the only
+    # record in the ecosystem that gets signed outside the agent's process, so
+    # every receipt said a tier acted and none said which credential did.
+    _bearer_index: dict[str, tuple[str, str | None]] = {
+        token: (tier, None) for token, tier in bearer_tiers.items()
+    }
+    for token, entry in (bearers or {}).items():
+        _bearer_index[token] = (
+            getattr(entry, "tier", "anon"),
+            getattr(entry, "caller_id", None),
+        )
+
+    def _principal(authorization: str | None) -> tuple[str, str | None]:
+        """Resolve an Authorization header to (tier, caller).
+
+        Unknown or absent bearer -> ("anon", None). `caller` names a CREDENTIAL,
+        never a person: it is the name the operator wrote beside the token in
+        bearers.yaml.
+        """
+        if authorization and authorization.startswith("Bearer "):
+            return _bearer_index.get(authorization[7:], ("anon", None))
+        return "anon", None
     # Multi-actuator mode is on when `actuators` is provided (even if empty
     # dict — that's a misconfiguration the operator made; loud failure at
     # request time is better than silent fallback to single).
@@ -186,6 +223,8 @@ def make_app(
         )
     if replay_cache is None:
         replay_cache = ReplayCache()
+    if freshness_policy is None:
+        freshness_policy = FreshnessPolicy()
     # Default the revocation cache at make_app level (parallel to replay_cache):
     # if the operator opts into revocation_resolver but doesn't pass an explicit
     # cache, build one here so it's shared across requests instead of being
@@ -220,6 +259,8 @@ def make_app(
         ended_at: str | None,
         outcome: ActuatorOutcome | None,
         error_kind: str | None,
+        caller: str | None,
+        tier: str | None,
     ) -> tuple[dict | None, str]:
         """Build the Ed25519-signed outcome for BOTH the wire receipt and the
         NDJSON attestation export.
@@ -269,6 +310,8 @@ def make_app(
             telemetry_sha256=telemetry_sha256_of(outcome),
             error=error,
             result_summary=None,
+            caller=caller,
+            tier=tier,
         )
         signed = sign_envelope(signing_identity.priv, body, signing_identity.kid)
         return signed, "attested"
@@ -328,6 +371,8 @@ def make_app(
         rrn: str | None = None,
         started_at: str | None = None,
         ended_at: str | None = None,
+        caller: str | None = None,
+        tier: str | None = None,
     ) -> tuple[dict | None, str]:
         # Sign the outcome ONCE for both the wire receipt and the file export.
         # Best-effort: a signing failure must never crash the request (mirrors the
@@ -338,6 +383,7 @@ def make_app(
                 decision=decision, reason=reason, msg_id=msg_id, rrn=rrn,
                 started_at=started_at, ended_at=ended_at,
                 outcome=outcome, error_kind=error_kind,
+                caller=caller, tier=tier,
             )
         except Exception:
             logging.getLogger(__name__).warning(
@@ -354,6 +400,8 @@ def make_app(
                 decision=decision,
                 decision_reason=reason,
                 envelope_kid=kid,
+                caller=caller,
+                tier=tier,
             )
             if outcome is not None:
                 telem_sha: str | None = None
@@ -408,11 +456,14 @@ def make_app(
         rrn: str | None = None,
         started_at: str | None = None,
         ended_at: str | None = None,
+        caller: str | None = None,
+        tier: str | None = None,
     ) -> tuple[dict | None, str]:
         return _record_with_outcome(
             decision=decision, reason=reason, kid=kid, msg_id=msg_id,
             envelope_dict=envelope_dict, ruri=ruri, rrn=rrn,
             started_at=started_at, ended_at=ended_at,
+            caller=caller, tier=tier,
         )
 
     @app.post("/v1/invoke")
@@ -420,9 +471,9 @@ def make_app(
         envelope_dict: dict = Body(...),
         authorization: str | None = Header(default=None),
     ):
-        tier = "anon"
-        if authorization and authorization.startswith("Bearer "):
-            tier = bearer_tiers.get(authorization[7:], "anon")
+        # `caller` rides every audit entry and every signed receipt from here
+        # down. It is the CREDENTIAL's name, never a person's.
+        tier, caller = _principal(authorization)
 
         # SF-001/SF-002: safety state preempts all other gates. Per-request
         # tick is sufficient — if no requests are arriving, no actuation can
@@ -440,7 +491,7 @@ def make_app(
                 signed, marker = _record(
                     "deny", f"safety_state: {reason}", None, raw_msg_id,
                     envelope_dict=envelope_dict, ruri=envelope_dict.get("ruri"),
-                    rrn="", started_at=started_at,
+                    rrn="", started_at=started_at, caller=caller, tier=tier,
                 )
                 detail = {"deny": "safety_state", "reason": reason}
                 _attach_signature(detail, signed, marker)
@@ -455,9 +506,24 @@ def make_app(
                     env_result.kid,
                     raw_msg_id,
                     envelope_dict=envelope_dict, ruri=envelope_dict.get("ruri"),
-                    rrn="", started_at=started_at,
+                    rrn="", started_at=started_at, caller=caller, tier=tier,
                 )
                 detail = {"deny": "envelope_signature", "reason": env_result.reason}
+                _attach_signature(detail, signed, marker)
+                raise HTTPException(status_code=403, detail=detail)
+            # FRESHNESS BEFORE REPLAY, deliberately. The replay cache is a
+            # bounded window: an id that falls out of it can be presented
+            # again. Checking the timestamp first bounds how long a captured
+            # envelope stays useful even after its id has aged out, and it
+            # keeps a stale envelope from consuming a slot in the window.
+            ok, reason = check_freshness(envelope_dict, freshness_policy)
+            if not ok:
+                signed, marker = _record(
+                    "deny", f"envelope_freshness: {reason}", env_result.kid, raw_msg_id,
+                    envelope_dict=envelope_dict, ruri=envelope_dict.get("ruri"),
+                    rrn="", started_at=started_at, caller=caller, tier=tier,
+                )
+                detail = {"deny": "envelope_freshness", "reason": reason}
                 _attach_signature(detail, signed, marker)
                 raise HTTPException(status_code=403, detail=detail)
             ok, reason = check_replay(envelope_dict, replay_cache)
@@ -465,7 +531,7 @@ def make_app(
                 signed, marker = _record(
                     "deny", f"replay: {reason}", env_result.kid, raw_msg_id,
                     envelope_dict=envelope_dict, ruri=envelope_dict.get("ruri"),
-                    rrn="", started_at=started_at,
+                    rrn="", started_at=started_at, caller=caller, tier=tier,
                 )
                 detail = {"deny": "replay", "reason": reason}
                 _attach_signature(detail, signed, marker)
@@ -483,7 +549,7 @@ def make_app(
                     env_result.kid,
                     raw_msg_id,
                     envelope_dict=envelope_dict, ruri=envelope_dict.get("ruri"),
-                    rrn="", started_at=started_at,
+                    rrn="", started_at=started_at, caller=caller, tier=tier,
                 )
                 detail = {
                     "deny": "revoked_key",
@@ -514,7 +580,7 @@ def make_app(
                 manifest_result.kid,
                 envelope.msg_id,
                 envelope_dict=envelope_dict, ruri=envelope.ruri,
-                rrn="", started_at=started_at,
+                rrn="", started_at=started_at, caller=caller, tier=tier,
             )
             detail = {
                 "deny": "manifest_provenance",
@@ -546,7 +612,7 @@ def make_app(
                 signed, marker = _record(
                     "deny", f"rrn_binding: {rb.reason}", manifest_result.kid, envelope.msg_id,
                     envelope_dict=envelope_dict, ruri=envelope.ruri,
-                    rrn=manifest_rrn, started_at=started_at,
+                    rrn=manifest_rrn, started_at=started_at, caller=caller, tier=tier,
                 )
                 detail = {"deny": "rrn_binding", "reason": rb.reason}
                 _attach_signature(detail, signed, marker)
@@ -557,7 +623,7 @@ def make_app(
             signed, marker = _record(
                 "deny", f"tier_policy: {reason}", manifest_result.kid, envelope.msg_id,
                 envelope_dict=envelope_dict, ruri=envelope.ruri,
-                rrn=manifest_rrn, started_at=started_at,
+                rrn=manifest_rrn, started_at=started_at, caller=caller, tier=tier,
             )
             detail = {"deny": "tier_policy", "reason": reason}
             _attach_signature(detail, signed, marker)
@@ -568,7 +634,7 @@ def make_app(
             signed, marker = _record(
                 "deny", f"tool_allowlist: {reason}", manifest_result.kid, envelope.msg_id,
                 envelope_dict=envelope_dict, ruri=envelope.ruri,
-                rrn=manifest_rrn, started_at=started_at,
+                rrn=manifest_rrn, started_at=started_at, caller=caller, tier=tier,
             )
             detail = {"deny": "tool_allowlist", "reason": reason}
             _attach_signature(detail, signed, marker)
@@ -581,7 +647,7 @@ def make_app(
             signed, marker = _record(
                 "deny", f"tool_tier: {reason}", manifest_result.kid, envelope.msg_id,
                 envelope_dict=envelope_dict, ruri=envelope.ruri,
-                rrn=manifest_rrn, started_at=started_at,
+                rrn=manifest_rrn, started_at=started_at, caller=caller, tier=tier,
             )
             detail = {"deny": "tool_tier", "reason": reason}
             _attach_signature(detail, signed, marker)
@@ -596,7 +662,7 @@ def make_app(
                     manifest_result.kid,
                     envelope.msg_id,
                     envelope_dict=envelope_dict, ruri=envelope.ruri,
-                    rrn=manifest_rrn, started_at=started_at,
+                    rrn=manifest_rrn, started_at=started_at, caller=caller, tier=tier,
                 )
                 detail = {"deny": "confidence_threshold", "reason": reason}
                 _attach_signature(detail, signed, marker)
@@ -619,7 +685,7 @@ def make_app(
                     manifest_result.kid,
                     envelope.msg_id,
                     envelope_dict=envelope_dict, ruri=envelope.ruri,
-                    rrn=manifest_rrn, started_at=started_at,
+                    rrn=manifest_rrn, started_at=started_at, caller=caller, tier=tier,
                 )
                 detail = {"deny": "hitl_required", "reason": reason}
                 _attach_signature(detail, signed, marker)
@@ -742,7 +808,7 @@ def make_app(
             outcome=outcome, error_kind=error_kind,
             actuator_name=target_actuator.name,
             envelope_dict=envelope_dict, ruri=envelope.ruri, rrn=manifest_rrn,
-            started_at=started_at, ended_at=ended_at,
+            started_at=started_at, ended_at=ended_at, caller=caller, tier=tier,
         )
 
         if not outcome.success and outcome.outcome_kind == "denied":
@@ -804,7 +870,7 @@ def make_app(
         if authorization is None or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="missing Authorization header")
         token = authorization[7:]
-        if token not in bearer_tiers:
+        if token not in _bearer_index:
             raise HTTPException(status_code=403, detail="unknown bearer")
 
         if audit_chain is None or not audit_chain.entries:

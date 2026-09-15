@@ -36,6 +36,16 @@ class AuditEntry:
     actuator_telemetry_sha256: str | None = None  # sha256 of canonical(telemetry)
     actuator_telemetry_path: str | None = None  # filesystem path if persisted
     actuator_error_kind: str | None = None  # exception class name on actuator error
+    # NEW v0.5.0a7 (OC-09) — who presented the credential, and at what tier.
+    #
+    # `caller` IS THE NAME OF A CREDENTIAL, NEVER THE NAME OF A PERSON. It is
+    # the `caller` field of the bearer entry in bearers.yaml that authorised
+    # this request ("craig-iphone", "host-config", "readonly-probe"). It says
+    # which token was presented; it does not say who was holding the device,
+    # and nothing in this gateway can. None when the request carried no bearer,
+    # an unknown bearer, or a bearer entry with no `caller` declared.
+    caller: str | None = None
+    tier: str | None = None  # "read" | "actuate" | "commission" | "anon"
     # Chain linkage — must remain last; AuditChain.append fills these in.
     chain_prev: str = ""  # filled by AuditChain.append; sha256 of prior entry's canonical bytes
     chain_hash: str = ""  # filled by AuditChain.append; sha256 of this entry's canonical bytes

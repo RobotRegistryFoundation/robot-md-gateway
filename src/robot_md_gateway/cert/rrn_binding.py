@@ -57,8 +57,9 @@ def verify_rrn_binding(envelope_ruri: str | None, manifest_rrn: str | None, *, m
     env_rrn = rrn_from_ruri(envelope_ruri)
 
     def _deny(reason: str) -> RrnBindingResult:
-        cert_report.record_property_pass(
+        cert_report.record_property(
             property_id="MF-003",
+            outcome="fail",
             evidence={"msg_id": msg_id, "envelope_rrn": env_rrn,
                       "manifest_rrn": manifest_rrn, "outcome": f"denied ({reason})"},
         )
@@ -71,8 +72,9 @@ def verify_rrn_binding(envelope_ruri: str | None, manifest_rrn: str | None, *, m
     if env_rrn != manifest_rrn:
         return _deny(f"envelope RRN {env_rrn} != manifest RRN {manifest_rrn}")
 
-    cert_report.record_property_pass(
+    cert_report.record_property(
         property_id="MF-003",
+        outcome="pass",
         evidence={"msg_id": msg_id, "envelope_rrn": env_rrn,
                   "manifest_rrn": manifest_rrn, "outcome": "allowed"},
     )

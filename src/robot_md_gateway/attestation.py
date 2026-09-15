@@ -21,6 +21,20 @@ from .actuator import ActuatorOutcome
 
 logger = logging.getLogger(__name__)
 
+#: Receipt payload version carried in every signed outcome this gateway emits.
+#:
+#: v1 (implicit, no ``receipt_version`` key): corr_id, rrn, status, started_at,
+#:    ended_at and the optional duration_ms / telemetry_sha256 / error /
+#:    result_summary. Every receipt signed before v0.5.0a7.
+#: v2 (this): adds ``receipt_version``, ``caller`` and ``tier``, all three
+#:    INSIDE the signed bytes, so an edited caller breaks the signature.
+#:
+#: Verifiers must accept BOTH for at least one release: the iOS app, the
+#: PlatAtlas console and the shipper all read receipts, and receipts already on
+#: disk are v1 forever. scripts/verify_receipt.py distinguishes them by the
+#: presence of the ``receipt_version`` key.
+RECEIPT_VERSION = 2
+
 
 @dataclass(frozen=True)
 class SigningIdentity:
@@ -134,19 +148,37 @@ def build_outcome(
     telemetry_sha256: str | None,
     error: dict | None,
     result_summary: str | None,
+    caller: str | None = None,
+    tier: str | None = None,
 ) -> dict:
     """Build the flat outcome payload (§3.4), WITHOUT envelope_signature.
 
     Required fields are always present. Optional fields are omitted when None so
     the signed shape stays clean (the absence of a field is signed, not a null).
     The caller signs the returned dict with sign_envelope(priv, outcome, kid).
+
+    ``caller`` and ``tier`` are the v2 additions and they break that omission
+    rule ON PURPOSE: both keys are always written, null included. A receipt
+    whose caller is absent and a receipt whose caller is unknown must not be
+    the same bytes, because a reader has to be able to tell "this gateway had
+    no bearer entry for that token" from "this gateway was not recording
+    callers at all". The version key answers the second question and the null
+    answers the first.
+
+    ``caller`` NAMES A CREDENTIAL, NEVER A PERSON. It is the `caller` field of
+    the bearer entry in bearers.yaml that authorised the request. It says which
+    token was presented. It does not say who was holding the device, and no
+    field in this receipt does.
     """
     outcome: dict = {
+        "receipt_version": RECEIPT_VERSION,
         "corr_id": corr_id,
         "rrn": rrn,
         "status": status,
         "started_at": started_at,
         "ended_at": ended_at,
+        "caller": caller,
+        "tier": tier,
     }
     if duration_ms is not None:
         outcome["duration_ms"] = duration_ms

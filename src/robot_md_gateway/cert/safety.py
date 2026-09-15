@@ -26,8 +26,16 @@ class SafetyMonitor:
         if tripped and self.state != GatewayState.ESTOP_ACTIVE:
             prev = self.state
             self.state = GatewayState.ESTOP_ACTIVE
-            cert_report.record_property_pass(
+            # A TRIP IS A FAIL, NOT A PASS. This recorded a pass until OC-09,
+            # which meant a robot that stopped hard read in the gateway's own
+            # report as evidence in its favour: the more often the stop was
+            # pulled, the better the report looked. The report has to
+            # distinguish a refusal from a success, so the event that stopped
+            # actuation is filed as what it is. The transition itself still
+            # works exactly as before; only the outcome written down changed.
+            cert_report.record_property(
                 property_id="SF-001",
+                outcome="fail",
                 evidence={"prev_state": prev.value, "new_state": self.state.value, "msg_id": msg_id,
                           "outcome": "estop preempted"},
             )
@@ -44,8 +52,12 @@ class SafetyMonitor:
         staleness = now - self.last_heartbeat_at
         if self.state == GatewayState.READY and staleness > self.heartbeat_staleness_s:
             self.state = GatewayState.SAFE_STOP
-            cert_report.record_property_pass(
+            # Same reasoning as the ESTOP trip above: losing the heartbeat and
+            # dropping into SAFE_STOP is the gateway refusing to actuate, and a
+            # refusal is not a success.
+            cert_report.record_property(
                 property_id="SF-002",
+                outcome="fail",
                 evidence={
                     "prev_state": "ready",
                     "new_state": "safe_stop",

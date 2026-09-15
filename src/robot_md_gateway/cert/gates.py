@@ -24,16 +24,18 @@ class ConfidencePolicy:
 def check_confidence(envelope: dict, policy: ConfidencePolicy) -> tuple[bool, str]:
     confidence = envelope.get("payload", {}).get("inference_confidence")
     if confidence is None:
-        cert_report.record_property_pass(
+        cert_report.record_property(
             property_id="RC-003",
+            outcome="fail",
             evidence={"msg_id": envelope.get("msg_id"), "scope": envelope.get("scope"),
                       "outcome": "denied (missing inference_confidence)"},
         )
         return False, "envelope payload missing inference_confidence"
     threshold = policy.threshold_for(envelope.get("scope", "UNKNOWN"))
     if confidence < threshold:
-        cert_report.record_property_pass(
+        cert_report.record_property(
             property_id="RC-003",
+            outcome="fail",
             evidence={
                 "msg_id": envelope.get("msg_id"),
                 "scope": envelope.get("scope"),
@@ -46,8 +48,9 @@ def check_confidence(envelope: dict, policy: ConfidencePolicy) -> tuple[bool, st
             f"confidence {confidence} below threshold {threshold} "
             f"for scope {envelope.get('scope')}"
         )
-    cert_report.record_property_pass(
+    cert_report.record_property(
         property_id="RC-003",
+        outcome="pass",
         evidence={"msg_id": envelope.get("msg_id"), "scope": envelope.get("scope"),
                   "confidence": confidence, "threshold": threshold, "outcome": "allowed"},
     )
@@ -92,15 +95,17 @@ class HiTLPolicy:
 def check_hitl(envelope: dict, policy: HiTLPolicy) -> tuple[bool, str]:
     scope = envelope.get("scope", "")
     if scope not in policy.required_for_scopes:
-        cert_report.record_property_pass(
+        cert_report.record_property(
             property_id="RC-004",
+            outcome="pass",
             evidence={"msg_id": envelope.get("msg_id"), "scope": scope, "outcome": "not required"},
         )
         return True, "ok (not required)"
     chain = envelope.get("delegation_chain", [])
     if not chain:
-        cert_report.record_property_pass(
+        cert_report.record_property(
             property_id="RC-004",
+            outcome="fail",
             evidence={
                 "msg_id": envelope.get("msg_id"),
                 "scope": scope,
@@ -110,8 +115,9 @@ def check_hitl(envelope: dict, policy: HiTLPolicy) -> tuple[bool, str]:
         return False, f"scope {scope} requires HiTL but envelope has no delegation_chain"
     last = chain[-1]
     if last.get("scope") != scope:
-        cert_report.record_property_pass(
+        cert_report.record_property(
             property_id="RC-004",
+            outcome="fail",
             evidence={"msg_id": envelope.get("msg_id"), "scope": scope,
                       "chain_final_scope": last.get("scope"),
                       "outcome": "denied (delegation_chain final scope mismatch)"},
@@ -121,14 +127,16 @@ def check_hitl(envelope: dict, policy: HiTLPolicy) -> tuple[bool, str]:
             f"requested scope {scope}"
         )
     if not last.get("human_subject"):
-        cert_report.record_property_pass(
+        cert_report.record_property(
             property_id="RC-004",
+            outcome="fail",
             evidence={"msg_id": envelope.get("msg_id"), "scope": scope,
                       "outcome": "denied (delegation_chain missing human_subject)"},
         )
         return False, "HiTL delegation_chain missing human_subject"
-    cert_report.record_property_pass(
+    cert_report.record_property(
         property_id="RC-004",
+        outcome="pass",
         evidence={
             "msg_id": envelope.get("msg_id"),
             "scope": scope,

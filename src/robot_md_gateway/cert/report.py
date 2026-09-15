@@ -46,6 +46,25 @@ def record_property_fail(*, property_id: str, evidence: dict) -> None:
     _record(property_id=property_id, outcome="fail", evidence=evidence)
 
 
+def record_property(*, property_id: str, outcome: str, evidence: dict) -> None:
+    """Record one cert-property observation whose outcome the CALLER computes.
+
+    The gate modules (policy, gates, rrn_binding, safety, envelope) go through
+    this single entry point rather than the two fixed-outcome helpers, because
+    the bug it exists to stop was a deny branch calling the pass helper: every
+    refusal in those files was filed as a pass, so a tripped ESTOP appeared in
+    the report as SF-001 evidence in favour of the gateway. One recorder with
+    an explicit ``outcome`` at each call site means the branch and the outcome
+    are read together, and a pass cannot be inherited from the function name.
+
+    ``record_property_pass`` / ``record_property_fail`` stay for the call sites
+    that are unambiguous (receiver.py, revocation.py, audit.py).
+    """
+    if outcome not in ("pass", "fail"):
+        raise ValueError(f"outcome must be 'pass' or 'fail', got {outcome!r}")
+    _record(property_id=property_id, outcome=outcome, evidence=evidence)
+
+
 def _record(*, property_id: str, outcome: str, evidence: dict) -> None:
     _GLOBAL_REPORT.properties.append(PropertyRecord(
         property_id=property_id,

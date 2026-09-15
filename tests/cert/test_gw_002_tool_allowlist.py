@@ -79,7 +79,16 @@ def test_gw_002_allowlisted_tool_accepted():
     assert response.status_code == 200
 
 
-def test_gw_002_pass_recorded():
+def test_gw_002_deny_records_a_fail():
+    """A tool refused by the allowlist is recorded as a FAIL, not a pass.
+
+    This test used to assert the opposite, and asserting the opposite is how
+    the bug survived: the deny branch called record_property_pass, so the
+    gateway's own report could not tell a refusal from a success, and a
+    gateway that refused everything looked identical to one that allowed
+    everything correctly. Same deny path, same single record; only the
+    outcome written down changed.
+    """
     client = _client_with_allowlist(allowed=("mcp__robot__render",))
     client.post("/v1/invoke", headers=ACTUATE_HEADERS, json={
         "msg_id": "msg-gw-002-3", "type": "INVOKE",
@@ -91,7 +100,7 @@ def test_gw_002_pass_recorded():
     })
     serialized = cert_report.serialize(repo="robot-md-gateway", sha="HEAD")
     gw_002 = [p for p in serialized["properties"] if p["property_id"] == "GW-002"]
-    assert len(gw_002) == 1 and gw_002[0]["outcome"] == "pass"
+    assert len(gw_002) == 1 and gw_002[0]["outcome"] == "fail"
 
 
 # --------------------------------------------------------------------------- #

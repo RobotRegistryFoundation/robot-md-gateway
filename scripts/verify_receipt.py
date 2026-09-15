@@ -15,6 +15,28 @@ the same contract a third party (e.g. the iOS app) implements from scratch:
 where canonical_json = UTF-8 JSON, sorted keys, compact separators, no ASCII
 escaping, whole-number floats normalized to ints (rcan canonical form).
 
+RECEIPT VERSIONS. Both are accepted, and which one a receipt is is decided by
+one key:
+
+    no ``receipt_version`` key  -> v1. Signed before v0.5.0a7. Carries no
+                                   caller and no tier; this verifier says so
+                                   rather than inventing one.
+    ``receipt_version: 2``      -> v2. Also carries ``caller`` and ``tier``
+                                   INSIDE the signed bytes. The tamper check
+                                   flips ``caller`` for these, so a receipt
+                                   whose caller has been edited by hand fails
+                                   verification and this script exits non-zero.
+
+``caller`` NAMES A CREDENTIAL, NEVER A PERSON: it is the name the operator
+wrote beside a bearer token in bearers.yaml ("craig-iphone", "readonly-probe").
+It says which token was presented. It does not say who was holding the device.
+
+What a pass here means: the bytes carry a signature made by the private key
+matching the public key you supplied, and they have not changed since. It does
+not mean the action was safe, correct, or authorised by anyone in particular.
+It is an accountability artifact, and reading it is the check; this script
+asserts, it does not bless.
+
 Usage:
     python scripts/verify_receipt.py --receipt allow.json --pubkey gw.pub
     python scripts/verify_receipt.py --receipt deny.json  --pubkey gw.pub
@@ -91,6 +113,31 @@ class SystemExit2(SystemExit):
         self.msg = msg
 
 
+#: Receipt payload versions this verifier understands.
+SUPPORTED_RECEIPT_VERSIONS = (1, 2)
+
+
+def receipt_version(outcome: dict) -> int:
+    """Which receipt schema this outcome is.
+
+    A missing ``receipt_version`` key means v1 (the shape every receipt signed
+    before v0.5.0a7 has). Anything present must be an int this build knows, or
+    the honest answer is "this verifier is too old to check that", not a guess.
+    """
+    raw = outcome.get("receipt_version")
+    if raw is None:
+        return 1
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise SystemExit2(f"receipt_version {raw!r} is not an integer")
+    if raw not in SUPPORTED_RECEIPT_VERSIONS:
+        raise SystemExit2(
+            f"receipt_version {raw} is newer than this verifier understands "
+            f"(knows {list(SUPPORTED_RECEIPT_VERSIONS)}); upgrade "
+            f"robot-md-gateway and re-run"
+        )
+    return raw
+
+
 def load_pubkey(path: str) -> Ed25519PublicKey:
     try:
         with open(path, "rb") as fh:
@@ -139,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         outcome = extract_outcome(receipt)
+        version = receipt_version(outcome)
         pub = load_pubkey(args.pubkey)
     except SystemExit2 as exc:
         print(f"ERROR: {exc.msg}", file=sys.stderr)
@@ -147,20 +195,54 @@ def main(argv: list[str] | None = None) -> int:
     kid = outcome["envelope_signature"].get("kid")
     authentic = verify(outcome, pub)
     print(f"kid={kid}  status={outcome.get('status')}  corr_id={outcome.get('corr_id')}")
+    if version >= 2:
+        # Printed from the SIGNED body, so these are the values the signature
+        # covers. caller is a credential name, not a person's name.
+        caller = outcome.get("caller")
+        print(
+            f"receipt_version={version}  "
+            f"caller={caller if caller is not None else '<none declared>'}  "
+            f"tier={outcome.get('tier') or '<none>'}"
+        )
+    else:
+        print("receipt_version=1  caller=<not carried by v1 receipts>  tier=<not carried>")
     print(f"[1] authentic signature verifies: {'PASS' if authentic else 'FAIL'}")
     if not authentic:
         print("=> signature did NOT verify against the supplied public key", file=sys.stderr)
         return 1
 
+    if version >= 2:
+        # A v2 receipt that lost its caller/tier keys is not a v2 receipt; it is
+        # a v2 receipt someone edited, and the signature check above would have
+        # caught that. Say which anyway, so the failure names itself.
+        missing = [k for k in ("caller", "tier") if k not in outcome]
+        if missing:
+            print(
+                f"ERROR: receipt_version {version} but signed body is missing {missing}",
+                file=sys.stderr,
+            )
+            return 1
+
     if args.no_tamper_check:
         print("=> receipt is authentic (tamper check skipped).")
         return 0
 
-    # Flip one byte of a signed field and re-verify: it MUST now fail.
+    # Flip one byte of a signed field and re-verify: it MUST now fail. On a v2
+    # receipt the flipped field is `caller`, which is the whole point of the
+    # version bump: it proves the caller is inside the signed bytes, so an
+    # operator who hand-edits it cannot hand you a receipt that still verifies.
     tampered = copy.deepcopy(outcome)
-    tampered["corr_id"] = _flip_one_byte(str(outcome.get("corr_id", "x")))
+    if version >= 2:
+        tampered["caller"] = _flip_one_byte(str(outcome.get("caller") or "x"))
+        flipped_field = "caller"
+    else:
+        tampered["corr_id"] = _flip_one_byte(str(outcome.get("corr_id", "x")))
+        flipped_field = "corr_id"
     tamper_rejected = not verify(tampered, pub)
-    print(f"[2] one-byte-flipped copy rejected: {'PASS' if tamper_rejected else 'FAIL'}")
+    print(
+        f"[2] one-byte-flipped copy rejected (field: {flipped_field}): "
+        f"{'PASS' if tamper_rejected else 'FAIL'}"
+    )
     if not tamper_rejected:
         print("=> DANGER: a tampered receipt still verified — signature is not binding",
               file=sys.stderr)
