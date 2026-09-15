@@ -8,10 +8,13 @@ the trace-row grain). Source-agnostic except for ?source=rcan.
 One thing is NOT retried: an offset past the end of the export file. That means
 bytes already delivered are gone from the local copy, and the shipper reports it
 by name and stops. See ShipperTamperStop for why stopping beats re-delivering.
+
+One thing is NOT SENT: an ``intent`` line. See SKIP_INTENT_REASON.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -51,6 +54,45 @@ class ShipperTamperStop(Exception):
     """
 
 
+#: Why an ``intent`` line stays on the box for now, spelled out where the code
+#: that does it can be read beside it.
+#:
+#: PlatAtlas's rcan ingest reads ``rec.outcome ?? {}`` and verifies it. An intent
+#: line has no ``outcome`` key at all, on purpose: at the moment it is written
+#: the actuator has not been called. So an intent lands over there with
+#: ``exec_verdict: "verify_failed"`` and ``binding_ok: false``. The ingest never
+#: rejects a record and never 4xxs the batch, and every consumer already gates
+#: attribution on ``exec_verdict === "verified"``, so nothing downstream would
+#: ever count an intent as an execution. Shipping them is SAFE.
+#:
+#: It is just not HONEST YET, and that is the reason. Record-before-dispatch
+#: writes one intent per invoke, so shipping them would fill the remote store
+#: with records marked as failed signature verification when not one signature
+#: failed: the intent is signed, correctly, and the field says "verify_failed"
+#: only because the thing it verifies is not in the record. Any recompute over
+#: the pack would report a large and growing population of failed signatures
+#: that are not failures, which ruins the one number an outside party would
+#: look at first.
+#:
+#: So: the local export stays COMPLETE, both halves of every pair, and it is the
+#: local file a third party walks. The remote copy is OUTCOMES ONLY and this is
+#: the sentence that says so. When the rail teaches its ingest to read
+#: ``record_kind`` and score an intent as an intent, set
+#: ``PLATATLAS_SHIP_INTENTS=1`` and the remote copy becomes complete too. That
+#: is a rail follow-up, not a blocker for this release.
+#:
+#: THE HONEST COST, stated rather than buried: until then, the off-box copy does
+#: not hold the record that a dispatch was attempted. A dispatch that never
+#: reported is visible only in the local file, which is the copy the operator
+#: controls. That is a real gap in what the off-box copy proves.
+SKIP_INTENT_REASON = (
+    "PlatAtlas ingest reads rec.outcome and an intent line has none, so an "
+    "intent would be stored as exec_verdict=verify_failed when no signature "
+    "failed. Kept local until the ingest reads record_kind; set "
+    "PLATATLAS_SHIP_INTENTS=1 once it does."
+)
+
+
 @dataclass(frozen=True)
 class ShipperConfig:
     ingest_key: str
@@ -58,6 +100,9 @@ class ShipperConfig:
     base_url: str | None
     export_file: Path
     offset_file: Path
+    #: Send ``record_kind: "intent"`` lines too. Default False. See
+    #: SKIP_INTENT_REASON for what turning it on is waiting for.
+    ship_intents: bool = False
 
     @classmethod
     def from_env(cls) -> ShipperConfig:
@@ -80,6 +125,8 @@ class ShipperConfig:
             base_url=os.environ.get("PLATATLAS_BASE_URL"),
             export_file=export_file,
             offset_file=offset_file,
+            ship_intents=os.environ.get("PLATATLAS_SHIP_INTENTS", "").strip()
+            in ("1", "true", "yes"),
         )
 
 
@@ -109,6 +156,21 @@ def _http_post(url: str, headers: dict, data: bytes) -> int:
         return exc.code
     except Exception:
         return 0
+
+
+def _is_intent_line(line: bytes) -> bool:
+    """Whether this NDJSON line is an intent record.
+
+    Only a line that SAYS it is an intent counts. A line that does not parse is
+    not one, and is shipped: deciding that a malformed line is not evidence is
+    not the shipper's call to make, and the remote copy should hold whatever the
+    local file holds.
+    """
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return False
+    return isinstance(rec, dict) and rec.get("record_kind") == "intent"
 
 
 def ship_once(cfg: ShipperConfig, *, post: PostFn = _http_post) -> int:
@@ -152,6 +214,7 @@ def ship_once(cfg: ShipperConfig, *, post: PostFn = _http_post) -> int:
     }
     url = target_url(cfg)
     shipped = 0
+    skipped_intents = 0
     pos = offset
     # "rb": the offset is a byte count and the writer emits UTF-8 bytes, so
     # binary seek/readline keeps the offset byte-accurate.
@@ -161,6 +224,14 @@ def ship_once(cfg: ShipperConfig, *, post: PostFn = _http_post) -> int:
             line = fh.readline()
             if not line.endswith(b"\n"):
                 break  # EOF or partial trailing line -> leave it for next pass
+            if not cfg.ship_intents and _is_intent_line(line):
+                # Counted, not dropped: the line stays in the local export, the
+                # offset moves past it, and the count goes in the journal so
+                # "the remote has fewer rows than the box" is never a mystery.
+                skipped_intents += 1
+                pos += len(line)
+                _write_offset(cfg, pos)
+                continue
             status = post(url, headers, line)
             if not (200 <= status < 300):
                 logger.warning("platatlas-shipper: POST returned %s; will retry", status)
@@ -168,6 +239,11 @@ def ship_once(cfg: ShipperConfig, *, post: PostFn = _http_post) -> int:
             pos += len(line)
             shipped += 1
             _write_offset(cfg, pos)
+    if skipped_intents:
+        logger.info(
+            "platatlas-shipper: %d intent line(s) kept local, not sent. %s",
+            skipped_intents, SKIP_INTENT_REASON,
+        )
     return shipped
 
 

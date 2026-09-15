@@ -84,6 +84,14 @@ An intent with no outcome beside it is **a dispatch that never reported**. It is
 not an action that happened, and `scripts/verify_receipt.py --walk` names it in
 exactly those words rather than counting it either way.
 
+**Both writes are on the request path**, before and after the dispatch, and on a
+Pi 5 with the export on the SD card they add about 16.6 ms of blocking IO per
+invoke, of which about 8.3 ms falls before the actuator is called. That is one
+`fsync` per line and it is the floor for a record that is on disk before the
+robot moves. An `fsync` has no timeout, so a failing card can make an invoke
+slow; it cannot make it wrong, and unsetting
+`ROBOT_MD_ATTESTATION_EXPORT_FILE` takes the export off the path entirely.
+
 Both writes are **best effort**, unchanged from the contract the outcome record
 has always had: a signing failure, a full disk or an unwritable export is logged
 and swallowed. It never crashes the request and it never changes whether the
@@ -101,11 +109,29 @@ python scripts/verify_receipt.py --walk attestation-export.ndjsonl
 ```
 
 No key and no network needed, so a third party handed the file can run it.
+Walking Bob's real 4437-line, 4.1 MB export takes 0.15 s on a Pi 5.
 Exit 0 is a clean walk, 1 is a gap or a chain break, 3 is named findings a
 person has to read. A clean walk means the numbering and the links agree with
 each other; it does **not** mean the file is complete. A line cut from the end,
 with the head file taken too, leaves nothing local to notice, which is the whole
 reason there is an off-box copy.
+
+### The file grows, and it is meant to
+
+The export is append-only and **there is no cap and no rotation**. Two lines per
+invoke since v0.5.0a8, roughly a kilobyte each: Bob's export was 4437 lines and
+4.1 MB before any of this, from one robot and no shipper. Plan for it the way
+you would plan for a journal, and watch the disk.
+
+Rotation is deliberately not built in, and **a rotated export reads as
+tampering**, which is the correct reading and not a bug. The shipper's offset
+would land past the end of the shorter file and it stops with a named
+`TAMPER/TRUNCATED` line rather than re-delivering, because from the outside a
+rotation and somebody cutting the file are the same event. `--walk` on the new
+file sees a `seq` that does not start where the old one stopped. If you must
+move the file, do it deliberately: stop the gateway, move the export, the head
+and the offset together, and keep the old file, because the off-box copy is the
+only thing that shows what the local one no longer holds.
 
 Lines written before v0.5.0a8 carry no `seq` and **bind nothing**; the walk says
 how many there are and refuses to imply otherwise. The first numbered line after

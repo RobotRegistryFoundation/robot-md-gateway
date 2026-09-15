@@ -169,13 +169,36 @@
   `ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE=1` into the generated policy. Nobody flip
   the flag early.
 
-- **Downstream note on intent lines.** PlatAtlas's rcan ingest reads
-  `rec.outcome ?? {}` and verifies it, so an intent line lands with
-  `exec_verdict: "verify_failed"`. That is literally true of the line (it carries
-  no execution envelope), the ingest never rejects a record, and consumers
-  already gate attribution on `exec_verdict === "verified"`, so an intent can
-  never be counted as an execution. Teaching that ingest to read `record_kind`
-  is a follow-up.
+- **The shipper sends outcomes, not intents, and says so.** PlatAtlas's rcan
+  ingest reads `rec.outcome ?? {}` and verifies it. An intent line has no
+  `outcome` key on purpose, so an intent would land over there with
+  `exec_verdict: "verify_failed"` and `binding_ok: false`. Confirmed by reading
+  the rail: the ingest never 4xxs, never throws, never fails the batch, and both
+  actor population and action-context indexing are gated on
+  `binding_ok && authz_verdict === 'verified'`, so an intent could never be
+  counted as an execution. Shipping them would be safe.
+
+  It would not be honest yet, which is the reason it is not done.
+  Record-before-dispatch writes one intent per invoke, so shipping them would
+  fill the remote store with records marked as failed signature verification
+  when not one signature failed: the intent IS signed, correctly, and the field
+  says `verify_failed` only because the thing it verifies is not in the record.
+  Any recompute over the pack would then report a large and growing population
+  of failed signatures that are not failures, which ruins the first number an
+  outside party looks at.
+
+  So `ship_once` skips `record_kind: "intent"` lines, counts them, and logs the
+  count with the reason. The offset still advances past them, so nothing is
+  re-read. Lines with no `record_kind` at all (everything written before
+  v0.5.0a8) mean outcome and are shipped. Lines that do not parse are shipped:
+  deciding that a malformed line is not evidence is not the shipper's call.
+
+  **The honest cost, stated rather than buried:** the local export stays
+  complete and is the copy `--walk` reads, but until this changes the off-box
+  copy does NOT hold the record that a dispatch was attempted. A dispatch that
+  never reported is visible only in the file the operator controls. Teaching the
+  ingest to read `record_kind` is a rail follow-up; when it lands, set
+  `PLATATLAS_SHIP_INTENTS=1` and the remote copy becomes complete too.
 
 ## [Unreleased] (0.5.0a7)
 

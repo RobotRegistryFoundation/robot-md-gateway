@@ -152,3 +152,82 @@ def test_the_tamper_stop_is_not_swallowed_as_a_transient_error(tmp_path):
     src = inspect.getsource(shipper_mod.main)
     assert "except ShipperTamperStop" in src
     assert "SystemExit(3)" in src
+
+
+# ---------------------------------------------------------------------------
+# Intent lines. Record-before-dispatch writes one per invoke, and PlatAtlas's
+# rcan ingest reads `rec.outcome`, which an intent line does not have.
+# ---------------------------------------------------------------------------
+
+
+def _cfg(export: Path, offset: Path, **kw) -> ShipperConfig:
+    return ShipperConfig(
+        ingest_key="sk_live_abc", org_slug="opencastor", base_url=None,
+        export_file=export, offset_file=offset, **kw,
+    )
+
+
+def _mixed(export: Path) -> None:
+    export.write_text("\n".join([
+        json.dumps({"v": "rcan-action-trace/1", "record_kind": "intent", "corr_id": "m1"}),
+        json.dumps({"v": "rcan-action-trace/1", "record_kind": "outcome", "corr_id": "m1"}),
+        json.dumps({"v": "rcan-action-trace/1", "record_kind": "intent", "corr_id": "m2"}),
+        json.dumps({"v": "rcan-action-trace/1", "record_kind": "outcome", "corr_id": "m2"}),
+    ]) + "\n")
+
+
+def test_intent_lines_are_not_shipped_by_default(tmp_path, caplog):
+    """The remote copy is outcomes only. Shipping an intent would store it as
+    exec_verdict=verify_failed when no signature failed, and any recompute over
+    the pack would then report a growing pile of failed signatures that are not
+    failures. The LOCAL export keeps both halves; that is the copy a third party
+    walks."""
+    export, offset = tmp_path / "t.ndjson", tmp_path / "t.offset"
+    _mixed(export)
+    posted: list[bytes] = []
+    with caplog.at_level("INFO"):
+        n = ship_once(_cfg(export, offset),
+                      post=lambda u, h, d: (posted.append(d), 200)[1])
+    assert n == 2
+    assert [json.loads(d)["record_kind"] for d in posted] == ["outcome", "outcome"]
+    # Counted and logged, never silently dropped: "the remote has fewer rows
+    # than the box" must never be a mystery.
+    assert "2 intent line(s) kept local, not sent" in caplog.text
+    assert "record_kind" in caplog.text
+    # The offset still moved past every byte, so nothing is re-read next poll.
+    assert int(offset.read_text()) == export.stat().st_size
+    # And the local file is untouched and still complete.
+    assert len(export.read_text().splitlines()) == 4
+
+
+def test_ship_intents_opt_in_sends_them(tmp_path):
+    """The switch the rail follow-up flips once its ingest reads record_kind."""
+    export, offset = tmp_path / "t.ndjson", tmp_path / "t.offset"
+    _mixed(export)
+    posted: list[bytes] = []
+    n = ship_once(_cfg(export, offset, ship_intents=True),
+                  post=lambda u, h, d: (posted.append(d), 200)[1])
+    assert n == 4
+    assert [json.loads(d)["record_kind"] for d in posted] == [
+        "intent", "outcome", "intent", "outcome"]
+
+
+def test_a_line_that_does_not_parse_is_still_shipped(tmp_path):
+    """Deciding that a malformed line is not evidence is not the shipper's call.
+    Only a line that SAYS record_kind=intent is held back."""
+    export, offset = tmp_path / "t.ndjson", tmp_path / "t.offset"
+    export.write_text("not json at all\n" + json.dumps(
+        {"v": "rcan-action-trace/1", "record_kind": "outcome"}) + "\n")
+    posted: list[bytes] = []
+    n = ship_once(_cfg(export, offset), post=lambda u, h, d: (posted.append(d), 200)[1])
+    assert n == 2
+    assert posted[0].strip() == b"not json at all"
+
+
+def test_a_pre_0_5_0a8_line_with_no_record_kind_is_shipped(tmp_path):
+    """Bob's 4437 existing lines carry no record_kind and mean outcome. None of
+    them may be held back by this filter."""
+    export, offset = tmp_path / "t.ndjson", tmp_path / "t.offset"
+    export.write_text(json.dumps({"v": "rcan-action-trace/1", "corr_id": "old"}) + "\n")
+    n = ship_once(_cfg(export, offset), post=lambda u, h, d: 200)
+    assert n == 1
