@@ -358,6 +358,10 @@ def walk(path: str) -> int:
         print(f"FINDING: {f}")
 
     if failures:
+        # Flush first: the findings above are on stdout and this line is on
+        # stderr, and an unflushed stdout makes the summary read before the
+        # thing it summarises when both land in one terminal.
+        sys.stdout.flush()
         print(f"=> {len(failures)} integrity failure(s): this file is not whole.",
               file=sys.stderr)
         return 1
