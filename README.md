@@ -39,6 +39,18 @@ plaintext goals, never SDK sessions. Every envelope is checked for:
 5. **Replay protection + freshness** *(Plan 6; freshness v0.5.0a7)*: the envelope's `msg_id` is checked against a bounded FIFO window of ids already seen (oldest evicted first), and when the envelope carries a `timestamp_ms` it must fall inside a configurable window, by default 300 seconds either side of the gateway's clock. An envelope that carries no `timestamp_ms` is not freshness-checked unless `ROBOT_MD_REQUIRE_ENVELOPE_TIMESTAMP` is on: the iOS client signs the field into its pre-image, older CLI signers do not send it at all, and refusing them all would be a silent break. The window is bounded, so this limits how long a captured envelope stays useful; it is not a permanent ledger of every id ever seen.
 6. **ESTOP precedence** *(Plan 6)* — physical or operator stop signal preempts any pending action.
 
+**Which of those run depends on one setting, so read this before quoting the
+list.** Checks 1, 2, 3, 4 and 6 run on every request. The envelope signature
+check itself, and check 5 (replay and freshness) which sits behind it, run
+**only when `ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE` is on, and it is off by
+default**. With it off the gateway still reads the envelope and still applies
+the other five checks, but it does not require the envelope to be signed and
+therefore does not check the id against the replay window or the timestamp
+against the freshness window. Turning it on is one environment variable, and a
+deployment that wants any of what check 5 describes has to turn it on. The
+defaults are permissive on purpose, for bring-up; they are not the
+configuration this section describes unless you set them that way.
+
 If all checks pass, the gateway dispatches to a local actuation tool
 (typically a robot-md-mcp tool call or a direct driver invocation) and
 emits a **signed audit bundle** entry per action. If any check fails,
@@ -119,6 +131,7 @@ Environment variables (also settable via CLI flags — flags win):
 | `ROBOT_MD_MCP_COMMAND` | Stdio MCP command the gateway dispatches to | `robot-md-mcp` |
 | `ROBOT_MD_MCP_ARGS` | Space-separated args for the MCP command | (none) |
 | `ROBOT_MD_LOG_LEVEL` | Python log level | `INFO` |
+| `ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE` | Require every envelope to carry a signature this gateway can check. **The replay window and the freshness window below only run when this is on.** | off |
 | `ROBOT_MD_ENVELOPE_MAX_SKEW_S` | Half-width of the envelope freshness window, in seconds, both directions. Unparseable, zero or negative values log a warning and fall back to the default, because a zero window would deny every envelope that carries a timestamp | `300` |
 | `ROBOT_MD_REQUIRE_ENVELOPE_TIMESTAMP` | Deny an envelope that carries no `timestamp_ms` instead of letting it through unchecked | off |
 
