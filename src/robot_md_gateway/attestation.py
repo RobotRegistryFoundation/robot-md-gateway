@@ -367,13 +367,47 @@ def next_trace_link(export_file: Path) -> tuple[int, str, str | None]:
 
 
 def write_trace_head(export_file: Path, *, seq: int, chain_hash: str) -> None:
-    """Persist the head atomically: temp file, fsync, rename, fsync the dir.
+    """Persist the head atomically: temp file, ONE fsync, atomic rename.
 
     Written BEFORE the line it describes. The crash window is therefore always
     "head is one ahead of the file", which a walk reports as a line that never
     landed. The other order would leave the head one BEHIND, the next line would
     reuse a seq, and the sequence would have silently restarted inside itself,
     which is the exact thing this file exists to make impossible.
+
+    ONE FSYNC, AND WHY IT IS THE ONE. This runs on the actuation hot path: the
+    intent line is written before ``target_actuator.execute()``, so every fsync
+    here is time a ``drive.stop`` or an ``arm.estop`` spends waiting on an SD
+    card before the robot is told anything. Measured on a Pi 5, ext4 on the SD
+    card, per line:
+
+        head fsync(tmp) + fsync(dir), line fsync    16.3 ms mean, 21.8 ms p95
+        head fsync(tmp) only, no line fsync          8.3 ms mean, 12.2 ms p95
+
+    which is 32.7 ms versus 16.6 ms per invoke, because an invoke writes two
+    lines. The two that went are the two that buy the least:
+
+      the DIRECTORY fsync made the rename itself durable. Losing the rename
+      loses the head, and a missing head is already a handled, REPORTED
+      condition: the next append continues from the file's own last line and
+      marks that line ``head_recovered_from_file``. It was paying 4 ms of
+      pre-dispatch latency to turn a named note into no note.
+      the EXPORT LINE fsync made the line itself durable. That is a promise
+      this export never made before v0.5.0a8 (the line was a plain buffered
+      write), and losing it lands in the crash window this design already names
+      and reports. It was 6 ms per line for a narrower version of a window that
+      does not close.
+
+    The fsync that stayed is the one that has no fallback: without it,
+    ``os.replace`` can install a head whose contents were never written, and a
+    head full of zero bytes read as a real head would be a sequence restarting
+    silently. It does not read as one (``read_trace_head`` rejects a structurally
+    wrong head and routes into the reported recovery path), but the fsync is
+    cheap insurance on the one step where being wrong is worse than being late.
+
+    NONE OF THIS MAKES THE RECORD MORE TRUE. fsync decides whether a record
+    survives a power cut, not whether it is honest, and every way it can be lost
+    is named on the next line written or reported by ``--walk``.
     """
     path = head_file_for(export_file)
     # A UNIQUE temp name per writer. A fixed ``<export>.head.tmp`` is a shared
@@ -398,16 +432,6 @@ def write_trace_head(export_file: Path, *, seq: int, chain_hash: str) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
-    try:
-        dir_fd = os.open(str(path.parent), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
-    finally:
-        os.close(dir_fd)
 
 
 #: One lock per export file, so two invokes cannot both read seq N and both
@@ -468,10 +492,14 @@ def _append_trace_line_locked(export_file: Path, record: dict) -> dict:
     write_trace_head(
         export_file, seq=seq, chain_hash=hashlib.sha256(canon).hexdigest()
     )
+    # Buffered write, flushed to the OS and not fsynced. See write_trace_head
+    # for the measurement and the reasoning: the line fsync cost 6 ms of
+    # pre-dispatch latency per line to narrow, not close, a crash window that
+    # the head file already names. `flush` still matters, so the bytes are in
+    # the page cache and the shipper's next poll sees them.
     with export_file.open("a", encoding="utf-8") as fh:
         fh.write(canon.decode("utf-8") + "\n")
         fh.flush()
-        os.fsync(fh.fileno())
     return line_record
 
 

@@ -343,3 +343,65 @@ def test_concurrent_appends_do_not_fork_the_audit_chain():
         if chain.entries[k].chain_prev != chain.entries[k - 1].chain_hash
     ]
     assert not breaks, f"the chain forked at {len(breaks)} entries"
+
+
+# ---------------------------------------------------------------------------
+# 6. A full disk, a read-only filesystem, a permission change. The record path
+#    is best effort BY CONTRACT: the robot still moves and the caller still
+#    gets its signed outcome. A record that can stop a robot is a record an
+#    operator turns off.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "target,err",
+    [
+        ("write_trace_head", OSError(28, "No space left on device")),
+        ("write_trace_head", OSError(30, "Read-only file system")),
+        ("append_trace_line", OSError(13, "Permission denied")),
+        ("append_trace_line", OSError(28, "No space left on device")),
+    ],
+)
+def test_a_failed_evidence_write_still_dispatches_and_still_signs(
+    identity, tmp_path, monkeypatch, target, err,
+):
+    """The disk is gone in four different ways and none of them reaches the
+    robot or the caller. The actuator is still called exactly once, the response
+    is still 200, and the outcome in it is still signed. The only thing lost is
+    the record, which is the only thing that MAY be lost."""
+    from robot_md_gateway import attestation as attn
+    from robot_md_gateway import receiver as rcv
+    from robot_md_gateway.actuator import ActuatorOutcome
+
+    calls: list[dict] = []
+
+    class _Counting:
+        name = "counting"
+
+        def execute(self, **kw):
+            calls.append(kw)
+            return ActuatorOutcome(success=True, outcome_kind="executed", telemetry={})
+
+    def boom(*a, **kw):
+        raise err
+
+    # Patch BOTH module objects. receiver.py does `from .attestation import
+    # append_trace_line`, so it holds its own reference and patching only the
+    # attestation module would leave the test passing while injecting nothing.
+    monkeypatch.setattr(attn, target, boom)
+    if hasattr(rcv, target):
+        monkeypatch.setattr(rcv, target, boom)
+
+    chain = AuditChain()
+    export = tmp_path / "traces.ndjson"
+    app = _app(_Counting(), chain, identity=identity, export=export)
+    r = TestClient(app).post("/v1/invoke", json=_envelope("msg-nodisk"))
+
+    assert r.status_code == 200, "an unwritable export must not fail the request"
+    assert len(calls) == 1, "an unwritable export must not change actuation"
+    body = r.json()
+    assert body["attestation"] == "attested"
+    assert "envelope_signature" in body["outcome"]
+    # The audit chain is in memory and survives a dead disk, both halves of it.
+    assert [e.entry_kind for e in chain.entries] == ["intent", "outcome"]
+    assert chain.entries[1].intent_chain_hash == chain.entries[0].chain_hash

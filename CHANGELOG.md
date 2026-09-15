@@ -110,6 +110,29 @@
     lines each left 6 of 48 lines in the file. Appends are now serialised by a
     per-export-file lock and each writer stages through its own temp name.
 
+- **Three fsyncs before every dispatch was too many; there is now one.** The
+  intent line is written before `target_actuator.execute()`, so every fsync on
+  that path is time a `drive.stop` or an `arm.estop` spends waiting on an SD
+  card before the robot is told anything. Measured on a Pi 5, ext4 on the card,
+  per trace line: head `fsync` + directory `fsync` + export-line `fsync` was
+  16.3 ms mean / 21.8 ms p95; the head `fsync` alone is 8.3 ms mean / 12.2 ms
+  p95. An invoke writes two lines, so the added blocking IO per invoke went from
+  32.7 ms to 16.6 ms, of which 8.3 ms is before the dispatch.
+
+  The directory `fsync` and the export-line `fsync` were the two that bought the
+  least. Losing the head's rename loses the head, and a missing head is already a
+  handled and REPORTED condition (`head_recovered_from_file` on the next line).
+  Losing the line lands in the crash window the head file already names and
+  `--walk` already reports, and durability of that line is a promise this export
+  never made before v0.5.0a8 anyway: it was a plain buffered write.
+
+  **This does not make the record less true, only less likely to survive a power
+  cut**, and every way it can be lost is named on the next line written or
+  reported by `--walk`. The honest remaining limit: an `fsync` on a stalling SD
+  card has no timeout, so a failing card can still make an invoke slow. It
+  cannot make it wrong, and unsetting `ROBOT_MD_ATTESTATION_EXPORT_FILE` takes
+  the export off the path entirely.
+
 ### Deliberately not in this release
 
 - **`ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE` is still off, and the flip is

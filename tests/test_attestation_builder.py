@@ -403,3 +403,70 @@ def test_no_stray_temp_files_are_left_behind(tmp_path):
     export = tmp_path / "e.ndjsonl"
     _append_from_threads(export, threads=8, per_thread=6)
     assert not list(tmp_path.glob("*.tmp"))
+
+
+# ---------------------------------------------------------------------------
+# The fsync budget. Every one of these runs BEFORE target_actuator.execute(),
+# so it is time a drive.stop spends waiting on an SD card before the robot is
+# told anything. Measured on a Pi 5, ext4 on the card, per line: three fsyncs
+# was 16.3 ms mean / 21.8 ms p95, one is 8.3 / 12.2. An invoke writes two
+# lines, so that is 32.7 ms versus 16.6 ms of added blocking IO per invoke.
+# ---------------------------------------------------------------------------
+
+
+def test_one_fsync_per_line_on_the_hot_path(tmp_path, monkeypatch):
+    import os as _os
+
+    calls: list[int] = []
+    real = _os.fsync
+    monkeypatch.setattr(
+        attestation.os, "fsync", lambda fd: (calls.append(fd), real(fd))[1]
+    )
+    export = tmp_path / "e.ndjsonl"
+    append_trace_line(export, {"v": "rcan-action-trace/1", "corr_id": "m1"})
+    assert len(calls) == 1, (
+        f"{len(calls)} fsync(s) per trace line. This is pre-dispatch latency on "
+        f"every invoke; read write_trace_head's docstring before adding one."
+    )
+
+
+def test_the_one_fsync_is_the_head_not_the_export(tmp_path, monkeypatch):
+    """If only one write is made durable it has to be the head, because the
+    whole design is 'head before line': a durable line under a lost head is the
+    ordering this format exists to rule out."""
+    import os as _os
+
+    synced: list[str] = []
+    real = _os.fsync
+
+    def spy(fd):
+        try:
+            synced.append(_os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:
+            synced.append("?")
+        return real(fd)
+
+    monkeypatch.setattr(attestation.os, "fsync", spy)
+    export = tmp_path / "e.ndjsonl"
+    append_trace_line(export, {"v": "rcan-action-trace/1", "corr_id": "m1"})
+    assert len(synced) == 1
+    assert ".head" in synced[0]
+    assert not synced[0].endswith("e.ndjsonl")
+
+
+def test_a_failed_head_write_does_not_stop_the_line_from_being_attempted(tmp_path, monkeypatch):
+    """append_trace_line raises rather than half-writing, and the CALLER's
+    best-effort wrapper is what swallows it. Pinned here so nobody 'helpfully'
+    catches OSError inside append_trace_line and leaves a line with no head."""
+    export = tmp_path / "e.ndjsonl"
+
+    def boom(*a, **kw):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(attestation, "write_trace_head", boom)
+    try:
+        append_trace_line(export, {"v": "rcan-action-trace/1", "corr_id": "m1"})
+    except OSError as exc:
+        assert exc.errno == 28
+    else:
+        raise AssertionError("expected the OSError to reach the caller")
