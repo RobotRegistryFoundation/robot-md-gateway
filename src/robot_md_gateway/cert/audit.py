@@ -36,7 +36,7 @@ class AuditEntry:
     actuator_telemetry_sha256: str | None = None  # sha256 of canonical(telemetry)
     actuator_telemetry_path: str | None = None  # filesystem path if persisted
     actuator_error_kind: str | None = None  # exception class name on actuator error
-    # NEW v0.5.0a7 (OC-09) — who presented the credential, and at what tier.
+    # NEW v0.5.0a7 (OC-09): who presented the credential, and at what tier.
     #
     # `caller` IS THE NAME OF A CREDENTIAL, NEVER THE NAME OF A PERSON. It is
     # the `caller` field of the bearer entry in bearers.yaml that authorised
