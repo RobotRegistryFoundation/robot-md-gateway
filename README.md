@@ -36,7 +36,7 @@ plaintext goals, never SDK sessions. Every envelope is checked for:
 2. **Tier + RBAC** — the caller's bearer token resolves to a tier authorized for this scope.
 3. **Tool allowlist** — the requested tool is in the operator's policy (default-deny on unknown).
 4. **Confidence + HiTL gates** *(Phase 4 — Plan 6)* — model-asserted confidence above threshold; human-in-the-loop approval if scope demands it.
-5. **Replay protection** *(Plan 6)* — envelope's nonce + timestamp not previously seen.
+5. **Replay protection + freshness** *(Plan 6; freshness v0.5.0a7)*: the envelope's `msg_id` is checked against a bounded FIFO window of ids already seen (oldest evicted first), and when the envelope carries a `timestamp_ms` it must fall inside a configurable window, by default 300 seconds either side of the gateway's clock. An envelope that carries no `timestamp_ms` is not freshness-checked unless `ROBOT_MD_REQUIRE_ENVELOPE_TIMESTAMP` is on: the iOS client signs the field into its pre-image, older CLI signers do not send it at all, and refusing them all would be a silent break. The window is bounded, so this limits how long a captured envelope stays useful; it is not a permanent ledger of every id ever seen.
 6. **ESTOP precedence** *(Plan 6)* — physical or operator stop signal preempts any pending action.
 
 If all checks pass, the gateway dispatches to a local actuation tool
@@ -119,6 +119,8 @@ Environment variables (also settable via CLI flags — flags win):
 | `ROBOT_MD_MCP_COMMAND` | Stdio MCP command the gateway dispatches to | `robot-md-mcp` |
 | `ROBOT_MD_MCP_ARGS` | Space-separated args for the MCP command | (none) |
 | `ROBOT_MD_LOG_LEVEL` | Python log level | `INFO` |
+| `ROBOT_MD_ENVELOPE_MAX_SKEW_S` | Half-width of the envelope freshness window, in seconds, both directions | `300` |
+| `ROBOT_MD_REQUIRE_ENVELOPE_TIMESTAMP` | Deny an envelope that carries no `timestamp_ms` instead of letting it through unchecked | off |
 
 ## What a client gets back
 
@@ -167,6 +169,49 @@ say.
 
 **Broken — `500`.** The driver raised. A fault is never dressed up as a
 decision, so it does not arrive as a deny and carries no receipt.
+
+### What is inside the signed receipt
+
+The `outcome` object is the receipt. Its bytes are what the Ed25519 signature
+covers, so every field listed here is bound to the signature and cannot be
+edited without breaking it.
+
+```json
+{
+  "receipt_version": 2,
+  "corr_id": "the envelope's msg_id",
+  "rrn": "RRN-... (the robot, from its signed manifest)",
+  "status": "ok | denied | failure | error",
+  "started_at": "2026-09-14T...", "ended_at": "2026-09-14T...",
+  "caller": "craig-iphone",
+  "tier": "actuate",
+  "envelope_signature": {"kid": "...", "alg": "Ed25519", "sig": "..."}
+}
+```
+
+**`caller` names a CREDENTIAL, never a person.** It is the `caller` field of
+the bearer entry in `bearers.yaml` that authorised the request, the name the
+operator wrote beside a token (`craig-iphone`, `host-config`,
+`readonly-probe`). It says which token was presented. It does not say who was
+holding the device, and no field in this receipt does. A bearer entry with no
+`caller` declared produces `"caller": null`, which is the honest answer rather
+than a guess.
+
+`receipt_version` tells a reader which shape they have. Receipts signed before
+v0.5.0a7 carry no `receipt_version` key at all, no `caller` and no `tier`;
+those are version 1 and they stay valid forever. `scripts/verify_receipt.py`
+accepts both, and prints which one it read:
+
+```bash
+python scripts/verify_receipt.py --receipt receipt.json --pubkey gateway.pub
+```
+
+Exit 0 means the bytes carry a signature from the key you supplied AND a
+one-byte-flipped copy was rejected. On a version 2 receipt the flipped field is
+`caller`, so a hand-edited caller exits non-zero. That is all a pass means: the
+record has not changed since it was signed. It is not a statement that the
+action was safe, correct, or authorised by any particular person. A signed
+receipt is an accountability artifact, and reading it is the check.
 
 ## Development
 

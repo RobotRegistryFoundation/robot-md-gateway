@@ -2,7 +2,75 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Receipts are version 2 and carry the caller.** The signed outcome now
+  includes `receipt_version: 2`, `caller` and `tier`, all three inside the
+  signed bytes. Until now the serve path collapsed the bearer store to
+  `{token: tier}` one step before the only record in this ecosystem that gets
+  signed outside the agent's process, so every receipt said an actuate-tier
+  principal acted and none said which of the robot's credentials did.
+
+  **`caller` names a CREDENTIAL, never a person.** It is the `caller` field of
+  the bearer entry in `bearers.yaml` that authorised the request, the name the
+  operator wrote beside a token (`craig-iphone`, `host-config`,
+  `readonly-probe`). It says which token was presented. It does not say who was
+  holding the device, and no field in the receipt does. A bearer entry with no
+  `caller` yields `"caller": null`.
+
+  **Wire change, both versions accepted.** The iOS app, the PlatAtlas console
+  and the shipper all read receipts, and receipts already on disk are version 1
+  forever. Version 1 is a receipt with no `receipt_version` key; it carries no
+  caller and no tier. `scripts/verify_receipt.py` accepts both, says which it
+  read, and on a version 2 receipt flips `caller` for its tamper check, so a
+  hand-edited caller exits non-zero. `AuditEntry` and `GET /v1/audit/last` grew
+  the same two fields; entries exported before this release verify unchanged.
+
+- **A refusal is recorded as a fail, not a pass.** Five cert modules called
+  `record_property_pass` on the branch where they REFUSED something, so the
+  gateway's own report could not tell a refusal from a success: a gateway that
+  denied everything produced the same evidence as one that allowed everything
+  correctly, and a tripped ESTOP filed SF-001 evidence in the gateway's favour.
+  Every deny branch in `cert/gates.py`, `cert/policy.py`, `cert/rrn_binding.py`,
+  `cert/safety.py` and `cert/envelope.py` now records a fail, through a single
+  `cert/report.py::record_property` entry point that takes the outcome as an
+  argument so a branch cannot inherit a pass from the function name.
+  `cert/revocation.py` and `receiver.py` already did this correctly and are
+  unchanged. Genuine allow branches still record passes.
+
+  This changes what a released `gateway-authority-*.json` looks like: reports
+  that drive deny paths (the emitter does) now show fails against RC-002,
+  RC-003, RC-004, GW-002, GW-003, MF-003, SF-001 and SF-002 where they showed
+  passes before. Nothing about the gate behaviour changed; only the outcome
+  written down did.
+
+- **The replay cache evicts the oldest id, not an arbitrary one.** It was a
+  `set` whose overflow branch called `set.pop()`, which removes an arbitrary
+  member, so the id it dropped could be the one seen a millisecond earlier and
+  dropping an id is exactly what re-enables its replay. It is an
+  insertion-ordered queue now: oldest out, everything inside the window stays
+  rejected, and re-recording an id does not refresh its place in the queue.
+
 ### Added
+
+- **Envelope freshness, the check README has claimed since Plan 6.** An
+  envelope's `timestamp_ms` must fall inside a configurable window, by default
+  300 seconds either side of the gateway's clock; outside it the envelope is
+  denied with `deny: envelope_freshness`, reason `stale_timestamp`, recorded as
+  an RC-002 fail and signed like any other decision. The check runs BEFORE the
+  replay cache, so a flood of stale envelopes cannot push live ids out of the
+  window.
+
+  The honest limit: an envelope that carries no `timestamp_ms` is not
+  freshness-checked unless `ROBOT_MD_REQUIRE_ENVELOPE_TIMESTAMP` is on. The iOS
+  client signs the field into its pre-image; the bring-up harness and older CLI
+  signers do not send it at all, and refusing them all would be a silent break
+  for a check they never had. `ROBOT_MD_ENVELOPE_MAX_SKEW_S` sets the width.
+
+- **A `bearers.yaml` with no `caller` field loads.** It used to read
+  `row["caller"]` and take the whole gateway down at boot on a file that was
+  valid the day it was written. `castor up` generates the field, so this
+  affects only hand-written and pre-0.5 files.
 
 - **A driver's structured refusal now reaches the client.** An actuator that
   declines on policy (`outcome_kind="denied"`) already returned a signed 403
