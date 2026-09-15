@@ -167,6 +167,27 @@
   off a file looks the same from here and that only an off-box copy separates
   the two.
 
+### The state of the off-box copy, as of this release
+
+**There is no off-box copy yet, and this release does not create one.** No
+`platatlas-shipper` process has ever run on the operator's machines: Bob's
+export holds 4437 signed records and not one of them has left the box it was
+written on, which is the whole finding OC-10 opened with. Everything shipped
+here is the half that had to exist first: the trace is ordered, a removed line
+leaves a hole, a third party can walk the file, and the shipper reports a
+truncation instead of re-delivering over it.
+
+Turning the copy on is a separate, deliberate act. It needs
+`PLATATLAS_INGEST_KEY` and `PLATATLAS_ORG_SLUG` in the environment of a
+`castor up` run, which renders the unit; merging this release and restarting the
+gateway does not start a shipper and does not send anything anywhere.
+
+Until that act, the only durable record of what these robots did is a file on
+the machine whose agent did it, and `--walk` reporting a clean file is a
+statement about that file's internal arithmetic and nothing more. A clean walk
+of a file nobody else holds a copy of is consistency, not completeness. That is
+the sentence the essay makes, and it is still true today.
+
 ### Deliberately not in this release
 
 - **`ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE` is still off, and the flip is
