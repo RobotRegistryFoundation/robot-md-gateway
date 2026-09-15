@@ -14,6 +14,16 @@
   entry's `intent_chain_hash` is the intent entry's chain hash, so the pair is
   one hop apart.
 
+  **Nothing that already exists stops verifying.** `verify_audit_bundle`
+  recomputes each entry's hash from the dict in the bundle rather than from an
+  `AuditEntry` rebuilt out of it, so a bundle signed before these fields existed
+  is hashed over exactly the bytes it was signed over. `GET /v1/audit/last`
+  returns the entry's `__dict__` and the iOS client decodes it into a
+  schema-free `CanonicalValue`, so the five new keys ride along with nothing to
+  fall out of date. Both are pinned by tests now, because the obvious
+  alternative implementation of either would have silently invalidated every
+  bundle ever exported.
+
   The late record stayed, because the reason it existed is still true: only a
   record written after the dispatch can say what happened. What it could never
   cover is the case where nothing comes back at all, and that case is now on the

@@ -405,3 +405,77 @@ def test_a_failed_evidence_write_still_dispatches_and_still_signs(
     # The audit chain is in memory and survives a dead disk, both halves of it.
     assert [e.entry_kind for e in chain.entries] == ["intent", "outcome"]
     assert chain.entries[1].intent_chain_hash == chain.entries[0].chain_hash
+
+
+# ---------------------------------------------------------------------------
+# 7. Five new fields on AuditEntry. Nothing that already exists may stop
+#    verifying because of them.
+# ---------------------------------------------------------------------------
+
+
+def test_an_audit_bundle_exported_before_these_fields_still_verifies():
+    """`verify_audit_bundle` recomputes each entry's hash from the DICT in the
+    bundle, not from an AuditEntry rebuilt out of it, so a bundle whose entries
+    predate `entry_kind` is hashed over exactly the bytes it was hashed over
+    when it was signed. That is the property that makes adding a field safe, and
+    it is worth a test because the obvious alternative implementation (rehydrate
+    into the dataclass, then hash) would have silently invalidated every bundle
+    ever exported."""
+    import base64
+    import hashlib
+
+    from rcan.audit_bundle import canonical_json
+
+    from robot_md_gateway.cert.audit import verify_audit_bundle
+
+    priv = Ed25519PrivateKey.generate()
+    pub_pem = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    # A v0.5.0a7 entry: the field set as it was, and NOT one field more.
+    old_entry = {
+        "msg_id": "m-old", "timestamp_ms": 1, "decision": "allow",
+        "decision_reason": "ok", "envelope_kid": "k", "actuator_name": None,
+        "actuator_outcome_kind": None, "actuator_telemetry_sha256": None,
+        "actuator_telemetry_path": None, "actuator_error_kind": None,
+        "caller": "readonly-probe", "tier": "read", "chain_prev": "0" * 64,
+    }
+    old_entry["chain_hash"] = hashlib.sha256(canonical_json(old_entry)).hexdigest()
+    body = {
+        "schema_version": "1.0", "exported_at": "2026-09-01T00:00:00+00:00",
+        "entry_count": 1, "entries": [old_entry],
+    }
+    bundle = {
+        **body,
+        "signature": {
+            "kid": "gw-old", "alg": "Ed25519",
+            "sig": base64.b64encode(priv.sign(canonical_json(body))).decode(),
+        },
+    }
+    assert verify_audit_bundle(bundle, kid_to_pem={"gw-old": pub_pem}) is True
+
+
+def test_a_new_entry_defaults_to_outcome_so_old_entries_keep_their_meaning():
+    from robot_md_gateway.cert.audit import AuditEntry
+
+    e = AuditEntry(msg_id="m", timestamp_ms=0, decision="allow",
+                   decision_reason="r", envelope_kid=None)
+    assert e.entry_kind == "outcome"
+    assert (e.tool_name, e.envelope_id, e.nonce, e.intent_chain_hash) == (
+        None, None, None, None)
+
+
+def test_the_audit_last_route_is_not_a_fixed_field_set():
+    """`GET /v1/audit/last` returns the entry's `__dict__`, and the iOS client
+    decodes it into CanonicalValue, a schema-free JSON value. Five new keys ride
+    along and nothing there has a field list to fall out of date. Pinned so the
+    route is not 'tidied' into a response model that would start dropping the
+    fields the entry's own chain hash was computed over."""
+    import inspect
+
+    from robot_md_gateway import receiver as rcv
+
+    src = inspect.getsource(rcv.make_app)
+    assert "return last.__dict__" in src
