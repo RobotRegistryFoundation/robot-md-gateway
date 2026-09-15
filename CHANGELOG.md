@@ -1,5 +1,107 @@
 # Changelog
 
+## [Unreleased] (0.5.0a8)
+
+### Added
+
+- **The gateway records before it dispatches (OC-M-04).** The allow path now
+  writes two entries per invoke instead of one: an **intent** entry after every
+  gate has passed and before `target_actuator.execute()` is called, and the
+  **outcome** entry after the actuator answered. `AuditEntry` grew
+  `entry_kind` (`"intent"` | `"outcome"`, defaulting to `"outcome"` so every
+  entry written before this release keeps exactly the meaning it already had),
+  plus `tool_name`, `envelope_id`, `nonce` and `intent_chain_hash`. The outcome
+  entry's `intent_chain_hash` is the intent entry's chain hash, so the pair is
+  one hop apart.
+
+  The late record stayed, because the reason it existed is still true: only a
+  record written after the dispatch can say what happened. What it could never
+  cover is the case where nothing comes back at all, and that case is now on the
+  record.
+
+  **An intent is not an action that happened.** The signed intent payload's
+  status is `"dispatching"` and is never anything else; the intent NDJSON line
+  carries no `outcome` key at all. `scripts/verify_receipt.py --walk` reports an
+  intent with no outcome as `dispatch never reported`, which is a named finding
+  and not a gap, and `--receipt` refuses an intent record by name rather than
+  printing a PASS beside `status=dispatching`.
+
+  **Best effort, unchanged.** Every write in the new path is wrapped the way the
+  outcome path already was: a signing failure, a full disk or an unwritable
+  export is logged and swallowed. It never crashes the request and never alters
+  actuation. A record is evidence, not enforcement.
+
+  Volume note for busy robots: this roughly doubles the durable trace. Bob's
+  export was already growing without a shipper; see the shipper unit below.
+
+- **The durable trace is ordered, and a removed line leaves a hole (OC-10).**
+  Every `rcan-action-trace/1` line now carries `seq` (monotonic within one export
+  file) and `chain_prev` (sha256 of the previous line's bytes, as written, with
+  no trailing newline), plus `record_kind`. The head is persisted in a sibling
+  `<export>.head` file written **before** the line it describes, so the only
+  crash window leaves the head one AHEAD of the file (a line that never landed,
+  which a walk reports) and never one behind (a reused seq, which would be a
+  silent restart inside the sequence).
+
+  **Lines written before this release bind nothing**, and nothing here pretends
+  otherwise. They carry no `seq` and no links, and this release cannot
+  retroactively give them any. The first numbered line after such history starts
+  at `seq: 1`, sets `chain_prev` to the sha256 of the last unnumbered line's
+  bytes, and is marked `chain_note: "unnumbered_history"`.
+
+  **A missing head file beside a numbered export is reported, not silently
+  restarted.** The gateway appends, continues from what the file itself still
+  proves (last line's `seq` + 1, `chain_prev` over its bytes), and marks that one
+  line `chain_note: "head_recovered_from_file"`. Refusing to append was
+  considered and rejected: the record path is best effort by contract, and
+  refusing would destroy evidence to protect the appearance of an unbroken
+  chain. If the head and the tail were removed together, the rebuilt number is
+  the truncated file's, and only an off-box copy shows it. The marker is what
+  tells a reader to go and compare.
+
+- **`scripts/verify_receipt.py --walk <file>`.** Walks a whole NDJSON export and
+  reports the first gap by seq and any chain break. No key, no network, no
+  import of this package, so a third party handed the file can run it and check
+  the operator's arithmetic. Exit 0 clean, 1 for a gap or a chain break, 3 for
+  named findings a person has to read. A clean walk is consistency, not
+  completeness, and the output says so.
+
+### Changed
+
+- **The shipper reports tampering instead of re-delivering from zero (OC-10).**
+  A persisted offset past the end of the export file means bytes this shipper
+  already delivered are gone from the local copy. That now logs
+  `TAMPER/TRUNCATED` with the offset, the path and the size, raises
+  `ShipperTamperStop`, and exits 3 (which the generated unit lists in
+  `RestartPreventExitStatus`, so the journal keeps the line). The offset file is
+  left untouched and nothing is re-sent.
+
+  The old behaviour reset to 0 and re-delivered, and it had the failure exactly
+  backwards: truncation is the one event the off-box copy exists to survive, and
+  quietly starting over turned it into a silent re-upload that made the local
+  file authoritative again. This is a report, not a defence. Nothing here
+  prevents tampering and nothing here can.
+
+### Deliberately not in this release
+
+- **`ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE` is still off, and the flip is
+  deliberately last.** The Python client has to sign first. `castor`'s
+  `bench/sacpaint/gateway.py` `build_envelope` attaches no `envelope_signature`,
+  so turning the gate on today returns 403 to `castor bench`, the console and
+  the paint rail while the iOS app keeps working. The order is: generate a
+  caller identity in `castor up` and publish its kid to the RRF stub, make the
+  Python client sign the invoke, and only then render
+  `ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE=1` into the generated policy. Nobody flip
+  the flag early.
+
+- **Downstream note on intent lines.** PlatAtlas's rcan ingest reads
+  `rec.outcome ?? {}` and verifies it, so an intent line lands with
+  `exec_verdict: "verify_failed"`. That is literally true of the line (it carries
+  no execution envelope), the ingest never rejects a record, and consumers
+  already gate attribution on `exec_verdict === "verified"`, so an intent can
+  never be counted as an execution. Teaching that ingest to read `record_kind`
+  is a follow-up.
+
 ## [Unreleased] (0.5.0a7)
 
 ### Changed

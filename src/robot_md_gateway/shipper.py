@@ -4,6 +4,10 @@ to PlatAtlas ingest. Separate console-script; NOT on the actuation hot path.
 At-least-once delivery via a persisted byte offset: the offset advances ONLY
 after a 2xx, so a crash/network outage re-delivers (S3 ingest is idempotent at
 the trace-row grain). Source-agnostic except for ?source=rcan.
+
+One thing is NOT retried: an offset past the end of the export file. That means
+bytes already delivered are gone from the local copy, and the shipper reports it
+by name and stops. See ShipperTamperStop for why stopping beats re-delivering.
 """
 
 from __future__ import annotations
@@ -20,6 +24,31 @@ logger = logging.getLogger(__name__)
 
 # post(url, headers, data) -> http status int. Injectable for tests.
 PostFn = Callable[[str, dict, bytes], int]
+
+
+class ShipperTamperStop(Exception):
+    """The export file no longer contains what was already shipped, so the
+    shipper stops rather than guessing.
+
+    Raised when the persisted byte offset is past the end of the export file.
+    That means bytes this shipper had already read and delivered are gone:
+    truncation, a rotation nothing told the shipper about, or somebody editing
+    the file. The shipper cannot tell those three apart from the outside, and
+    the honest name for all of them from here is that the local copy no longer
+    agrees with what was sent.
+
+    WHY IT STOPS INSTEAD OF RE-DELIVERING FROM ZERO. Re-delivering was the old
+    behaviour and it had the failure exactly backwards: truncation is the one
+    event the off-box copy exists to survive, and quietly starting over turned
+    it into a silent re-upload with no record that anything had been removed.
+    Worse, it made the local file authoritative again: whoever cut the file
+    decided what the remote end would hold next. Stopping leaves the off-box
+    copy intact, leaves the offset untouched, and puts a named line in the
+    journal for a person to read.
+
+    This is a report, not a defence. Nothing here prevents tampering and
+    nothing here can. It makes it visible.
+    """
 
 
 @dataclass(frozen=True)
@@ -95,22 +124,28 @@ def ship_once(cfg: ShipperConfig, *, post: PostFn = _http_post) -> int:
     if not cfg.export_file.exists():
         return 0
     offset = _read_offset(cfg)
-    # Truncation/rotation guard: a persisted offset past the current EOF (logrotate,
-    # manual wipe, file re-created smaller) would seek past the end and stall forever.
-    # Reset to 0 and re-deliver from the start (S3 ingest is idempotent per trace row).
+    # TAMPER/TRUNCATION GUARD. A persisted offset past the current EOF means the
+    # bytes this shipper already delivered are no longer in the file. Report it
+    # by name and stop; never re-deliver from zero. See ShipperTamperStop.
     try:
         size = cfg.export_file.stat().st_size
     except OSError:
         size = 0
     if offset > size:
-        logger.warning(
-            "platatlas-shipper: persisted offset %d > file size %d (truncated/rotated?); "
-            "resetting to 0 and re-delivering",
+        logger.error(
+            "platatlas-shipper: TAMPER/TRUNCATED: persisted offset %d is past the end "
+            "of %s (size %d). Bytes already shipped are no longer in the local file. "
+            "Stopping; the offset is left untouched and nothing is re-delivered. "
+            "Compare the off-box copy with this file, then delete %s to resume "
+            "deliberately.",
             offset,
+            cfg.export_file,
             size,
+            cfg.offset_file,
         )
-        offset = 0
-        _write_offset(cfg, 0)
+        raise ShipperTamperStop(
+            f"TRUNCATED: offset {offset} past end of {cfg.export_file} (size {size})"
+        )
     headers = {
         "Authorization": f"Bearer {cfg.ingest_key}",
         "Content-Type": "application/x-ndjson",
@@ -149,6 +184,14 @@ def main() -> None:
         try:
             ship_once(cfg)
             backoff = poll_s  # reset backoff after a clean poll
+        except ShipperTamperStop:
+            # Deliberately NOT a transient error and deliberately not retried.
+            # ship_once has already logged the named reason. Exit 3, which the
+            # generated unit lists in RestartPreventExitStatus, so the journal
+            # keeps one readable line instead of burying it under a restart
+            # loop every two seconds.
+            logger.error("platatlas-shipper: stopping on the tamper report above (exit 3)")
+            raise SystemExit(3) from None
         except Exception as exc:  # sidecar must not die on a transient error
             logger.warning("platatlas-shipper: ship_once error: %s", exc)
             backoff = min(backoff * 2, 60.0)

@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
-from robot_md_gateway.shipper import ShipperConfig, ship_once, target_url
+import pytest
+
+from robot_md_gateway.shipper import (
+    ShipperConfig,
+    ShipperTamperStop,
+    ship_once,
+    target_url,
+)
 
 
 def test_target_url_default_subdomain():
@@ -102,14 +110,17 @@ def test_ship_once_no_file_is_noop(tmp_path):
     assert ship_once(cfg, post=lambda *a, **k: 200) == 0
 
 
-def test_ship_once_resets_stale_offset_after_truncation(tmp_path):
-    """If the NDJSON is truncated/rotated (persisted offset > file size), the shipper
-    must reset to 0 and re-deliver — never seek past EOF and stall forever."""
+def test_shipper_reports_tamper_not_replay(tmp_path):
+    """A persisted offset past the end of the export means bytes this shipper
+    already delivered are no longer in the local file. That is reported by name
+    and the shipper stops. It must NOT re-deliver from zero: re-delivery hands
+    whoever cut the file the power to decide what the off-box copy holds next,
+    and it does it silently."""
     export = tmp_path / "traces.ndjson"
     offset = tmp_path / "traces.offset"
     line = json.dumps({"corr_id": "m1"}) + "\n"
-    export.write_text(line)            # small, freshly-rotated file
-    offset.write_text("99999")         # stale offset far past the new EOF
+    export.write_text(line)            # the file after somebody cut it short
+    offset.write_text("99999")         # what had already been shipped
 
     posted = []
 
@@ -121,8 +132,23 @@ def test_ship_once_resets_stale_offset_after_truncation(tmp_path):
         ingest_key="sk_live_abc", org_slug="opencastor", base_url=None,
         export_file=export, offset_file=offset,
     )
-    shipped = ship_once(cfg, post=fake_post)
 
-    assert shipped == 1                                       # re-delivered, not stalled
-    assert posted == [line.encode("utf-8")]
-    assert int(offset.read_text()) == len(line.encode("utf-8"))
+    with pytest.raises(ShipperTamperStop) as exc:
+        ship_once(cfg, post=fake_post)
+
+    assert "TRUNCATED" in str(exc.value)
+    assert posted == []                       # nothing re-delivered
+    assert offset.read_text() == "99999"      # and the offset was not rewritten
+
+
+def test_the_tamper_stop_is_not_swallowed_as_a_transient_error(tmp_path):
+    """main()'s loop swallows transient errors and backs off. The tamper stop is
+    deliberately NOT one of them: it exits 3, which the generated unit lists in
+    RestartPreventExitStatus so the journal keeps the line instead of burying it
+    under a restart every two seconds."""
+    from robot_md_gateway import shipper as shipper_mod
+
+    assert not issubclass(ShipperTamperStop, SystemExit)
+    src = inspect.getsource(shipper_mod.main)
+    assert "except ShipperTamperStop" in src
+    assert "SystemExit(3)" in src
