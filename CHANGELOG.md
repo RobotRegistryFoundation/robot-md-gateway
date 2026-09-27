@@ -1,6 +1,9 @@
 # Changelog
 
-## [Unreleased] (0.5.0a8)
+## [0.5.0a8] - 2026-09-27
+
+This is the first PyPI release since 0.5.0a6. 0.5.0a7 was never published;
+its changes, listed in the section below this one, ship in this release.
 
 ### Added
 
@@ -82,6 +85,24 @@
   the operator's arithmetic. Exit 0 clean, 1 for a gap or a chain break, 3 for
   named findings a person has to read. A clean walk is consistency, not
   completeness, and the output says so.
+
+- **`scripts/rrf_preflight.py`.** Run before a bench run or a live RCAN test,
+  it says per robot whether the manifest (and, live, the gateway's receipts)
+  can be checked against keys the public registry serves
+  (`registry-resolves`), only against the local copies on this host
+  (`local-keys-only`), or whether something is inconsistent enough that the run
+  must not go ahead (`STOP:<reason>`). It only looks: one GET call site, no
+  body, never `/v1/invoke`, never a private key. Standard library plus
+  `cryptography`, like `verify_receipt.py`.
+
+- **`scripts/rcan_conformance.py`.** Sends a fixed set of hand-written RCAN
+  INVOKE envelopes to one gateway (read tools only, no model, no motion) and
+  checks that each is decided the way the gateway's own gates say, that every
+  answer is a receipt signed by the gateway key, and that no refusal left an
+  intent record in the export. `--enforced` adds the unresolvable-key and
+  replay cases for a gateway with `ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE` on.
+
+  Both scripts ship in the repository and the sdist, not in the wheel.
 
 ### Changed
 
@@ -238,7 +259,7 @@ the sentence the essay makes, and it is still true today.
   ingest to read `record_kind` is a rail follow-up; when it lands, set
   `PLATATLAS_SHIP_INTENTS=1` and the remote copy becomes complete too.
 
-## [Unreleased] (0.5.0a7)
+## [0.5.0a7] - never published, shipped in 0.5.0a8
 
 ### Changed
 
