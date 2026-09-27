@@ -547,7 +547,7 @@ FIXTURES = Path.home() / "projects/opencastor-ios/CastorKit/Tests/CastorKitTests
 
 
 @pytest.mark.parametrize("name,rrn,kid,backend", [
-    ("ROBOT-rover-live.md", "RRN-000000000012", "rover-manifest-2026", "SimulatedDrive"),
+    ("ROBOT-rover-live.md", "RRN-000000000012", "rover-manifest-2026", "PCA9685Drive"),
     ("ROBOT-bob-live.md", "RRN-000000000011", "bob-manifest-2026", ""),
 ])
 def test_real_bench_fixtures_parse(name, rrn, kid, backend) -> None:
