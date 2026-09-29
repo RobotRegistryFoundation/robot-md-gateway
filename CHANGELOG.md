@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`systemd/install.sh` adds the person who ran it to `dialout`** (`$SUDO_USER`,
+  the same group the `robot` service user already gets), so they can open
+  `/dev/ttyACM0` from their own shell. Before this, `robot-md-mcp` run as that
+  person fell through to "no backend" mode without saying why and advertised
+  actuator tools that failed at dispatch
+  ([#21](https://github.com/RobotRegistryFoundation/robot-md-gateway/issues/21),
+  [#22](https://github.com/RobotRegistryFoundation/robot-md-gateway/pull/22)).
+  When there is no `$SUDO_USER`, or it names no account, the script says so
+  and skips the step. `--no-interactive-user` skips it for a service-only
+  install. The script ends with a verification command and a reminder that the
+  new group applies only after logging out and back in.
+- **README "Onboarding checklist for the operator"**: the group requirement,
+  the re-login step, the verification command, and what to do when a udev rule
+  gives the device to a group other than `dialout`.
+
 ## [0.5.0a8] - 2026-09-27
 
 This is the first PyPI release since 0.5.0a6. 0.5.0a7 was never published;
