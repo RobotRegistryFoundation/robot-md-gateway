@@ -378,8 +378,9 @@ def _print_next_steps(
         print()
         print("Production install (run these):")
         print("  sudo ./systemd/install.sh")
-        print("  sudo cp ./bearers.yaml ./.env /etc/robot-md-dispatcher/")
-        print("  sudo cp ./ROBOT.md /etc/robot-md-dispatcher/ROBOT.md")
+        # Not ./.env: its paths are relative to this directory, and the unit
+        # reads the installer's /etc/robot-md-dispatcher/dispatcher.env.
+        print("  sudo cp ./bearers.yaml ./ROBOT.md /etc/robot-md-dispatcher/")
         print("  sudo systemctl daemon-reload && sudo systemctl enable --now robot-md-dispatcher")
 
     if cfg.tailscale_print:
