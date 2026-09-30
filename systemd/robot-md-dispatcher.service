@@ -18,7 +18,9 @@ WorkingDirectory=/opt/robot-md-dispatcher
 #   ROBOT_MD_LOG_LEVEL=INFO
 EnvironmentFile=/etc/robot-md-dispatcher/dispatcher.env
 
-ExecStart=/opt/robot-md-dispatcher/.venv/bin/robot-md-dispatcher serve \
+# The package's own command. The legacy `robot-md-dispatcher` alias is slated
+# for removal; the unit keeps its old name so existing installs upgrade in place.
+ExecStart=/opt/robot-md-dispatcher/.venv/bin/robot-md-gateway serve \
     --host 127.0.0.1 --port 8080
 
 Restart=on-failure

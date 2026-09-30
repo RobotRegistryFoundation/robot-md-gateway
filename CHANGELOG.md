@@ -19,6 +19,20 @@
   the re-login step, the verification command, and what to do when a udev rule
   gives the device to a group other than `dialout`.
 
+### Fixed
+
+- **The README's production install steps now match what `install.sh`
+  creates.** They copied config to `/etc/robot-md-gateway/` and enabled
+  `robot-md-gateway.service`, neither of which the installer makes, so
+  following them exactly failed at the copy. The on-disk names are still
+  `/opt/robot-md-dispatcher`, `/etc/robot-md-dispatcher` and
+  `robot-md-dispatcher.service`, and the README now says so.
+- **`init` and the README no longer copy `.env` to `/etc`.** Its paths are
+  relative to the directory `init` ran in, and the unit reads the installer's
+  `dispatcher.env`, so the copy did nothing.
+- **The systemd unit runs `robot-md-gateway serve`** instead of the deprecated
+  `robot-md-dispatcher` alias, so removing the alias cannot break an install.
+
 ## [0.5.0a8] - 2026-09-27
 
 This is the first PyPI release since 0.5.0a6. 0.5.0a7 was never published;

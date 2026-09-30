@@ -190,16 +190,21 @@ guided walk that explains each knob.
 
 ## Production install
 
-`systemd/install.sh` handles the full setup: dedicated `robot` system user, `/opt/robot-md-gateway/.venv` with hardened unit, `DeviceAllow=/dev/ttyACM0 rw`, `MemoryMax=1G`, `CPUQuota=80%`, journal logging.
+`systemd/install.sh` handles the full setup: dedicated `robot` system user, `/opt/robot-md-dispatcher/.venv` with hardened unit, `DeviceAllow=/dev/ttyACM0 rw`, `MemoryMax=1G`, `CPUQuota=80%`, journal logging.
+
+The on-disk names still carry the package's old name: the install goes to
+`/opt/robot-md-dispatcher`, config to `/etc/robot-md-dispatcher`, and the unit
+is `robot-md-dispatcher.service`. The installer writes
+`/etc/robot-md-dispatcher/dispatcher.env` with absolute paths; the unit reads
+that file, not a `.env`.
 
 Run `robot-md-gateway init --yes` first (next to your `ROBOT.md`) to generate
 `bearers.yaml`, `.env`, and `dispatch-test.sh`. Then:
 
 ```bash
 sudo ./systemd/install.sh
-sudo cp ./bearers.yaml ./.env /etc/robot-md-gateway/
-sudo cp ./ROBOT.md /etc/robot-md-gateway/ROBOT.md
-sudo systemctl daemon-reload && sudo systemctl enable --now robot-md-gateway
+sudo cp ./bearers.yaml ./ROBOT.md /etc/robot-md-dispatcher/
+sudo systemctl daemon-reload && sudo systemctl enable --now robot-md-dispatcher
 ```
 
 ### Onboarding checklist for the operator
