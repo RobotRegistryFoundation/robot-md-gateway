@@ -257,7 +257,7 @@ Environment variables (also settable via CLI flags — flags win):
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `ROBOT_MD_PATH` | Path to the `ROBOT.md` loaded as the manifest under verification | unset |
+| `ROBOT_MD_PATH` | Path to the `ROBOT.md` this gateway enforces. When set, `/v1/invoke` denies (403 `manifest_pin`, audited) any envelope whose `manifest_path` resolves to a different file. Unset = no pin; bench only | unset |
 | `ROBOT_MD_BEARERS_FILE` | Path to `bearers.yaml` | **required** |
 | `ROBOT_MD_MCP_COMMAND` | Stdio MCP command the gateway dispatches to | `robot-md-mcp` |
 | `ROBOT_MD_MCP_ARGS` | Space-separated args for the MCP command | (none) |

@@ -57,6 +57,18 @@ def _require_rrn_binding_from_env() -> bool:
     return os.environ.get("ROBOT_MD_REQUIRE_RRN_BINDING", "").strip().lower() in _TRUTHY
 
 
+def _pinned_manifest_from_env() -> Path | None:
+    """Read ROBOT_MD_PATH as the manifest the receiver PINS (#29).
+
+    Set (the deployed gateway.env sets it, and `serve --robot-md` does too) ->
+    the receiver denies, 403 and audited, any envelope whose manifest_path
+    resolves anywhere else. Unset -> no pin, the old trust-the-envelope
+    behavior, which is only safe on a bench.
+    """
+    raw = os.environ.get("ROBOT_MD_PATH", "").strip()
+    return Path(raw) if raw else None
+
+
 def _freshness_policy_from_env():
     """Build the envelope freshness policy from env. Generous by default.
 
@@ -269,6 +281,7 @@ def main() -> None:
             freshness_policy = _freshness_policy_from_env()
             hitl_from_manifest = _hitl_from_manifest_from_env()
             require_rrn_binding = _require_rrn_binding_from_env()
+            pinned_manifest_path = _pinned_manifest_from_env()
             # In-memory audit chain so executed invokes are recorded (and /v1/audit/last
             # works). Restart-wiped by design; persistence is out of scope here.
             audit_chain = AuditChain()
@@ -317,6 +330,7 @@ def main() -> None:
                     freshness_policy=freshness_policy,
                     hitl_from_manifest=hitl_from_manifest,
                     require_rrn_binding=require_rrn_binding,
+                    pinned_manifest_path=pinned_manifest_path,
                     audit_chain=audit_chain,
                     actuators=actuators,
                     actuator_configs=actuator_configs,
@@ -344,6 +358,7 @@ def main() -> None:
                     freshness_policy=freshness_policy,
                     hitl_from_manifest=hitl_from_manifest,
                     require_rrn_binding=require_rrn_binding,
+                    pinned_manifest_path=pinned_manifest_path,
                     audit_chain=audit_chain,
                     actuator=actuator_instance,
                     actuator_config=actuator_section["config"],
