@@ -142,6 +142,7 @@ def make_app(
     hitl_policy: HiTLPolicy | None = None,
     hitl_from_manifest: bool = False,
     require_rrn_binding: bool = False,
+    pinned_manifest_path: Path | None = None,
     safety_monitor: SafetyMonitor | None = None,
     audit_chain: AuditChain | None = None,
     revocation_resolver: RRFRevocationResolver | None = None,
@@ -669,6 +670,29 @@ def make_app(
         except ValidationError as exc:
             # Schema fails are parser errors, not policy decisions — not audited.
             raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+        # MANIFEST PIN (#29). The envelope names the manifest it wants enforced,
+        # and provenance alone only proves that file was signed by someone we
+        # trust, not that it is the one the operator installed. An old signed
+        # copy, or a signed manifest for a looser tier/allowlist posture, would
+        # pass. When the operator has pinned ROBOT_MD_PATH, any other path is
+        # denied before the caller-named file is even read.
+        if pinned_manifest_path is not None and (
+            os.path.realpath(envelope.manifest_path)
+            != os.path.realpath(pinned_manifest_path)
+        ):
+            reason = (
+                f"envelope names {envelope.manifest_path}; "
+                f"this gateway enforces {pinned_manifest_path}"
+            )
+            signed, marker = _record(
+                "deny", f"manifest_pin: {reason}", None, envelope.msg_id,
+                envelope_dict=envelope_dict, ruri=envelope.ruri,
+                rrn="", started_at=started_at, caller=caller, tier=tier,
+            )
+            detail = {"deny": "manifest_pin", "reason": reason}
+            _attach_signature(detail, signed, marker)
+            raise HTTPException(status_code=403, detail=detail)
 
         manifest_result = verify_manifest(Path(envelope.manifest_path), resolver=resolver)
         if not manifest_result.accepted:
