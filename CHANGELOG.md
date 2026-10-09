@@ -40,11 +40,17 @@
   review). Tools an actuator declares in `stop_capabilities` now run on
   `STOP_LANES` (8) threads of their own; everything else shares the pool as
   before. The stop's checks are unchanged. This does not make the stop immune
-  to a flood: one that saturates the server's CPU still delays it in the event
-  loop. With 120 looping clients in other processes (two cores, a simulated
-  bus) the stop latched 0.9 s after it was sent, against 2.75 s before; with
-  200, 4.7 s. Rate-limiting the read tier, or a stop path outside HTTP, is the
-  fix for that.
+  to a flood: CPU and the GIL are shared by every thread. With the clients in
+  other processes (two cores, a simulated bus, a paced move running), the stop
+  latched 0.05 s after it was sent with no other traffic, 0.9 s under 120
+  looping clients (2.75 s before), and 4.7 s under 200; the actuator's hold
+  went out about 0.9 s after the latch under load. Under 45 clients it was no
+  faster than before (0.87 s against 0.73 s): the threads had not run out.
+  Rate-limiting the read tier, or a stop path outside HTTP, is the fix for a
+  flood. The lane is chosen from the envelope's `tool_name` before any check,
+  so any caller can occupy it with stop-tool requests, and a real stop then
+  waits behind them; each such request is refused in milliseconds unless it is
+  a valid stop. The per-loop limiter assumes asyncio (uvicorn).
 
 ### Added
 
