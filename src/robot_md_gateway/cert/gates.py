@@ -17,17 +17,24 @@ class ConfidencePolicy:
         "ESTOP": 0.50,  # ESTOP intentionally low — emergency actions always considered
     })
 
+    #: Applied to a scope the thresholds do not list.
+    DEFAULT_STRICT = 0.95
+
     def threshold_for(self, scope: str, *, motion: bool = False) -> float:
         """The threshold for ``scope`` (any case). For a tool that moves the
         robot, the strictest threshold of any motion scope applies as well, so
-        relabelling a manipulation NAVIGATE cannot buy a lower bar."""
+        relabelling a manipulation NAVIGATE cannot buy a lower bar. A motion
+        scope the thresholds do not list counts at the default-strict value it
+        would get if used as the label (with the default thresholds that is
+        ACTUATE and EXECUTE, so every motion needs 0.95); skipping it let the
+        label choose the bar again (review of #34)."""
         key = scope.upper() if isinstance(scope, str) else scope
-        threshold = self.thresholds.get(key, 0.95)  # default-strict for unknown scopes
+        threshold = self.thresholds.get(key, self.DEFAULT_STRICT)
         if motion:
             from .policy import MOTION_SCOPES
 
-            threshold = max([threshold, *(self.thresholds[s] for s in MOTION_SCOPES
-                                          if s in self.thresholds)])
+            threshold = max([threshold, *(self.thresholds.get(s, self.DEFAULT_STRICT)
+                                          for s in MOTION_SCOPES)])
         return threshold
 
 

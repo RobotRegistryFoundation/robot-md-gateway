@@ -161,6 +161,30 @@ def test_a_motion_labelled_navigate_meets_the_manipulate_confidence_bar():
     assert high.status_code == 200, high.text
 
 
+@pytest.mark.parametrize("scope", ["NAVIGATE", "MANIPULATE", "ACTUATE", "EXECUTE"])
+def test_every_motion_label_meets_the_same_bar(scope):
+    """ACTUATE and EXECUTE are not in the default thresholds, so as labels they
+    get the default-strict 0.95. The strictest-of-all-motion-scopes rule used to
+    skip them, so NAVIGATE needed 0.90 and ACTUATE 0.95 for the same motion."""
+    policy = ConfidencePolicy()
+    assert policy.threshold_for(scope, motion=True) == pytest.approx(0.95)
+    assert policy.threshold_for("NAVIGATE", motion=False) == pytest.approx(0.85)
+
+
+def test_a_stop_capabilities_string_is_one_tool_in_the_startup_audit_too():
+    from robot_md_gateway.cert.policy import ALLOWLIST_HAS_NO_STOP, audit_allowlist_for_stop
+
+    class _Strings(_Arm):
+        motion_capabilities = "arm.home"
+        stop_capabilities = "arm.estop"
+
+    allow_motion_only = ToolAllowlist(allowed_tools=("arm.home",))
+    findings = audit_allowlist_for_stop(allow_motion_only, [("arm", _Strings())])
+    assert [f["reason"] for f in findings] == [ALLOWLIST_HAS_NO_STOP]
+    allow_both = ToolAllowlist(allowed_tools=("arm.home", "arm.estop"))
+    assert audit_allowlist_for_stop(allow_both, [("arm", _Strings())]) == []
+
+
 def test_a_motion_capabilities_string_is_one_tool_not_a_set_of_letters():
     class _Sloppy(_Arm):
         motion_capabilities = "arm.move_to"

@@ -48,8 +48,11 @@ def audit_allowlist_for_stop(
     """
     findings: list[dict] = []
     for name, actuator in actuators:
-        motion = frozenset(getattr(actuator, "motion_capabilities", ()) or ())
-        stop = frozenset(getattr(actuator, "stop_capabilities", ()) or ())
+        # The same reading the scope gate uses: a bare string is one tool name.
+        # frozenset("arm.home") would be a set of letters, and the actuator
+        # would pass this audit with no stop at all (review of #34).
+        motion = as_tool_set(getattr(actuator, "motion_capabilities", None))
+        stop = as_tool_set(getattr(actuator, "stop_capabilities", None))
         if not motion:
             # Nothing that moves, so nothing that needs stopping.
             continue

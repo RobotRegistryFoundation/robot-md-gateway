@@ -24,9 +24,13 @@
   means HiTL on all of them, and the confidence threshold is the highest of
   theirs. Relabelling a manipulation NAVIGATE used to skip bob's HiTL gates and
   lower the confidence bar from 0.90 to 0.85. (COMMISSION is not in that set: a
-  gate on bring-up does not spread to every move.)
+  gate on bring-up does not spread to every move.) A motion scope the
+  thresholds do not list counts at the default-strict 0.95 it would get as a
+  label, so with the default thresholds (where ACTUATE and EXECUTE are unlisted)
+  every motion needs 0.95, whatever it is labelled.
 - An actuator's `motion_capabilities` given as a bare string is one tool name,
-  not a set of characters (which silently disabled the scope gate).
+  not a set of characters (which silently disabled the scope gate). The startup
+  `allowlist_has_no_stop` audit reads both declarations the same way.
 - **`serve` lets each actuator claim its device at startup** (`claim(config)`,
   when the actuator has one; so-arm101-actuator's opens the servo bus with an
   flock and TIOCEXCL). An exclusive open cannot evict a process that got there
