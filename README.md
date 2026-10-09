@@ -33,7 +33,7 @@ The gateway accepts incoming **signed RCAN INVOKE envelopes** — never
 plaintext goals, never SDK sessions. Every envelope is checked for:
 
 1. **Manifest provenance** — the ROBOT.md being actuated against has a verified signature from a key registered to this robot's RRN at RRF.
-2. **Tier + RBAC** — the caller's bearer token resolves to a tier authorized for this scope.
+2. **Tier + RBAC** — the caller's bearer token resolves to a tier authorized for this scope, and the scope covers the tool: a tool the actuator declares as motion (`motion_capabilities`) is refused under a non-actuation scope such as OBSERVE (`scope_mismatch`). No scope refuses a stop.
 3. **Tool allowlist** — the requested tool is in the operator's policy (default-deny on unknown).
 4. **Confidence + HiTL gates** *(Phase 4 — Plan 6)* — model-asserted confidence above threshold; human-in-the-loop approval if scope demands it.
 5. **Replay protection + freshness** *(Plan 6; freshness v0.5.0a7)*: the envelope's `msg_id` is checked against a bounded FIFO window of ids already seen (oldest evicted first), and when the envelope carries a `timestamp_ms` it must fall inside a configurable window, by default 300 seconds either side of the gateway's clock. An envelope that carries no `timestamp_ms` is not freshness-checked unless `ROBOT_MD_REQUIRE_ENVELOPE_TIMESTAMP` is on: the iOS client signs the field into its pre-image, older CLI signers do not send it at all, and refusing them all would be a silent break. The window is bounded, so this limits how long a captured envelope stays useful; it is not a permanent ledger of every id ever seen.

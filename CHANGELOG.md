@@ -21,6 +21,15 @@
 
 ### Fixed
 
+- **The envelope's scope must cover the tool.** A tool the target actuator
+  declares in `motion_capabilities` is refused, signed and audited, with
+  `deny: "scope_mismatch"` when the envelope's scope is not an actuation scope
+  (MANIPULATE, NAVIGATE, ACTUATE, EXECUTE, COMMISSION). `check_tier` reads the
+  scope and `check_tool_tier` the credential, and neither asked whether the
+  scope the signer declared can carry the tool: in the EV-03 hostile-model test
+  (8 Oct 2026) an actuate-tier envelope with scope OBSERVE executed
+  `arm.move_to`. Actuators that declare no motion tools are unaffected; stop
+  tools are never motion tools, so no scope can refuse a stop.
 - **The README's production install steps now match what `install.sh`
   creates.** They copied config to `/etc/robot-md-gateway/` and enabled
   `robot-md-gateway.service`, neither of which the installer makes, so

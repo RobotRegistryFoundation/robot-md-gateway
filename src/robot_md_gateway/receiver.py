@@ -62,6 +62,7 @@ from .cert.envelope import (
 )
 from .cert.gates import ConfidencePolicy, HiTLPolicy, check_confidence, check_hitl
 from .cert.policy import (
+    ACTUATION_SCOPES,
     ToolAllowlist,
     audit_allowlist_for_stop,
     check_tier,
@@ -913,6 +914,30 @@ def make_app(
         else:
             target_actuator = actuator
             target_config = actuator_config
+
+        # THE SCOPE MUST COVER THE TOOL. check_tier reads the envelope's scope and
+        # check_tool_tier the credential; neither asks whether the scope the signer
+        # declared can carry this tool at all. An actuate-tier envelope that said
+        # scope OBSERVE used to execute arm.move_to (EV-03, 8 Oct 2026): the signed
+        # scope meant nothing. Actuators already declare which of their tools move
+        # the robot (`motion_capabilities`, read at startup for the stop-tool
+        # check); naming one of those under a non-actuation scope is refused here,
+        # signed and audited, before anything is dispatched. Stop tools are never
+        # in that set, so no scope can refuse a stop.
+        motion_tools = getattr(target_actuator, "motion_capabilities", None) or ()
+        if envelope.tool_name in motion_tools and envelope.scope not in ACTUATION_SCOPES:
+            reason = (
+                f"tool {envelope.tool_name!r} moves the robot and the envelope's scope "
+                f"is {envelope.scope!r}; motion needs one of {sorted(ACTUATION_SCOPES)}"
+            )
+            signed, marker = _record(
+                "deny", f"scope_mismatch: {reason}", manifest_result.kid, envelope.msg_id,
+                envelope_dict=envelope_dict, ruri=envelope.ruri,
+                rrn=manifest_rrn, started_at=started_at, caller=caller, tier=tier,
+            )
+            detail = {"deny": "scope_mismatch", "reason": reason}
+            _attach_signature(detail, signed, marker)
+            raise HTTPException(status_code=403, detail=detail)
 
         # RECORD BEFORE DISPATCH (RCAN 6.3). Every gate above has passed and the
         # actuator has been chosen; the next statement is the one that can move
