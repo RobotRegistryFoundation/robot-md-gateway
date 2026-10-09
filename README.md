@@ -162,10 +162,10 @@ to protect the appearance of an unbroken chain) or silently restarting at 1
 - ❌ **Be optional.** If you can move the robot without going through the gateway, you don't have an enforcement gateway — you have a hint.
 - ❌ **Cover Layer 4.** Drivers, fleet UI, cloud bridge belong to OpenCastor (or any future Layer-4 runtime); not here.
 
-<!-- BEGIN: ecosystem authority disclaimer (canonical, verbatim per spec §10) -->
+<!-- BEGIN: ecosystem authority disclaimer (canonical; revised 2026-10-08 from spec §10 after EV-03; keep identical in robot-md, robot-md-gateway and OpenCastor) -->
 > **Where safety is meant to be enforced.**
 >
-> Physical limits are meant to be enforced at Layer 3 (`robot-md-gateway` and the actuator driver it calls) or Layer 4 (a runtime that embeds it, e.g., OpenCastor). Declaration alone (Layer 1) does not enforce safety. Agent host alone (Layer 2) is not the safety boundary. If a deployment lacks Layer 3, no safety claim attaches to it. Layer 3 is not a certified safety function, and hostile-input testing in simulation (October 2026) found motions it does not yet bound.
+> Physical limits are meant to be enforced at Layer 3 (`robot-md-gateway` and the actuator driver it calls), and only for commands that pass through it. OpenCastor (Layer 4) does not embed the gateway yet, so actuators it drives directly are not covered. Declaration alone (Layer 1) does not enforce safety. Agent host alone (Layer 2) is not the safety boundary. If a deployment lacks Layer 3, no safety claim attaches to it. Layer 3 is not a certified safety function, and hostile-input testing in simulation (October 2026) found motions it does not yet bound.
 <!-- END: ecosystem authority disclaimer -->
 
 ## Status (v0.3.0a1)
