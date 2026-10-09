@@ -1,7 +1,7 @@
 # robot-md-gateway
 
-> **The mandatory enforcement gateway for the OpenCastor stack.**
-> Receives signed RCAN action envelopes, verifies manifest provenance, applies tier policy + tool allowlist, dispatches to drivers. Exclusive path between agent intent and any actuator. Open, neutral, becomes OpenCastor's safety kernel via open-core extraction.
+> **The enforcement gateway for the OpenCastor stack.**
+> Receives signed RCAN action envelopes, verifies manifest provenance, applies tier policy + tool allowlist, dispatches to drivers. Designed to be the only path between agent intent and any actuator; that holds only when the deployment makes it so (see [Where this fits in the stack](#where-this-fits-in-the-stack)). Open source; intended to become OpenCastor's safety kernel via open-core extraction.
 
 [![PyPI](https://img.shields.io/pypi/v/robot-md-gateway.svg)](https://pypi.org/project/robot-md-gateway/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
@@ -13,16 +13,25 @@
 ## Where this fits in the stack
 
 `robot-md-gateway` is **Layer 3** of the OpenCastor stack — the
-enforcement gateway. Every action that crosses from agent intent to
-any actuator passes through this gateway. There is no second path.
+enforcement gateway. It is designed to be the only path from agent
+intent to any actuator. That holds only when the deployment makes it
+so: the gateway runs as its own service account, and the GW-001 udev
+rule makes that account the owner and group of the robot's device nodes
+(mode 0660), so other non-root users get `EACCES` when they open them
+([procedure](docs/hil/gw-001-procedure.md)). The default
+`systemd/install.sh` does not set this up: it gives the device to the
+`dialout` group and adds the installing user to that group, so another
+local process can still reach the servos. Adding users to the device's
+group, as the [onboarding checklist](#onboarding-checklist-for-the-operator)
+describes for interactive use, has the same effect.
 
 | Layer | Piece | What it is |
 |---|---|---|
 | **1 — Declaration** | [robot-md](https://github.com/RobotRegistryFoundation/robot-md) | The ROBOT.md file + Python CLI. Declares identity, capabilities, safety gates. |
-| **2 — Agent runtime** | (any MCP host) | Claude Code, Codex, Gemini — plans actions, calls tools, never reaches actuators directly. |
-| **3 — Gateway / Enforcement** ← *this* | [robot-md-gateway](https://github.com/RobotRegistryFoundation/robot-md-gateway) | Mandatory exclusive path. Verifies signatures, applies policy, signs audit bundles. |
+| **2 — Agent runtime** | (any MCP host) | Claude Code, Codex, Gemini — plans actions, calls tools, and is not meant to reach actuators directly. |
+| **3 — Gateway / Enforcement** ← *this* | [robot-md-gateway](https://github.com/RobotRegistryFoundation/robot-md-gateway) | Designed to be the only path to the actuators, when the deployment enforces it (see above). Verifies signatures, applies policy, signs audit bundles. |
 | **4 — Robot-facing runtime** | [OpenCastor](https://github.com/craigm26/OpenCastor) | Productized open-core runtime. Embeds the gateway as its safety kernel. |
-| **5 — Protocol** | [rcan-spec](https://github.com/continuonai/rcan-spec) | Wire format, envelopes, conformance suite. |
+| **5 — Protocol** | [rcan-spec](https://github.com/RobotRegistryFoundation/rcan-spec) | Wire format, envelopes, conformance suite. |
 | **6 — Registry** | [Robot Registry Foundation](https://robotregistryfoundation.org) | Identity (RRN/RCN/RMN/RHN), public keys, evidence. |
 
 [See the live compatibility matrix →](https://rcan.dev/compatibility)
@@ -162,8 +171,8 @@ to protect the appearance of an unbroken chain) or silently restarting at 1
 ## Status (v0.3.0a1)
 
 This release lands the rename + scope-shift skeleton. The receive-only
-RCAN handler, manifest provenance verification (cert MF-001 / MF-002),
-and direct-device-bypass denial (cert GW-001) ship in upcoming patch
+RCAN handler, manifest provenance verification (test properties MF-001 /
+MF-002), and direct-device-bypass denial (test property GW-001) ship in upcoming patch
 releases under Plan 6. The legacy planner-launcher mode is preserved
 behind `--legacy-byok-launcher` for one minor release.
 
