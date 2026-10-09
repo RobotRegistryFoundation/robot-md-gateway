@@ -123,6 +123,26 @@ def check_tool_tier(
     )
 
 
+#: The actuation scopes an ordinary motion can be labelled with. COMMISSION is
+#: left out on purpose: it is the bring-up scope behind its own tier, and a HiTL
+#: gate on bring-up must not spread to every move_to.
+MOTION_SCOPES = frozenset({"MANIPULATE", "NAVIGATE", "ACTUATE", "EXECUTE"})
+
+
+def as_tool_set(declared: object) -> frozenset[str]:
+    """An actuator's ``motion_capabilities`` / ``stop_capabilities`` as a set of
+    tool names. A bare string is ONE tool name, not a set of characters: read as
+    an iterable it would silently turn the scope gate off."""
+    if declared is None:
+        return frozenset()
+    if isinstance(declared, str):
+        return frozenset({declared})
+    try:
+        return frozenset(str(t) for t in declared)
+    except TypeError:
+        return frozenset()
+
+
 def is_actuation_scope(scope: object) -> bool:
     """Whether an envelope's ``scope`` names an act that moves or alters the robot.
 

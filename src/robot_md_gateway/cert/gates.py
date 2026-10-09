@@ -17,11 +17,22 @@ class ConfidencePolicy:
         "ESTOP": 0.50,  # ESTOP intentionally low — emergency actions always considered
     })
 
-    def threshold_for(self, scope: str) -> float:
-        return self.thresholds.get(scope, 0.95)  # default-strict for unknown scopes
+    def threshold_for(self, scope: str, *, motion: bool = False) -> float:
+        """The threshold for ``scope`` (any case). For a tool that moves the
+        robot, the strictest threshold of any motion scope applies as well, so
+        relabelling a manipulation NAVIGATE cannot buy a lower bar."""
+        key = scope.upper() if isinstance(scope, str) else scope
+        threshold = self.thresholds.get(key, 0.95)  # default-strict for unknown scopes
+        if motion:
+            from .policy import MOTION_SCOPES
+
+            threshold = max([threshold, *(self.thresholds[s] for s in MOTION_SCOPES
+                                          if s in self.thresholds)])
+        return threshold
 
 
-def check_confidence(envelope: dict, policy: ConfidencePolicy) -> tuple[bool, str]:
+def check_confidence(envelope: dict, policy: ConfidencePolicy, *, motion: bool = False
+                     ) -> tuple[bool, str]:
     confidence = envelope.get("payload", {}).get("inference_confidence")
     if confidence is None:
         cert_report.record_property(
@@ -31,7 +42,7 @@ def check_confidence(envelope: dict, policy: ConfidencePolicy) -> tuple[bool, st
                       "outcome": "denied (missing inference_confidence)"},
         )
         return False, "envelope payload missing inference_confidence"
-    threshold = policy.threshold_for(envelope.get("scope", "UNKNOWN"))
+    threshold = policy.threshold_for(envelope.get("scope", "UNKNOWN"), motion=motion)
     if confidence < threshold:
         cert_report.record_property(
             property_id="RC-003",
@@ -79,6 +90,20 @@ class HiTLPolicy:
     """
     required_for_scopes: frozenset[str] = frozenset({"MANIPULATE"})
 
+    def requires(self, scope: object, *, motion: bool = False) -> bool:
+        """Whether ``scope`` (any case) needs a HiTL chain. For a tool that moves
+        the robot, HiTL on ANY motion scope means HiTL on all of them: the scope
+        is caller-written, and a gate on MANIPULATE that NAVIGATE walks past is
+        not a gate."""
+        key = scope.upper() if isinstance(scope, str) else scope
+        if key in self.required_for_scopes:
+            return True
+        if motion:
+            from .policy import MOTION_SCOPES
+
+            return bool(self.required_for_scopes & MOTION_SCOPES)
+        return False
+
     @classmethod
     def from_manifest_gates(cls, gates: list[dict] | None) -> "HiTLPolicy":
         """Build a policy from a manifest's `safety.hitl_gates`. Only gates with
@@ -92,9 +117,9 @@ class HiTLPolicy:
         return cls(required_for_scopes=frozenset(scopes))
 
 
-def check_hitl(envelope: dict, policy: HiTLPolicy) -> tuple[bool, str]:
+def check_hitl(envelope: dict, policy: HiTLPolicy, *, motion: bool = False) -> tuple[bool, str]:
     scope = envelope.get("scope", "")
-    if scope not in policy.required_for_scopes:
+    if not policy.requires(scope, motion=motion):
         cert_report.record_property(
             property_id="RC-004",
             outcome="pass",
@@ -114,7 +139,9 @@ def check_hitl(envelope: dict, policy: HiTLPolicy) -> tuple[bool, str]:
         )
         return False, f"scope {scope} requires HiTL but envelope has no delegation_chain"
     last = chain[-1]
-    if last.get("scope") != scope:
+    last_scope = last.get("scope")
+    if not (isinstance(last_scope, str) and isinstance(scope, str)
+            and last_scope.upper() == scope.upper()):
         cert_report.record_property(
             property_id="RC-004",
             outcome="fail",

@@ -13,16 +13,26 @@
   2026) found `arm.move_to` executing under `scope: "OBSERVE"`. The stop tools
   are not motion and are unaffected, as is any actuator that declares no
   `motion_capabilities`.
-- **Scope names are compared case-insensitively** in the tier gate
-  (`check_tier`) and the new scope gate. `"manipulate"` or `"commission"` in
-  lower case used to pass GW-003 untouched, including the commission-tier
-  requirement.
+- **Scope names are compared case-insensitively** in every gate that keys off
+  them: the tier gate (`check_tier`), the scope gate, the confidence thresholds
+  and the HiTL gates (including the delegation chain's final scope).
+  `"manipulate"` or `"commission"` in lower case used to pass GW-003 untouched,
+  including the commission-tier requirement, and to skip a HiTL gate on
+  MANIPULATE.
+- **A motion is held to the strictest motion scope.** For a tool any actuator
+  declares as motion, HiTL on any of MANIPULATE, NAVIGATE, ACTUATE or EXECUTE
+  means HiTL on all of them, and the confidence threshold is the highest of
+  theirs. Relabelling a manipulation NAVIGATE used to skip bob's HiTL gates and
+  lower the confidence bar from 0.90 to 0.85. (COMMISSION is not in that set: a
+  gate on bring-up does not spread to every move.)
+- An actuator's `motion_capabilities` given as a bare string is one tool name,
+  not a set of characters (which silently disabled the scope gate).
 - **`serve` lets each actuator claim its device at startup** (`claim(config)`,
   when the actuator has one; so-arm101-actuator's opens the servo bus with an
   flock and TIOCEXCL). An exclusive open cannot evict a process that got there
   first, so the device is now held from the moment the service runs rather than
-  from the first request. A failed claim is logged (`device_claim_failed`) and
-  is not fatal.
+  from the first request. A failed claim, for any reason (a busy port, a bad
+  baud in the config), is logged (`device_claim_failed`) and is not fatal.
 
 ### Added
 

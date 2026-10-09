@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from robot_md_gateway.__main__ import _claim_devices
 from robot_md_gateway.actuator import ActuatorOutcome
 from robot_md_gateway.cert.audit import AuditChain
+from robot_md_gateway.cert.gates import ConfidencePolicy, HiTLPolicy
 from robot_md_gateway.cert.policy import ToolAllowlist, check_tier, check_tool_scope
 from robot_md_gateway.receiver import make_app
 
@@ -58,7 +59,7 @@ class _Undeclared(_Arm):
     motion_capabilities = None
 
 
-def _client(actuator, chain=None):
+def _client(actuator, chain=None, **policy):
     app = make_app(
         resolver=_Resolver(),
         tool_allowlist=ToolAllowlist(allowed_tools=("arm.move_to", "arm.home", "arm.estop")),
@@ -66,11 +67,12 @@ def _client(actuator, chain=None):
         actuator=actuator,
         actuator_config={},
         audit_chain=chain,
+        **policy,
     )
     return TestClient(app)
 
 
-def _post(client, tool, scope):
+def _post(client, tool, scope, **extra):
     return client.post(
         "/v1/invoke",
         json={
@@ -81,6 +83,7 @@ def _post(client, tool, scope):
             "tool_name": tool,
             "tool_args": {},
             "manifest_path": str(FIXTURES / "signed-good.md"),
+            **extra,
         },
         headers={"Authorization": "Bearer actuate-token"},
     )
@@ -123,6 +126,50 @@ def test_an_actuator_that_declares_no_motion_tools_is_unaffected():
     with _client(arm) as client:
         response = _post(client, "arm.move_to", "OBSERVE")
     assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("scope", ["NAVIGATE", "manipulate", "Execute", "actuate"])
+def test_relabelling_a_motion_does_not_step_past_a_hitl_gate(scope):
+    """bob's manifest gates `destructive` (MANIPULATE) and `system` (EXECUTE,
+    ACTUATE) behind a human. Lower case, or NAVIGATE, used to walk past both."""
+    arm = _Arm()
+    policy = HiTLPolicy.from_manifest_gates([{"scope": "destructive", "require_auth": True},
+                                             {"scope": "system", "require_auth": True}])
+    with _client(arm, hitl_policy=policy) as client:
+        response = _post(client, "arm.move_to", scope)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"]["deny"] == "hitl_required"
+    assert arm.calls == []
+
+
+def test_a_motion_with_its_human_approval_still_runs_under_any_case():
+    arm = _Arm()
+    policy = HiTLPolicy(required_for_scopes=frozenset({"MANIPULATE"}))
+    chain = [{"scope": "manipulate", "human_subject": "craig", "issued_at": 1}]
+    with _client(arm, hitl_policy=policy) as client:
+        response = _post(client, "arm.move_to", "MANIPULATE", delegation_chain=chain)
+    assert response.status_code == 200, response.text
+    assert arm.calls == ["arm.move_to"]
+
+
+def test_a_motion_labelled_navigate_meets_the_manipulate_confidence_bar():
+    arm = _Arm()
+    with _client(arm, confidence_policy=ConfidencePolicy()) as client:
+        low = _post(client, "arm.move_to", "NAVIGATE", payload={"inference_confidence": 0.87})
+        high = _post(client, "arm.move_to", "NAVIGATE", payload={"inference_confidence": 0.95})
+    assert low.status_code == 403 and low.json()["detail"]["deny"] == "confidence_threshold"
+    assert high.status_code == 200, high.text
+
+
+def test_a_motion_capabilities_string_is_one_tool_not_a_set_of_letters():
+    class _Sloppy(_Arm):
+        motion_capabilities = "arm.move_to"
+
+    arm = _Sloppy()
+    with _client(arm) as client:
+        response = _post(client, "arm.move_to", "OBSERVE")
+    assert response.status_code == 403
+    assert response.json()["detail"]["deny"] == "tool_scope"
 
 
 def test_check_tool_scope_is_pure():
@@ -169,3 +216,11 @@ def test_a_device_that_cannot_be_claimed_is_logged_not_fatal(caplog):
         _claim_devices([(busy, {"port": "/dev/ttyACM0"})])
     assert "device_claim_failed" in caplog.text
     assert "busy" in caplog.text
+
+
+def test_a_claim_that_fails_for_any_reason_is_logged_not_fatal(caplog):
+    """A bad baud in the config raises ValueError, not OSError."""
+    bad = _Claims(fail=ValueError("invalid literal for int() with base 10: 'fast'"))
+    with caplog.at_level(logging.ERROR, logger="robot_md_gateway.claim"):
+        _claim_devices([(bad, {"baud": "fast"})])
+    assert "device_claim_failed" in caplog.text

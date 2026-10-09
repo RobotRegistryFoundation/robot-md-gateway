@@ -202,7 +202,7 @@ def _claim_devices(pairs) -> None:
         name = getattr(actuator, "name", type(actuator).__name__)
         try:
             claim(dict(config or {}))
-        except OSError as exc:
+        except Exception as exc:  # a bad port or baud is not a reason not to serve
             log.error(
                 "device_claim_failed actuator=%s error=%s: another process may hold the "
                 "device, or it is not connected. Motion through this actuator will fail "

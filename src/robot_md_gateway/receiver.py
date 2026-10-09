@@ -63,6 +63,7 @@ from .cert.envelope import (
 from .cert.gates import ConfidencePolicy, HiTLPolicy, check_confidence, check_hitl
 from .cert.policy import (
     ToolAllowlist,
+    as_tool_set,
     audit_allowlist_for_stop,
     check_tier,
     check_tool,
@@ -205,6 +206,15 @@ def make_app(
             actuator_config = {}
         actuators = {}
         actuator_configs = {}
+    # Every tool any configured actuator says moves the robot. Known before an
+    # actuator is chosen, so the scope, confidence and HiTL gates below can treat
+    # a motion as a motion whatever the envelope calls it.
+    _motion_tools = frozenset().union(*(
+        as_tool_set(getattr(a, "motion_capabilities", None))
+        for a in ([*actuators.values()] if multi_actuator_mode else [actuator])
+        if a is not None
+    ))
+
     # Startup invariant: a gateway allowlisted to MOVE a robot and not to STOP
     # it is a misconfiguration, and it is the one this whole change exists to
     # stop recurring. Logged loudly under a named reason, NOT refused: the
@@ -784,8 +794,26 @@ def make_app(
             _attach_signature(detail, signed, marker)
             raise HTTPException(status_code=403, detail=detail)
 
+        # SCOPE MUST NAME THE ACT. A tool an actuator declares as motion must be
+        # invoked under an actuation scope; the same motion labelled OBSERVE is
+        # refused, signed like every other deny. Scope is caller-written, and the
+        # tier, confidence and HiTL gates key off it.
+        is_motion = envelope.tool_name in _motion_tools
+        allowed, reason = check_tool_scope(
+            envelope.tool_name, envelope.scope, _motion_tools, msg_id=envelope.msg_id
+        )
+        if not allowed:
+            signed, marker = _record(
+                "deny", f"tool_scope: {reason}", manifest_result.kid, envelope.msg_id,
+                envelope_dict=envelope_dict, ruri=envelope.ruri,
+                rrn=manifest_rrn, started_at=started_at, caller=caller, tier=tier,
+            )
+            detail = {"deny": "tool_scope", "reason": reason}
+            _attach_signature(detail, signed, marker)
+            raise HTTPException(status_code=403, detail=detail)
+
         if confidence_policy is not None:
-            ok, reason = check_confidence(envelope_dict, confidence_policy)
+            ok, reason = check_confidence(envelope_dict, confidence_policy, motion=is_motion)
             if not ok:
                 signed, marker = _record(
                     "deny",
@@ -808,7 +836,7 @@ def make_app(
             gates = (fm.get("safety") or {}).get("hitl_gates")
             effective_hitl = HiTLPolicy.from_manifest_gates(gates)
         if effective_hitl is not None:
-            ok, reason = check_hitl(envelope_dict, effective_hitl)
+            ok, reason = check_hitl(envelope_dict, effective_hitl, motion=is_motion)
             if not ok:
                 signed, marker = _record(
                     "deny",
@@ -914,27 +942,6 @@ def make_app(
         else:
             target_actuator = actuator
             target_config = actuator_config
-
-        # SCOPE MUST NAME THE ACT. The actuator says which of its tools move the
-        # robot; an envelope invoking one of them under a scope that does not
-        # (OBSERVE, READ, ...) is refused here, signed like every other deny.
-        # Scope is caller-written and the tier gate and HiTL gates above key off
-        # it, so without this an actuate-tier caller could relabel a motion and
-        # step past a HiTL gate required for MANIPULATE.
-        allowed, reason = check_tool_scope(
-            envelope.tool_name, envelope.scope,
-            frozenset(getattr(target_actuator, "motion_capabilities", ()) or ()),
-            msg_id=envelope.msg_id,
-        )
-        if not allowed:
-            signed, marker = _record(
-                "deny", f"tool_scope: {reason}", manifest_result.kid, envelope.msg_id,
-                envelope_dict=envelope_dict, ruri=envelope.ruri,
-                rrn=manifest_rrn, started_at=started_at, caller=caller, tier=tier,
-            )
-            detail = {"deny": "tool_scope", "reason": reason}
-            _attach_signature(detail, signed, marker)
-            raise HTTPException(status_code=403, detail=detail)
 
         # RECORD BEFORE DISPATCH (RCAN 6.3). Every gate above has passed and the
         # actuator has been chosen; the next statement is the one that can move
