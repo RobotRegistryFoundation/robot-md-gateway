@@ -180,6 +180,38 @@ class _LegacyByokAction(argparse.Action):
         setattr(namespace, self.dest, True)
 
 
+def _claim_devices(pairs) -> None:
+    """Let each actuator claim its device now, before the gateway serves.
+
+    ``pairs`` is ``[(actuator, config), ...]``.
+
+    The gateway is only an enforcement layer if nothing else can reach the
+    actuator. An actuator that can take its device exclusively (so-arm101's
+    ``claim()`` opens the servo bus with flock + TIOCEXCL) does it here, at
+    startup, so the device is held from the moment the service runs rather than
+    from the first request: an exclusive open cannot evict a process that got
+    there first. A failure is logged, not fatal: the gateway still serves its
+    read endpoints, and the actuator refuses motion while it cannot hold the
+    device.
+    """
+    log = logging.getLogger("robot_md_gateway.claim")
+    for actuator, config in pairs:
+        claim = getattr(actuator, "claim", None)
+        if not callable(claim):
+            continue
+        name = getattr(actuator, "name", type(actuator).__name__)
+        try:
+            claim(dict(config or {}))
+        except OSError as exc:
+            log.error(
+                "device_claim_failed actuator=%s error=%s: another process may hold the "
+                "device, or it is not connected. Motion through this actuator will fail "
+                "until it can be claimed.", name, exc,
+            )
+        else:
+            log.info("device_claimed actuator=%s", name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="robot-md-gateway")
     parser.add_argument(
@@ -322,6 +354,9 @@ def main() -> None:
                     )
                     actuators[instance.name] = instance
                     actuator_configs[instance.name] = entry["config"]
+                _claim_devices(
+                    [(actuators[n], actuator_configs[n]) for n in actuators]
+                )
                 fastapi_app = make_app(
                     resolver=RRFResolverFromEnv.from_env(),
                     tool_allowlist=tool_allowlist,
@@ -350,6 +385,7 @@ def main() -> None:
                     actuator_instance=actuator_instance,
                     config=actuator_section["config"],
                 )
+                _claim_devices([(actuator_instance, actuator_section["config"])])
                 fastapi_app = make_app(
                     resolver=RRFResolverFromEnv.from_env(),
                     tool_allowlist=tool_allowlist,

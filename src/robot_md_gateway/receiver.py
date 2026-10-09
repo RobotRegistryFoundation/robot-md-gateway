@@ -66,6 +66,7 @@ from .cert.policy import (
     audit_allowlist_for_stop,
     check_tier,
     check_tool,
+    check_tool_scope,
     check_tool_tier,
 )
 from .cert.revocation import RevocationCache, RRFRevocationResolver
@@ -913,6 +914,27 @@ def make_app(
         else:
             target_actuator = actuator
             target_config = actuator_config
+
+        # SCOPE MUST NAME THE ACT. The actuator says which of its tools move the
+        # robot; an envelope invoking one of them under a scope that does not
+        # (OBSERVE, READ, ...) is refused here, signed like every other deny.
+        # Scope is caller-written and the tier gate and HiTL gates above key off
+        # it, so without this an actuate-tier caller could relabel a motion and
+        # step past a HiTL gate required for MANIPULATE.
+        allowed, reason = check_tool_scope(
+            envelope.tool_name, envelope.scope,
+            frozenset(getattr(target_actuator, "motion_capabilities", ()) or ()),
+            msg_id=envelope.msg_id,
+        )
+        if not allowed:
+            signed, marker = _record(
+                "deny", f"tool_scope: {reason}", manifest_result.kid, envelope.msg_id,
+                envelope_dict=envelope_dict, ruri=envelope.ruri,
+                rrn=manifest_rrn, started_at=started_at, caller=caller, tier=tier,
+            )
+            detail = {"deny": "tool_scope", "reason": reason}
+            _attach_signature(detail, signed, marker)
+            raise HTTPException(status_code=403, detail=detail)
 
         # RECORD BEFORE DISPATCH (RCAN 6.3). Every gate above has passed and the
         # actuator has been chosen; the next statement is the one that can move

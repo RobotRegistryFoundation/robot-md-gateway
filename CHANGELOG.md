@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Security
+
+- **A motion tool must be invoked under a scope that says so.** The receiver
+  now refuses (signed 403, `deny: "tool_scope"`, audited) an envelope that names
+  one of the actuator's `motion_capabilities` under a non-actuation scope such
+  as `OBSERVE`. The tier gate and the HiTL gates key off the caller-written
+  `scope`, so an actuate-tier caller could relabel a motion and step past a HiTL
+  gate required for `MANIPULATE`; EV-03's software-in-the-loop run (October
+  2026) found `arm.move_to` executing under `scope: "OBSERVE"`. The stop tools
+  are not motion and are unaffected, as is any actuator that declares no
+  `motion_capabilities`.
+- **Scope names are compared case-insensitively** in the tier gate
+  (`check_tier`) and the new scope gate. `"manipulate"` or `"commission"` in
+  lower case used to pass GW-003 untouched, including the commission-tier
+  requirement.
+- **`serve` lets each actuator claim its device at startup** (`claim(config)`,
+  when the actuator has one; so-arm101-actuator's opens the servo bus with an
+  flock and TIOCEXCL). An exclusive open cannot evict a process that got there
+  first, so the device is now held from the moment the service runs rather than
+  from the first request. A failed claim is logged (`device_claim_failed`) and
+  is not fatal.
+
 ### Added
 
 - **`systemd/install.sh` adds the person who ran it to `dialout`** (`$SUDO_USER`,
