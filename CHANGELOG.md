@@ -33,6 +33,13 @@
   first, so the device is now held from the moment the service runs rather than
   from the first request. A failed claim, for any reason (a busy port, a bad
   baud in the config), is logged (`device_claim_failed`) and is not fatal.
+- **A stop no longer queues behind other requests for a thread.** `/v1/invoke`
+  is synchronous work on FastAPI's shared pool of 40 threads, first come first
+  served, so a burst of polls each waiting on the robot left an `arm.estop`
+  waiting for a thread (5.9 s late under 120 looping clients, in EV-03's
+  review). Tools an actuator declares in `stop_capabilities` now run on
+  `STOP_LANES` (8) threads of their own; everything else shares the pool as
+  before. The stop's checks are unchanged.
 
 ### Added
 

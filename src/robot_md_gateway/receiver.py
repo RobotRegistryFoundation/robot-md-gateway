@@ -27,13 +27,16 @@ Subsequent plans fill in:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
 import time
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 
+import anyio
 import yaml
 from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, ValidationError
@@ -76,6 +79,11 @@ from .cert.safety import SafetyMonitor
 from .manifest_provenance import RRFResolver, verify_manifest
 
 _DEFAULT_ALLOWLIST = ToolAllowlist(allowed_tools=("mcp__robot__render", "mcp__robot__validate"))
+
+#: Worker threads reserved for stop tools (an actuator's `stop_capabilities`).
+#: Every other request shares the default pool of 40. A stop is quick and
+#: idempotent, so a handful is plenty, and a burst of stops only queues stops.
+STOP_LANES = 8
 
 # Manifest frontmatter cache keyed by path -> (mtime, frontmatter dict). Used by the
 # RRN-binding (B4) and manifest-driven HiTL (B3) gates so they read the manifest's
@@ -214,6 +222,22 @@ def make_app(
         for a in ([*actuators.values()] if multi_actuator_mode else [actuator])
         if a is not None
     ))
+    # And every tool any of them says stops it: these get their own worker
+    # threads (see invoke), so a stop never queues behind other requests.
+    _stop_tools = frozenset().union(*(
+        as_tool_set(getattr(a, "stop_capabilities", None))
+        for a in ([*actuators.values()] if multi_actuator_mode else [actuator])
+        if a is not None
+    ))
+    _stop_lane: list = [None, None]          # (weakref to the event loop, its limiter)
+
+    def _stop_limiter() -> anyio.CapacityLimiter:
+        # One limiter per event loop: an anyio limiter belongs to the loop that
+        # first used it, and tests run one app under several loops.
+        loop = asyncio.get_running_loop()
+        if _stop_lane[0] is None or _stop_lane[0]() is not loop:
+            _stop_lane[:] = [weakref.ref(loop), anyio.CapacityLimiter(STOP_LANES)]
+        return _stop_lane[1]
 
     # Startup invariant: a gateway allowlisted to MOVE a robot and not to STOP
     # it is a misconfiguration, and it is the one this whole change exists to
@@ -584,11 +608,7 @@ def make_app(
             caller=caller, tier=tier,
         )
 
-    @app.post("/v1/invoke")
-    def invoke(
-        envelope_dict: dict = Body(...),
-        authorization: str | None = Header(default=None),
-    ):
+    def _invoke(envelope_dict: dict, authorization: str | None):
         # `caller` rides every audit entry and every signed receipt from here
         # down. It is the CREDENTIAL's name, never a person's.
         tier, caller = _principal(authorization)
@@ -1043,6 +1063,23 @@ def make_app(
         # configured, this attaches attestation="unattested" + envelope_signature=null.
         _attach_signature(response, signed_outcome, marker)
         return response
+
+    @app.post("/v1/invoke")
+    async def invoke(
+        envelope_dict: dict = Body(...),
+        authorization: str | None = Header(default=None),
+    ):
+        # The work is synchronous (signatures, the audit chain, the actuator)
+        # and runs on a worker thread, as it did when this handler was a plain
+        # `def`. A stop runs on threads of its own: FastAPI's shared pool is
+        # first-come-first-served, so a burst of polls each holding a thread
+        # left a stop queued behind them (5.9 s late under 120 looping
+        # clients, found in EV-03's review). Nothing about the stop's checks
+        # changes; only which threads it waits for.
+        tool = envelope_dict.get("tool_name")
+        limiter = _stop_limiter() if isinstance(tool, str) and tool in _stop_tools else None
+        return await anyio.to_thread.run_sync(_invoke, envelope_dict, authorization,
+                                              limiter=limiter)
 
     @app.get("/v1/audit/last")
     def audit_last(authorization: str | None = Header(default=None)):
