@@ -91,7 +91,7 @@ could say what actually happened. That reason is still true, which is why the
 late record stayed. What the late record could never cover is the case where
 nothing comes back at all: a driver that hangs, a process killed mid-motion, a
 robot unplugged between the gate and the wire. Those used to leave no trace that
-anything had been attempted. RCAN 6.3 makes the write before driver dispatch
+anything had been attempted. RCAN §6.3 makes the write before driver dispatch
 normative, and the pair is how both halves are true at once.
 
 An intent with no outcome beside it is **a dispatch that never reported**. It is
