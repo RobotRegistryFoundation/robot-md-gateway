@@ -39,7 +39,12 @@
   waiting for a thread (5.9 s late under 120 looping clients, in EV-03's
   review). Tools an actuator declares in `stop_capabilities` now run on
   `STOP_LANES` (8) threads of their own; everything else shares the pool as
-  before. The stop's checks are unchanged.
+  before. The stop's checks are unchanged. This does not make the stop immune
+  to a flood: one that saturates the server's CPU still delays it in the event
+  loop. With 120 looping clients in other processes (two cores, a simulated
+  bus) the stop latched 0.9 s after it was sent, against 2.75 s before; with
+  200, 4.7 s. Rate-limiting the read tier, or a stop path outside HTTP, is the
+  fix for that.
 
 ### Added
 
