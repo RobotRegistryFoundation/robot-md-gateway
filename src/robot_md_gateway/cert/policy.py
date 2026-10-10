@@ -48,8 +48,11 @@ def audit_allowlist_for_stop(
     """
     findings: list[dict] = []
     for name, actuator in actuators:
-        motion = frozenset(getattr(actuator, "motion_capabilities", ()) or ())
-        stop = frozenset(getattr(actuator, "stop_capabilities", ()) or ())
+        # The same reading the scope gate uses: a bare string is one tool name.
+        # frozenset("arm.home") would be a set of letters, and the actuator
+        # would pass this audit with no stop at all (review of #34).
+        motion = as_tool_set(getattr(actuator, "motion_capabilities", None))
+        stop = as_tool_set(getattr(actuator, "stop_capabilities", None))
         if not motion:
             # Nothing that moves, so nothing that needs stopping.
             continue
@@ -123,16 +126,69 @@ def check_tool_tier(
     )
 
 
+#: The actuation scopes an ordinary motion can be labelled with. COMMISSION is
+#: left out on purpose: it is the bring-up scope behind its own tier, and a HiTL
+#: gate on bring-up must not spread to every move_to.
+MOTION_SCOPES = frozenset({"MANIPULATE", "NAVIGATE", "ACTUATE", "EXECUTE"})
+
+
+def as_tool_set(declared: object) -> frozenset[str]:
+    """An actuator's ``motion_capabilities`` / ``stop_capabilities`` as a set of
+    tool names. A bare string is ONE tool name, not a set of characters: read as
+    an iterable it would silently turn the scope gate off."""
+    if declared is None:
+        return frozenset()
+    if isinstance(declared, str):
+        return frozenset({declared})
+    try:
+        return frozenset(str(t) for t in declared)
+    except TypeError:
+        return frozenset()
+
+
+def is_actuation_scope(scope: object) -> bool:
+    """Whether an envelope's ``scope`` names an act that moves or alters the robot.
+
+    Case-insensitive. ``scope`` is a caller-supplied string, and matching it
+    exactly let ``"manipulate"`` or ``"commission"`` in lower case through every
+    check keyed on these names.
+    """
+    return isinstance(scope, str) and scope.upper() in ACTUATION_SCOPES
+
+
+def check_tool_scope(
+    tool_name: str, scope: str, motion_tools: frozenset[str] | set[str], *, msg_id: str
+) -> tuple[bool, str]:
+    """A tool that moves the robot must be invoked under a scope that says so.
+
+    ``check_tier`` and the HiTL gates key off the envelope's ``scope``, which the
+    caller writes. An envelope naming a motion tool while declaring ``scope:
+    "OBSERVE"`` passed both, and executed: EV-03's software-in-the-loop run
+    found it (October 2026). A HiTL gate required for MANIPULATE never saw it.
+    ``motion_tools`` comes from the actuator (``motion_capabilities``), which
+    the operator installed; an actuator that declares none is unaffected.
+    """
+    if tool_name in motion_tools and not is_actuation_scope(scope):
+        return False, (
+            f"tool {tool_name} moves the robot, and scope {scope!r} does not say so "
+            f"(motion needs one of {sorted(ACTUATION_SCOPES)})"
+        )
+    return True, "ok"
+
+
 def check_tier(tier: str, scope: str, *, msg_id: str) -> tuple[bool, str]:
-    """GW-003 — read/anon principals denied actuation; COMMISSION needs the commission tier."""
-    if tier in NON_ACTUATING_TIERS and scope in ACTUATION_SCOPES:
+    """GW-003 — read/anon principals denied actuation; COMMISSION needs the commission tier.
+
+    Scope names are compared case-insensitively (see :func:`is_actuation_scope`)."""
+    scope_key = scope.upper() if isinstance(scope, str) else scope
+    if tier in NON_ACTUATING_TIERS and scope_key in ACTUATION_SCOPES:
         cert_report.record_property(
             property_id="GW-003",
             outcome="fail",
             evidence={"tier": tier, "scope": scope, "msg_id": msg_id, "outcome": "denied"},
         )
         return False, f"{tier}-tier principal cannot invoke {scope}"
-    if scope == "COMMISSION" and tier != "commission":
+    if scope_key == "COMMISSION" and tier != "commission":
         cert_report.record_property(
             property_id="GW-003",
             outcome="fail",

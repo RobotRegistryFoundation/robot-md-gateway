@@ -2,6 +2,62 @@
 
 ## [Unreleased]
 
+## [0.5.0a9] - 2026-10-09
+
+### Security
+
+- **A motion tool must be invoked under a scope that says so.** The receiver
+  now refuses (signed 403, `deny: "tool_scope"`, audited) an envelope that names
+  one of the actuator's `motion_capabilities` under a non-actuation scope such
+  as `OBSERVE`. The tier gate and the HiTL gates key off the caller-written
+  `scope`, so an actuate-tier caller could relabel a motion and step past a HiTL
+  gate required for `MANIPULATE`; EV-03's software-in-the-loop run (October
+  2026) found `arm.move_to` executing under `scope: "OBSERVE"`. The stop tools
+  are not motion and are unaffected, as is any actuator that declares no
+  `motion_capabilities`.
+- **Scope names are compared case-insensitively** in every gate that keys off
+  them: the tier gate (`check_tier`), the scope gate, the confidence thresholds
+  and the HiTL gates (including the delegation chain's final scope).
+  `"manipulate"` or `"commission"` in lower case used to pass GW-003 untouched,
+  including the commission-tier requirement, and to skip a HiTL gate on
+  MANIPULATE.
+- **A motion is held to the strictest motion scope.** For a tool any actuator
+  declares as motion, HiTL on any of MANIPULATE, NAVIGATE, ACTUATE or EXECUTE
+  means HiTL on all of them, and the confidence threshold is the highest of
+  theirs. Relabelling a manipulation NAVIGATE used to skip bob's HiTL gates and
+  lower the confidence bar from 0.90 to 0.85. (COMMISSION is not in that set: a
+  gate on bring-up does not spread to every move.) A motion scope the
+  thresholds do not list counts at the default-strict 0.95 it would get as a
+  label, so with the default thresholds (where ACTUATE and EXECUTE are unlisted)
+  every motion needs 0.95, whatever it is labelled.
+- An actuator's `motion_capabilities` given as a bare string is one tool name,
+  not a set of characters (which silently disabled the scope gate). The startup
+  `allowlist_has_no_stop` audit reads both declarations the same way.
+- **`serve` lets each actuator claim its device at startup** (`claim(config)`,
+  when the actuator has one; so-arm101-actuator's opens the servo bus with an
+  flock and TIOCEXCL). An exclusive open cannot evict a process that got there
+  first, so the device is now held from the moment the service runs rather than
+  from the first request. A failed claim, for any reason (a busy port, a bad
+  baud in the config), is logged (`device_claim_failed`) and is not fatal.
+- **A stop no longer queues behind other requests for a thread.** `/v1/invoke`
+  is synchronous work on FastAPI's shared pool of 40 threads, first come first
+  served, so a burst of polls each waiting on the robot left an `arm.estop`
+  waiting for a thread (5.9 s late under 120 looping clients, in EV-03's
+  review). Tools an actuator declares in `stop_capabilities` now run on
+  `STOP_LANES` (8) threads of their own; everything else shares the pool as
+  before. The stop's checks are unchanged. This does not make the stop immune
+  to a flood: CPU and the GIL are shared by every thread. With the clients in
+  other processes (two cores, a simulated bus, a paced move running), the stop
+  latched 0.05 s after it was sent with no other traffic, 0.9 s under 120
+  looping clients (2.75 s before), and 4.7 s under 200; the actuator's hold
+  went out about 0.9 s after the latch under load. Under 45 clients it was no
+  faster than before (0.87 s against 0.73 s): the threads had not run out.
+  Rate-limiting the read tier, or a stop path outside HTTP, is the fix for a
+  flood. The lane is chosen from the envelope's `tool_name` before any check,
+  so any caller can occupy it with stop-tool requests, and a real stop then
+  waits behind them; each such request is refused in milliseconds unless it is
+  a valid stop. The per-loop limiter assumes asyncio (uvicorn).
+
 ### Added
 
 - **`systemd/install.sh` adds the person who ran it to `dialout`** (`$SUDO_USER`,
