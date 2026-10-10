@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0a9] - 2026-10-09
+
 ### Security
 
 - **A motion tool must be invoked under a scope that says so.** The receiver
