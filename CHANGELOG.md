@@ -60,8 +60,9 @@
 - **What actuators declare is checked at startup.** A tool declared both as a
   stop and as a motion refuses to start the gateway. An actuator whose own
   declared tiers would refuse its stop at tier `read` gets a `stop_unreachable`
-  error and every motion through it is refused. An actuator that declares no
-  stop is logged as `no_declared_stop`.
+  error and every motion through it is refused; so does one that refuses the
+  gateway's stop when a trip sends it, from then until a restart. An actuator
+  that declares no stop is logged as `no_declared_stop`.
 - **A damaged ROBOT.md is a signed deny, never a 500.** A non-UTF-8 byte, a
   frontmatter or `metadata:` that is not a mapping, a signature footer that is
   not base64, and a `safety.hitl_gates` of the wrong shape each escaped as an

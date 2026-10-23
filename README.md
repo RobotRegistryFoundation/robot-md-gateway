@@ -365,6 +365,11 @@ included, is a trip:
   whose thread could not start is tried again on the next tick.
 - Nothing on this path reads ROBOT.md: what to stop, and the robot's RRN, were
   resolved when the gateway started.
+- An actuator that refuses this stop cannot be stopped by the gateway, so every
+  motion through it is refused from then until the gateway restarts
+  (`deny: stop_unreachable`). The same holds from startup for one whose declared
+  tiers (`required_tiers`, or a module-level `REQUIRED_TIERS`) leave out `read`.
+  A tool declared both as a stop and as a motion stops the gateway at startup.
 - The trip, each stop and each timeout are recorded in the audit chain and the
   export (`safety_trip: ...`, `safety_stop: ...`, `safety_stop_timeout: ...`).
   The trip record names the caller of the last accepted heartbeat. An actuator
