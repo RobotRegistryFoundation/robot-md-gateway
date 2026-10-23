@@ -39,7 +39,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1778,11 +1778,54 @@ def make_app(
         return {"state": monitor.state.value,
                 "heartbeat_staleness_s": monitor.heartbeat_staleness_s}
 
+    def _signed_clear_refusal(body: object) -> tuple[str | None, str | None]:
+        """(why the clear is refused, or None; the verified kid) for a gateway
+        that requires signed envelopes. A clear makes the robot movable again,
+        so it is held to everything an invoke is held to, and a timestamp is
+        required even where the freshness policy does not require one
+        (rcan-spec replay-prevention: RESUME needs a fresh timestamp and a
+        unique msg_id; revocation: RESUME from a revoked key is rejected).
+        Nothing in here raises: a lookup that fails is a refusal."""
+        if not isinstance(body, dict):
+            return ("this gateway requires signed envelopes, and a clear must be one, "
+                    "of type ESTOP_CLEAR"), None
+        if body.get("type") != "ESTOP_CLEAR":
+            return f"the envelope's type is {body.get('type')!r}, not 'ESTOP_CLEAR'", None
+        try:
+            result = verify_envelope(body, resolver=resolver)
+        except Exception as exc:
+            return f"envelope_signature: could not be verified ({type(exc).__name__})", None
+        if not result.accepted:
+            return f"envelope_signature: {result.reason}", result.kid
+        ok, reason = check_freshness(body, replace(freshness_policy, require_timestamp=True))
+        if not ok:
+            return f"envelope_freshness: {reason}", result.kid
+        ok, reason = check_replay(body, replay_cache)
+        if not ok:
+            return f"replay: {reason}", result.kid
+        if revocation_resolver is not None and result.kid:
+            try:
+                if revocation_cache.is_revoked(result.kid, resolver=revocation_resolver):
+                    return f"revoked_key: kid={result.kid}", result.kid
+            except Exception as exc:
+                return (f"revoked_key: the revocation status of {result.kid} could not be "
+                        f"checked ({type(exc).__name__})"), result.kid
+        return None, result.kid
+
     @app.post("/v1/safety/clear")
-    def safety_clear(authorization: str | None = Header(default=None)):
+    def safety_clear(
+        authorization: str | None = Header(default=None),
+        envelope_dict: dict | None = Body(default=None),
+    ):
         """The operator's resume signal, after a safe-stop or an ESTOP.
 
-        Conditions, in the order they are checked, all under the safety lock:
+        Conditions, in the order they are checked:
+        - Where the gateway requires signed envelopes, the body must be one, of
+          type ESTOP_CLEAR: signed by a key the resolver knows, with a fresh
+          timestamp, a msg_id never seen before, and a key that is not revoked
+          (finding 10). Checked before the safety lock is taken, because the
+          key lookup can take seconds. Elsewhere the body is ignored.
+        The rest under the safety lock:
         - Any trip not yet acted on is acted on first: its stops are sent before
           anything is cleared. While a stop of the last trip has neither
           answered nor timed out, the clear is refused with 409 (finding 5).
@@ -1802,7 +1845,13 @@ def make_app(
         tier, caller = _known_principal(authorization)
         monitor = _require_monitor()
         msg_id = f"safety-clear-{uuid.uuid4().hex[:12]}"
+        recorded_envelope: dict = {"msg_id": msg_id, "type": "ESTOP_CLEAR"}
         started_at = datetime.now(tz=timezone.utc).isoformat()
+        unsigned, kid = None, None
+        if require_envelope_signature:
+            unsigned, kid = _signed_clear_refusal(envelope_dict)
+            if isinstance(envelope_dict, dict) and isinstance(envelope_dict.get("msg_id"), str):
+                msg_id, recorded_envelope = envelope_dict["msg_id"], envelope_dict
         records: list = []
         status = 200
         with _safety_lock:
@@ -1810,7 +1859,9 @@ def make_app(
             _advance_locked(records)
             trip = _safety.trip
             age = clock() - monitor.last_heartbeat_at
-            if trip is not None and not trip.settled():
+            if unsigned is not None:
+                status, reason = 403, f"safety.clear: refused, {unsigned}"
+            elif trip is not None and not trip.settled():
                 waiting = ", ".join(f"{s.tool} to {s.name}" for s in trip.sends
                                     if s.status not in ("done", "timed_out"))
                 status, reason = 409, (
@@ -1838,8 +1889,8 @@ def make_app(
                     status = 403
         _write_safety_records(records)
         signed, marker = _record(
-            "allow" if status == 200 else "deny", reason, None, msg_id,
-            envelope_dict={"msg_id": msg_id, "type": "ESTOP_CLEAR"}, ruri=None,
+            "allow" if status == 200 else "deny", reason, kid, msg_id,
+            envelope_dict=recorded_envelope, ruri=None,
             rrn=_pinned_rrn, started_at=started_at, caller=caller, tier=tier,
         )
         if status != 200:
