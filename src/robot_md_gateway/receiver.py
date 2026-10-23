@@ -777,6 +777,143 @@ def make_app(
                     "safety_watchdog: a tick failed; the next runs in %.1f s", SAFETY_TICK_S,
                 )
 
+    def _dispatch(
+        *,
+        envelope_dict: dict,
+        msg_id: str,
+        ruri: str | None,
+        scope: str,
+        tool_name: str,
+        target_actuator: Actuator,
+        target_config: dict,
+        manifest_path: Path | None,
+        kid: str | None,
+        rrn: str,
+        tier: str,
+        caller: str | None,
+        started_at: str,
+    ) -> dict:
+        """Record, dispatch to the actuator, record again, and answer.
+
+        Everything after the gates: the intent written before dispatch, the
+        call into the actuator, the outcome record, and the 200, 403 or 500
+        that goes back. Shared by the gated path and the stop path, so the
+        records and the response cannot drift apart between them.
+        """
+        # RECORD BEFORE DISPATCH (RCAN 6.3). Every gate above has passed and the
+        # actuator has been chosen; the next statement is the one that can move
+        # the robot. This is the last moment at which a record can be written
+        # that does not depend on the dispatch coming back, and that is exactly
+        # why the spec puts it here: a driver that hangs, a process that is
+        # killed mid-motion, or a robot that is unplugged all used to leave no
+        # trace that anything had been attempted at all.
+        #
+        # THE LATE RECORD STAYS. The outcome entry below is not replaced by
+        # this one, because the reason the late record existed is still true:
+        # only a record written after the dispatch can say what happened. The
+        # pair is the answer. The intent says what was about to be attempted,
+        # the outcome says how it went, and the outcome carries the intent's
+        # chain hash so the two are one hop apart.
+        intent_chain_hash = _record_intent(
+            msg_id=msg_id, envelope_dict=envelope_dict,
+            ruri=ruri, rrn=rrn,
+            tool_name=tool_name, actuator_name=target_actuator.name,
+            kid=kid, caller=caller, tier=tier,
+        )
+
+        # Capture outcome regardless of success so the audit entry records
+        # what actually happened.
+        try:
+            outcome = target_actuator.execute(
+                envelope=envelope_dict,
+                manifest_path=manifest_path,
+                tier=tier,
+                config=target_config,
+            )
+            error_kind: str | None = None
+        except Exception as exc:
+            outcome = ActuatorOutcome(
+                success=False, outcome_kind="error",
+                error_message=str(exc),
+            )
+            error_kind = type(exc).__name__
+        ended_at = datetime.now(tz=timezone.utc).isoformat()
+
+        # A DRIVER'S REFUSAL IS RECORDED AS A DENY. outcome_kind == "denied" is
+        # the actuator's own policy gate saying no, and the caller is told so
+        # with a signed 403 just below. This record used to say
+        # decision="allow", reason="ok" whatever the driver answered, so the
+        # audit chain and the signed receipt (status "failure") filed a refusal
+        # as an action that ran and failed. Any other unsuccessful outcome is a
+        # fault, not a decision: the gates allowed it and the driver broke, so it
+        # stays an allow, with the error carried by the outcome fields.
+        refused = not outcome.success and outcome.outcome_kind == "denied"
+        if refused:
+            decision, reason = "deny", f"actuator_policy: {outcome.error_message or 'refused'}"
+        else:
+            decision, reason = "allow", "ok"
+        signed_outcome, marker = _record_with_outcome(
+            decision=decision, reason=reason,
+            kid=kid, msg_id=msg_id,
+            outcome=outcome, error_kind=error_kind,
+            actuator_name=target_actuator.name,
+            envelope_dict=envelope_dict, ruri=ruri, rrn=rrn,
+            started_at=started_at, ended_at=ended_at, caller=caller, tier=tier,
+            intent_chain_hash=intent_chain_hash,
+        )
+
+        if refused:
+            # A driver refusing on POLICY is a decision, not a fault, and it must
+            # reach the caller the way every other decision does: a signed 403 the
+            # client can render, verify, and keep. It used to fall into the 500
+            # below — unsigned, and unreadable to clients that accept only
+            # 200/403, so "no drive approval is open" arrived as a transport
+            # error indistinguishable from the gateway falling over. Same fix as
+            # the one made for an unreadable manifest_path.
+            #
+            # Only outcome_kind == "denied" takes this path. An actuator that
+            # crashed still 500s: a fault dressed as a policy refusal would tell
+            # the operator the robot decided something when in fact it broke.
+            detail = {
+                "deny": "actuator_policy",
+                "reason": outcome.error_message,
+                "actuator_name": target_actuator.name,
+            }
+            # The driver's own structured account of the refusal, when it has
+            # one. `reason` is a sentence for a person; a harness deciding what
+            # to do next needs a code it can branch on, and regexing the prose
+            # is how a message becomes an accidental API.
+            #
+            # This is not new information reaching the client: telemetry is
+            # already hashed into the signed outcome above (telemetry_sha256),
+            # so the structure returned here is bound to the same signature the
+            # sentence is — and the allow path has always returned it verbatim.
+            if outcome.telemetry:
+                detail["telemetry"] = outcome.telemetry
+            _attach_signature(detail, signed_outcome, marker)
+            raise HTTPException(status_code=403, detail=detail)
+
+        if not outcome.success:
+            raise HTTPException(status_code=500, detail={
+                "actuator_error": outcome.error_message,
+                "actuator_error_kind": error_kind,
+            })
+
+        response = {
+            "ok": True,
+            "manifest_kid": kid,
+            "scope": scope,
+            "tool_name": tool_name,
+            "actuator_name": target_actuator.name,
+            "outcome_kind": outcome.outcome_kind,
+            "telemetry": outcome.telemetry,
+        }
+        # Embed the Ed25519-signed outcome so the client can verify the receipt on
+        # the wire (envelope_signature: {kid, alg, sig}). When attestation is not
+        # configured, this attaches attestation="unattested" + envelope_signature=null.
+        _attach_signature(response, signed_outcome, marker)
+        return response
+
     def _invoke(envelope_dict: dict, authorization: str | None):
         # `caller` rides every audit entry and every signed receipt from here
         # down. It is the CREDENTIAL's name, never a person's.
@@ -1167,119 +1304,13 @@ def make_app(
             _attach_signature(detail, signed, marker)
             raise HTTPException(status_code=403, detail=detail)
 
-        # RECORD BEFORE DISPATCH (RCAN 6.3). Every gate above has passed and the
-        # actuator has been chosen; the next statement is the one that can move
-        # the robot. This is the last moment at which a record can be written
-        # that does not depend on the dispatch coming back, and that is exactly
-        # why the spec puts it here: a driver that hangs, a process that is
-        # killed mid-motion, or a robot that is unplugged all used to leave no
-        # trace that anything had been attempted at all.
-        #
-        # THE LATE RECORD STAYS. The outcome entry below is not replaced by
-        # this one, because the reason the late record existed is still true:
-        # only a record written after the dispatch can say what happened. The
-        # pair is the answer. The intent says what was about to be attempted,
-        # the outcome says how it went, and the outcome carries the intent's
-        # chain hash so the two are one hop apart.
-        intent_chain_hash = _record_intent(
-            msg_id=envelope.msg_id, envelope_dict=envelope_dict,
-            ruri=envelope.ruri, rrn=manifest_rrn,
-            tool_name=envelope.tool_name, actuator_name=target_actuator.name,
-            kid=manifest_result.kid, caller=caller, tier=tier,
+        return _dispatch(
+            envelope_dict=envelope_dict, msg_id=envelope.msg_id, ruri=envelope.ruri,
+            scope=envelope.scope, tool_name=envelope.tool_name,
+            target_actuator=target_actuator, target_config=target_config,
+            manifest_path=Path(envelope.manifest_path), kid=manifest_result.kid,
+            rrn=manifest_rrn, tier=tier, caller=caller, started_at=started_at,
         )
-
-        # Capture outcome regardless of success so the audit entry records
-        # what actually happened.
-        try:
-            outcome = target_actuator.execute(
-                envelope=envelope_dict,
-                manifest_path=Path(envelope.manifest_path),
-                tier=tier,
-                config=target_config,
-            )
-            error_kind: str | None = None
-        except Exception as exc:
-            outcome = ActuatorOutcome(
-                success=False, outcome_kind="error",
-                error_message=str(exc),
-            )
-            error_kind = type(exc).__name__
-        ended_at = datetime.now(tz=timezone.utc).isoformat()
-
-        # A DRIVER'S REFUSAL IS RECORDED AS A DENY. outcome_kind == "denied" is
-        # the actuator's own policy gate saying no, and the caller is told so
-        # with a signed 403 just below. This record used to say
-        # decision="allow", reason="ok" whatever the driver answered, so the
-        # audit chain and the signed receipt (status "failure") filed a refusal
-        # as an action that ran and failed. Any other unsuccessful outcome is a
-        # fault, not a decision: the gates allowed it and the driver broke, so it
-        # stays an allow, with the error carried by the outcome fields.
-        refused = not outcome.success and outcome.outcome_kind == "denied"
-        if refused:
-            decision, reason = "deny", f"actuator_policy: {outcome.error_message or 'refused'}"
-        else:
-            decision, reason = "allow", "ok"
-        signed_outcome, marker = _record_with_outcome(
-            decision=decision, reason=reason,
-            kid=manifest_result.kid, msg_id=envelope.msg_id,
-            outcome=outcome, error_kind=error_kind,
-            actuator_name=target_actuator.name,
-            envelope_dict=envelope_dict, ruri=envelope.ruri, rrn=manifest_rrn,
-            started_at=started_at, ended_at=ended_at, caller=caller, tier=tier,
-            intent_chain_hash=intent_chain_hash,
-        )
-
-        if refused:
-            # A driver refusing on POLICY is a decision, not a fault, and it must
-            # reach the caller the way every other decision does: a signed 403 the
-            # client can render, verify, and keep. It used to fall into the 500
-            # below — unsigned, and unreadable to clients that accept only
-            # 200/403, so "no drive approval is open" arrived as a transport
-            # error indistinguishable from the gateway falling over. Same fix as
-            # the one made for an unreadable manifest_path.
-            #
-            # Only outcome_kind == "denied" takes this path. An actuator that
-            # crashed still 500s: a fault dressed as a policy refusal would tell
-            # the operator the robot decided something when in fact it broke.
-            detail = {
-                "deny": "actuator_policy",
-                "reason": outcome.error_message,
-                "actuator_name": target_actuator.name,
-            }
-            # The driver's own structured account of the refusal, when it has
-            # one. `reason` is a sentence for a person; a harness deciding what
-            # to do next needs a code it can branch on, and regexing the prose
-            # is how a message becomes an accidental API.
-            #
-            # This is not new information reaching the client: telemetry is
-            # already hashed into the signed outcome above (telemetry_sha256),
-            # so the structure returned here is bound to the same signature the
-            # sentence is — and the allow path has always returned it verbatim.
-            if outcome.telemetry:
-                detail["telemetry"] = outcome.telemetry
-            _attach_signature(detail, signed_outcome, marker)
-            raise HTTPException(status_code=403, detail=detail)
-
-        if not outcome.success:
-            raise HTTPException(status_code=500, detail={
-                "actuator_error": outcome.error_message,
-                "actuator_error_kind": error_kind,
-            })
-
-        response = {
-            "ok": True,
-            "manifest_kid": manifest_result.kid,
-            "scope": envelope.scope,
-            "tool_name": envelope.tool_name,
-            "actuator_name": target_actuator.name,
-            "outcome_kind": outcome.outcome_kind,
-            "telemetry": outcome.telemetry,
-        }
-        # Embed the Ed25519-signed outcome so the client can verify the receipt on
-        # the wire (envelope_signature: {kid, alg, sig}). When attestation is not
-        # configured, this attaches attestation="unattested" + envelope_signature=null.
-        _attach_signature(response, signed_outcome, marker)
-        return response
 
     @app.post("/v1/invoke")
     async def invoke(
