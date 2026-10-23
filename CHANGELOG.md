@@ -4,36 +4,68 @@
 
 ### Security
 
-- **`serve` runs a safety monitor, always, and a tripped gateway now stops the
-  machine.** `make_app` has taken a `SafetyMonitor` since Plan 6 Phase 4, but
-  the `serve` path never passed one, so a deployed gateway had no heartbeat
-  staleness rule (SF-002) at all. Where a monitor was wired, only an incoming
-  request ever ticked it, and entering `safe_stop` only refused new requests: a
-  paced move already dispatched ran to its end. Now `serve` always passes a
-  monitor (3 s staleness, from the pendant integration spec), with no switch to
-  turn it off. A watchdog thread ticks it every 0.1 s for as long as the app is
-  served, and the moment it leaves READY (a stale heartbeat, or the in-process
-  ESTOP wire) the gateway sends every actuator that declares `stop_capabilities`
-  its stop, once per trip, as itself: no bearer, no gate. For
-  so-arm101-actuator that is `arm.estop` (latch, end a paced move at its next
-  setpoint, hold the pose in software). Each of those stops is recorded in the
-  audit chain and the export as `safety_stop: ...`. An actuator that declares no
-  stop cannot be stopped this way, and the log says so (`safety_stop: ...
-  nothing was told to stop`). `make_app` without a monitor still works, for
-  tests and embedders, and logs `no_safety_monitor` as a warning.
-- **A heartbeat alone still never resumes.** Resume is `POST /v1/safety/clear`
-  at the `commission` tier (`SafetyMonitor.clear`'s existing rule), and it is
-  refused while the heartbeat is stale, so a clear cannot drop straight back
-  into `safe_stop`. The clear is audited with the credential's `caller` and
-  `tier`, allowed or refused. The actuator keeps its own latch: so-arm101 needs
-  `arm.estop.clear` at commission tier as well.
-- **A declared stop gets through a tripped gateway.** The safety-state check
-  runs before every other gate, and it refused every request outside READY,
-  the stop tools included. A tool some actuator declares in `stop_capabilities`
-  now passes it in every state, and nothing else does: not the clear, not a
-  read. The stop still passes every other gate, and the actuator it is routed
-  to must declare it (`arm.estop` sent to a camera is refused as
-  `safety_state`).
+- **`serve` runs a safety monitor, always, and starts held.** `make_app` has
+  taken a `SafetyMonitor` since Plan 6 Phase 4, but the `serve` path never
+  passed one, so a deployed gateway had no heartbeat staleness rule (SF-002) at
+  all. Now `serve` always passes one (3 s staleness, from the pendant
+  integration spec), with no switch to turn it off, and it starts in
+  `safe_stop` with no heartbeat: a gateway that starts or restarts refuses
+  everything but a declared stop until a supervisor's heartbeats and a
+  commission clear arm it. A restart used to resume a tripped robot. `make_app`
+  without a monitor still works, for tests and embedders, and logs
+  `no_safety_monitor` as a warning.
+- **A tripped gateway stops the machine, and nothing on that path can cancel
+  the stop.** Where a monitor was wired, only an incoming request ever ticked
+  it, and entering `safe_stop` only refused new requests: a paced move already
+  dispatched ran to its end. Now a watchdog thread ticks it every 0.1 s, and
+  every move into `safe_stop` or `estop_active` (including from one to the
+  other) sends every actuator that declares `stop_capabilities` its stop, as
+  the gateway: no bearer, no gate, tier `read`, the pinned manifest or none.
+  What to stop and the robot's RRN are resolved at startup, so a damaged
+  ROBOT.md cannot cancel a stop. Each stop runs on its own thread with a 10 s
+  timeout, so a hung bus delays no other stop and does not stop the watchdog,
+  and a stop whose thread could not start is retried. The trip, each stop and
+  each timeout are recorded (`safety_trip:`, `safety_stop:`,
+  `safety_stop_timeout:`), with the caller of the last heartbeat. A watchdog
+  that dies or stops ticking for 1 s puts the gateway in `safe_stop`, and the
+  heartbeat and the clear answer 503 rather than 200.
+- **The heartbeat is accepted only from a supervisor credential.** Any bearer
+  could send it, the agent's own included, so the thing being supervised could
+  keep its supervision alive. A `bearers.yaml` entry with `role: supervisor`
+  (read tier, nothing more) is now the only credential the heartbeat takes. The
+  gateway refuses to start if a supervisor entry has another tier, or if one
+  token is listed twice.
+- **A clear is held to more.** `POST /v1/safety/clear` first sends any stop not
+  yet sent, and answers 409 while a stop of the last trip has neither answered
+  nor timed out, 503 while the watchdog is not ticking, 403 while the heartbeat
+  is stale or before any has arrived, and 403 below the commission tier. Where
+  `ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE` is on, its body must be a signed
+  `ESTOP_CLEAR` envelope with a fresh `timestamp_ms`, an unseen `msg_id` and a
+  key that is not revoked. Allowed or refused, it is recorded like any decision:
+  the audit chain, a signed receipt, and an export line. A heartbeat alone still
+  never resumes, and the actuator keeps its own latch (so-arm101:
+  `arm.estop.clear`, commission).
+- **An allowlisted, declared stop from a known credential always passes.** A
+  tool that the receiving actuator declares in `stop_capabilities` takes a path
+  of its own: it passes in every state, is judged as `SAFETY` whatever scope the
+  envelope carries (a read bearer's `arm.estop` with scope `actuate` was a 403),
+  and is not refused for its signature, freshness, revocation or replay. A
+  replayed stop is processed and recorded as `REPLAY_DETECTED`, and the key
+  registry is never consulted for a stop. The actuator gets the pinned manifest
+  or none. A stop still needs a bearer the gateway knows, the operator's
+  allowlist and per-tool tiers.
+- **A request is checked against the safety state again just before dispatch.**
+  The gates can take seconds (a key fetched on a cold cache), and a request
+  admitted in READY was dispatched after a trip in that time.
+- **What actuators declare is checked at startup.** A tool declared both as a
+  stop and as a motion refuses to start the gateway. An actuator whose own
+  declared tiers would refuse its stop at tier `read` gets a `stop_unreachable`
+  error and every motion through it is refused. An actuator that declares no
+  stop is logged as `no_declared_stop`.
+- **A damaged ROBOT.md is a signed deny, never a 500.** A non-UTF-8 byte, a
+  frontmatter or `metadata:` that is not a mapping, a signature footer that is
+  not base64, and a `safety.hitl_gates` of the wrong shape each escaped as an
+  exception.
 - **A driver's refusal is recorded as a deny.** An actuator answering
   `outcome_kind="denied"` reached the caller as a signed 403 (`actuator_policy`)
   but was recorded as `decision="allow"`, `reason="ok"`, and signed with
@@ -48,17 +80,28 @@
   `anon`, and the actuator section of `bearers.yaml` was never read either. The
   unit now passes `--bearers /etc/robot-md-dispatcher/bearers.yaml` and refuses
   to start without the file (`AssertPathExists=`). A missing or empty file stops
-  the gateway at startup. `install.sh` creates the file if there is none, through
-  the new `systemd/create-bearers.sh`: one generated actuate-tier token, mode
-  0600, owned by the `robot` service user, never printed, never overwriting an
-  existing file. It used to write a comment-only file, mode 0640. `bearers.yaml`
-  and `dispatch-test.sh` are now in `.gitignore`.
+  the gateway at startup. `install.sh` creates the file if there is none,
+  through the new `systemd/create-bearers.sh`: a generated actuate token and a
+  generated supervisor token, no commission token, `root:robot` 0640, never
+  printed, never overwriting an existing file (the name is taken with link(2)).
+  It used to write a comment-only file, mode 0640. `bearers.yaml` and
+  `dispatch-test.sh` are now in `.gitignore`.
+- **A placeholder token no longer loads as a credential.** robot-md's installer
+  wrote `REPLACE-WITH-MINTED-TOKEN`; with a tier added by hand the gateway
+  accepted it, at that tier. `BearerStore.from_yaml` now refuses empty and
+  placeholder tokens, and warns (`weak_bearer_token`) on one shorter than 16
+  characters.
 
 ### Added
 
-- `POST /v1/safety/heartbeat` (any known bearer; never anon) and
-  `POST /v1/safety/clear` (commission tier, fresh heartbeat). Both answer 404 on
-  a gateway built without a monitor. The ESTOP wire stays off HTTP.
+- `POST /v1/safety/heartbeat` (supervisor credential only) and
+  `POST /v1/safety/clear` (commission tier, fresh heartbeat, and a signed
+  `ESTOP_CLEAR` body where signatures are required). Both answer 404 on a
+  gateway built without a monitor. The ESTOP wire stays off HTTP.
+- `role: supervisor` in `bearers.yaml`.
+- `make_app(clock=...)`, the clock heartbeat staleness and stop timeouts are
+  judged on, and `app.state.safety_tick()`, one synchronous tick, for tests and
+  in-process integrations.
 
 ### Fixed
 
@@ -68,19 +111,27 @@
   The service could therefore open nothing in it, `ROBOT.md` included. The unit
   now adds `SupplementaryGroups=robot`. Found while adding `--bearers`, which
   would otherwise have stopped the gateway at startup on every install.
+- A recorded allow with no actuator outcome (a clear) is now signed; signing
+  one used to raise, so it went out unattested.
 
 ### Operators will notice
 
-- **A served gateway needs a heartbeat.** With nothing sending one, it enters
-  `safe_stop` 3 s after it starts and stops every actuator that declares a
-  stop (so-arm101 latches). Send `POST /v1/safety/heartbeat` at least every 3 s
-  from the client that supervises the robot, not from the robot itself. After
-  a trip: heartbeats, then `POST /v1/safety/clear` (commission), then the
-  actuator's own clear (`arm.estop.clear`, commission, allowlisted). The
-  HIL PHASE-5 harness and any other client that drives a served gateway needs
-  a heartbeat running alongside it.
+- **A served gateway starts held, every time.** After each start: heartbeats
+  from the supervisor credential, then `POST /v1/safety/clear` at the commission
+  tier. `bearers.yaml` needs a supervisor entry and a commission entry for that;
+  a fresh `install.sh` creates the supervisor entry, and the commission one is
+  added by hand. A file made by `robot-md-gateway init` has neither.
+- **Then it needs a heartbeat**, at least every 3 s, from the supervising
+  person's device: not the agent's host and not the robot. Without one it trips
+  and stops every actuator that declares a stop (so-arm101 latches). After a
+  trip: heartbeats, then the clear, then the actuator's own clear
+  (`arm.estop.clear`, commission, allowlisted). The HIL PHASE-5 harness and any
+  other client that drives a served gateway needs a supervisor heartbeat
+  running alongside it.
+- **A stop needs a bearer the gateway knows.** One with no bearer, or an
+  unknown one, is now refused, signed and recorded.
 - **The systemd unit needs its bearer file.** A fresh `install.sh` creates
-  one; read the generated token with `sudo cat` (README, "Bearer tokens").
+  one; read the generated tokens with `sudo cat` (README, "Bearer tokens").
   An install from before this release kept its comment-only `bearers.yaml`.
   The installer leaves an existing file alone, so the gateway refuses to start
   until that file has at least one entry.
