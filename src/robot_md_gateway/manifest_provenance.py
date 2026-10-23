@@ -50,7 +50,9 @@ class ManifestProvenanceResult:
 def verify_manifest(path: Path, *, resolver: RRFResolver) -> ManifestProvenanceResult:
     try:
         text = path.read_text()
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError covers UnicodeDecodeError: one non-UTF-8 byte in a
+        # hand-edited ROBOT.md used to escape as a 500 (review of #35, finding 1).
         # An unreadable manifest_path is a caller-supplied value: a missing file,
         # a directory, or an empty string must fail closed as an audited, signed
         # DENY — never an unhandled 500, which yields no receipt and no audit
@@ -66,7 +68,12 @@ def verify_manifest(path: Path, *, resolver: RRFResolver) -> ManifestProvenanceR
             reason="no ROBOT-MD-SIG footer (signature absent)",
         )
     kid = match.group("kid")
-    sig = base64.b64decode(match.group("sig"))
+    try:
+        sig = base64.b64decode(match.group("sig"))
+    except ValueError:  # binascii.Error: bad padding in a hand-edited footer
+        return ManifestProvenanceResult(
+            accepted=False, kid=kid, reason="signature is not valid base64",
+        )
     body = text[: match.start()].encode("utf-8")
 
     pub_pem = resolver.resolve_public_key_pem(kid)

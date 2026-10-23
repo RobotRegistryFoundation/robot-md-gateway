@@ -37,8 +37,11 @@ import threading
 import time
 import uuid
 import weakref
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import anyio
 import yaml
@@ -104,6 +107,46 @@ SAFETY_TICK_S = 0.1
 #: to read, actuate and commission) and nothing on this path may need more.
 SAFETY_STOP_TIER = "read"
 
+#: The watchdog counts as stuck when it has not ticked for this long, in real
+#: time. A stuck watchdog fails closed: the gateway enters SAFE_STOP and sends
+#: its stops, and the heartbeat stops answering 200 (review of #35, finding 6).
+WATCHDOG_STALE_S = 1.0
+
+#: How long the gateway waits for one actuator's stop to answer before it
+#: records that stop as failed and stops waiting for it. Each stop runs on a
+#: thread of its own, so a slow or hung stop delays nothing else; this bounds
+#: only how long a clear is refused on its account. so-arm101-actuator can wait
+#: STOP_BUS_WAIT_S (5 s) for its bus before it answers.
+STOP_TIMEOUT_S = 10.0
+
+
+@dataclass
+class _StopSend:
+    """One actuator's stop for one trip: what the gateway sends, and how it went."""
+
+    name: str
+    actuator: object
+    config: dict
+    tool: str
+    msg_id: str
+    status: str = "pending"        # pending -> running -> done, or running -> timed_out
+    started: float | None = None   # the app's clock() when its thread started
+
+
+@dataclass
+class _Trip:
+    """One departure from READY, and the stops the gateway owes for it."""
+
+    seq: int
+    state: GatewayState
+    why: str
+    sends: list[_StopSend]
+
+    def settled(self) -> bool:
+        """Every stop has answered, or the gateway has stopped waiting for it."""
+        return all(s.status in ("done", "timed_out") for s in self.sends)
+
+
 # Manifest frontmatter cache keyed by path -> (mtime, frontmatter dict). Used by the
 # RRN-binding (B4) and manifest-driven HiTL (B3) gates so they read the manifest's
 # metadata.rrn / safety.hitl_gates without re-parsing on every invoke; refreshes when
@@ -126,8 +169,14 @@ def _manifest_frontmatter(path: str) -> dict:
             end = text.find("\n---", 3)
             if end != -1:
                 fm = yaml.safe_load(text[3:end]) or {}
-    except (OSError, yaml.YAMLError):
+    except Exception:
+        # NOTHING ESCAPES THIS. It used to catch only OSError and YAMLError, so
+        # one non-UTF-8 byte (UnicodeDecodeError) in a hand-edited ROBOT.md
+        # raised out of the gateway's own trip path and cancelled its stop
+        # (review of #35, finding 1). An unreadable manifest reads as empty.
         fm = {}
+    if not isinstance(fm, dict):
+        fm = {}  # frontmatter that is a string or a list is no frontmatter
     _MANIFEST_FM_CACHE[path] = (mtime, fm)
     return fm
 
@@ -182,7 +231,12 @@ def make_app(
     actuator_configs: dict[str, dict] | None = None,
     signing_identity: SigningIdentity | None = None,
     attestation_export_file: Path | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> FastAPI:
+    # The clock heartbeat staleness and the stop timeout are judged on:
+    # time.monotonic, unless a test passes a fake one. Whether the watchdog
+    # itself is still ticking is always judged in real time.
+    clock = clock or time.monotonic
     if tool_allowlist is None:
         tool_allowlist = _DEFAULT_ALLOWLIST
     tool_tier_requirements = tool_tier_requirements or {}
@@ -261,6 +315,25 @@ def make_app(
         for a in ([*actuators.values()] if multi_actuator_mode else [actuator])
         if a is not None
     ))
+    # Each actuator that declares a stop, and the stop the gateway sends it on a
+    # trip: (name, actuator, config, tool), resolved ONCE, here. The trip path
+    # reads nothing that can fail at the moment it matters, not ROBOT.md and
+    # not a declaration (review of #35, finding 1).
+    _stop_targets: list[tuple[str, object, dict, str]] = []
+    for _name, _act in (sorted(actuators.items()) if multi_actuator_mode
+                        else [(getattr(actuator, "name", "actuator"), actuator)]):
+        _declared = sorted(as_tool_set(getattr(_act, "stop_capabilities", None)))
+        if _declared:
+            _config = actuator_configs.get(_name, {}) if multi_actuator_mode else actuator_config
+            _stop_targets.append((_name, _act, _config, _declared[0]))
+    # The robot's RRN for the gateway's own records (trips, stops, clears),
+    # read once from the pinned manifest. Best effort: "" if it cannot be read.
+    _pinned_rrn = ""
+    if pinned_manifest_path is not None:
+        _fm0 = _manifest_frontmatter(str(pinned_manifest_path))
+        _md0 = _fm0.get("metadata")
+        _pinned_rrn = str((_md0.get("rrn") if isinstance(_md0, dict) else None)
+                          or _fm0.get("rrn") or "")
     _stop_lane: list = [None, None]          # (weakref to the event loop, its limiter)
 
     def _stop_limiter() -> anyio.CapacityLimiter:
@@ -327,12 +400,17 @@ def make_app(
             target=_safety_watchdog, args=(stopping,),
             name="robot-md-gateway-safety-watchdog", daemon=True,
         )
+        # Registered so that a watchdog which dies or stops ticking is noticed
+        # by every request and every heartbeat, and fails closed.
+        _safety.last_tick = time.monotonic()
+        _safety.watchdog = watchdog
         watchdog.start()
         try:
             yield
         finally:
             stopping.set()
             watchdog.join(timeout=5)
+            _safety.watchdog = None
 
     app = FastAPI(title="robot-md-gateway", version="0.4.0a1", lifespan=_lifespan)
     # Operators access these via app.state for ESTOP wire integration and
@@ -381,9 +459,14 @@ def make_app(
         """
         if signing_identity is None:
             return None, "unattested"
+        # An allow with no actuator outcome is something the gateway did itself,
+        # with no actuator call that could fail (a safety clear): ok, unless an
+        # error_kind says it failed (a stop that never answered). Signing one
+        # used to raise on `outcome.error_message`, so it went out unattested.
         status = outcome_status(
             decision=decision,
-            success=(outcome.success if outcome is not None else None),
+            success=(outcome.success if outcome is not None
+                     else decision == "allow" and error_kind is None),
             error_kind=error_kind,
         )
         error: dict | None = None
@@ -392,6 +475,8 @@ def make_app(
                 # reason is "<gate>: <detail>"; the gate name is the error kind.
                 kind = reason.split(":", 1)[0].strip() or "denied"
                 error = {"kind": kind, "message": reason}
+            elif outcome is None:
+                error = {"kind": error_kind, "message": reason}
             elif error_kind is not None:
                 error = {"kind": error_kind, "message": outcome.error_message or ""}
             else:  # clean actuator failure
@@ -679,117 +764,231 @@ def make_app(
     # Refusing new requests is not stopping the machine. A paced move already
     # dispatched keeps going, and a goal an actuator holds stays set, until the
     # actuator is told to stop. So every time the monitor leaves READY (stale
-    # heartbeat, ESTOP wire) the gateway sends each actuator that declares one
-    # its own stop tool, once per trip, whether or not any request is arriving.
+    # heartbeat, ESTOP wire, a stuck watchdog) the gateway sends each actuator
+    # in `_stop_targets` its own stop, whether or not any request is arriving.
     #
-    # `_safety_seen` is the state this gateway last acted on. Reading it and
-    # ticking the monitor happen under one lock, so a watchdog tick and a
-    # request tick racing over the same transition send one stop, not two.
+    # How a trip is handled, and why each part is the way it is:
+    # - Observing the state and starting the stops happen under one lock, and
+    #   so does a clear, which first acts on any trip not yet acted on. A clear
+    #   can never discard a trip whose stops were not sent (finding 5).
+    # - Each stop runs on a thread of its own. A stop that hangs (a serial
+    #   write with no timeout) delays no other actuator's stop and does not
+    #   wedge the watchdog (finding 6). After STOP_TIMEOUT_S the gateway records
+    #   it as failed and stops waiting for it.
+    # - A trip is handled when every stop has answered or timed out, not when
+    #   it was noticed. A stop whose thread could not start is still owed and
+    #   is tried again on the next tick (finding 1).
+    # - Nothing on this path parses ROBOT.md or anything else that can fail:
+    #   the targets and the RRN were resolved when the app was built.
+    # - Records are written after the lock is released, and writing one never
+    #   raises: evidence must never be the thing that stops a stop.
     _safety_lock = threading.Lock()
-    _safety_seen: list = [safety_monitor.state if safety_monitor is not None else None]
+    _safety = SimpleNamespace(
+        seen=safety_monitor.state if safety_monitor is not None else None,
+        trip=None,              # the current _Trip, until a clear ends it
+        trips=0,
+        watchdog=None,          # the watchdog thread while the app is served
+        last_tick=0.0,          # time.monotonic() of the watchdog's last tick
+        last_heartbeat=None,    # (caller, clock()) of the last accepted heartbeat
+    )
 
-    def _safety_check() -> GatewayState:
-        """Tick the monitor; if it has just left READY, stop the actuators.
+    def _watchdog_stuck() -> bool:
+        """True when the watchdog of a served app has died or stopped ticking.
+        An app that is not being served (no lifespan) has no watchdog; its
+        requests tick the monitor themselves."""
+        watchdog = _safety.watchdog
+        if watchdog is None:
+            return False
+        return (not watchdog.is_alive()
+                or time.monotonic() - _safety.last_tick > WATCHDOG_STALE_S)
 
-        Called by the watchdog every SAFETY_TICK_S and by every request.
-        Returns the state the caller should act on.
-        """
-        with _safety_lock:
-            safety_monitor.tick()
-            state = safety_monitor.state
-            age = time.monotonic() - safety_monitor.last_heartbeat_at
-            left_ready = _safety_seen[0] is GatewayState.READY and state is not GatewayState.READY
-            _safety_seen[0] = state
-        if left_ready:
-            if state is GatewayState.SAFE_STOP:
-                why = (f"no heartbeat for {age:.1f} s, limit "
-                       f"{safety_monitor.heartbeat_staleness_s:g} s")
+    def _trip_reason(state: GatewayState, stuck: bool) -> str:
+        if stuck:
+            return f"the safety watchdog has not ticked for over {WATCHDOG_STALE_S:g} s"
+        if state is GatewayState.SAFE_STOP:
+            age = clock() - safety_monitor.last_heartbeat_at
+            last = _safety.last_heartbeat
+            source = (f"; the last one came from supervisor {last[0]!r}" if last
+                      else "; no heartbeat had been accepted")
+            return (f"no heartbeat for {age:.1f} s, limit "
+                    f"{safety_monitor.heartbeat_staleness_s:g} s{source}")
+        return "ESTOP wire tripped"
+
+    def _observe_locked(records: list) -> GatewayState:
+        """Tick the monitor and act on a change of state. Caller holds the lock."""
+        safety_monitor.tick(now=clock())
+        stuck = _watchdog_stuck()
+        if stuck and safety_monitor.state is GatewayState.READY:
+            safety_monitor.state = GatewayState.SAFE_STOP
+        state = safety_monitor.state
+        prev = _safety.seen
+        if state is not prev:
+            _safety.seen = state
+            if state is not GatewayState.READY:
+                # Every move into a stopped state sends the stops, SAFE_STOP ->
+                # ESTOP_ACTIVE included: an ESTOP is never absorbed by an
+                # earlier trip whose stop may have failed.
+                _safety.trips += 1
+                trip = _Trip(
+                    seq=_safety.trips, state=state, why=_trip_reason(state, stuck),
+                    sends=[_StopSend(name=n, actuator=a, config=c, tool=t,
+                                     msg_id=f"safety-stop-{uuid.uuid4().hex[:12]}")
+                           for n, a, c, t in _stop_targets],
+                )
+                _safety.trip = trip
+                records.append(("trip", prev, trip))
             else:
-                why = "ESTOP wire tripped"
-            _stop_actuators(state, why)
+                records.append(("state", prev, state))
         return state
 
-    def _stop_actuators(state: GatewayState, why: str) -> None:
-        """Send every actuator that declares a stop its stop, as the gateway.
-
-        No caller credential is involved and no gate is consulted: the
-        allowlist and the tiers decide what a CALLER may do, and nothing may
-        decide that the gateway cannot stop its own machine. Each actuator gets
-        the first of its `stop_capabilities` (sorted, so it is the same one on
-        every run). What the stop does is the actuator's: so-arm101-actuator's
-        `arm.estop` latches, ends a paced move at its next setpoint and holds
-        the pose, in software.
-
-        Never raises. A stop that fails is logged and recorded, and the next
-        actuator is still stopped. An actuator that declares no stop cannot be
-        stopped from here, and the log says exactly that rather than implying
-        otherwise; the gateway still refuses it every request but its stop.
-        """
-        log = logging.getLogger(__name__)
-        pairs = (sorted(actuators.items()) if multi_actuator_mode
-                 else [(getattr(actuator, "name", "actuator"), actuator)])
-        targets = []
-        for name, act in pairs:
-            stops = sorted(as_tool_set(getattr(act, "stop_capabilities", None)))
-            if stops:
-                config = actuator_configs.get(name, {}) if multi_actuator_mode else actuator_config
-                targets.append((name, act, config, stops[0]))
-        if not targets:
-            log.error(
-                "safety_stop: gateway entered %s (%s), and no actuator declares a "
-                "stop tool, so nothing was told to stop. New requests are refused "
-                "until an operator clears it.", state.value, why,
-            )
+    def _advance_locked(records: list) -> None:
+        """Start the current trip's stops that have not started, and stop
+        waiting for any that has not answered in STOP_TIMEOUT_S. Caller holds
+        the lock."""
+        trip = _safety.trip
+        if trip is None:
             return
-        fm = _manifest_frontmatter(str(pinned_manifest_path)) if pinned_manifest_path else {}
-        rrn = (fm.get("metadata") or {}).get("rrn") or fm.get("rrn") or ""
-        for name, act, config, tool in targets:
-            msg_id = f"safety-stop-{uuid.uuid4().hex[:12]}"
-            stop_envelope = {
-                "msg_id": msg_id, "type": "rcan/v1/invoke", "scope": "SAFETY",
-                "tool_name": tool, "tool_args": {}, "actuator_name": name,
-                "manifest_path": str(pinned_manifest_path or ""),
-            }
-            started = datetime.now(tz=timezone.utc).isoformat()
-            try:
-                outcome = act.execute(
-                    envelope=stop_envelope, manifest_path=pinned_manifest_path,
-                    tier=SAFETY_STOP_TIER, config=config,
+        for send in trip.sends:
+            if send.status == "pending":
+                thread = threading.Thread(
+                    target=_send_stop, args=(trip, send),
+                    name=f"robot-md-gateway-stop-{send.name}", daemon=True,
                 )
-                error_kind: str | None = None
-            except Exception as exc:
-                outcome = ActuatorOutcome(
-                    success=False, outcome_kind="error", error_message=str(exc),
-                )
-                error_kind = type(exc).__name__
-            ended = datetime.now(tz=timezone.utc).isoformat()
+                send.status, send.started = "running", clock()
+                try:
+                    thread.start()
+                except Exception:
+                    # No thread (resource exhaustion): the stop is still owed,
+                    # and the next tick tries again.
+                    send.status, send.started = "pending", None
+                    logging.getLogger(__name__).exception(
+                        "safety_stop: could not start the stop for %r; retrying on the "
+                        "next tick", send.name,
+                    )
+            elif send.status == "running" and clock() - send.started > STOP_TIMEOUT_S:
+                send.status = "timed_out"
+                records.append(("timeout", trip, send))
+
+    def _send_stop(trip: _Trip, send: _StopSend) -> None:
+        """On its own thread: send one actuator its stop, as the gateway, and
+        record what it answered. No caller credential is involved and no gate is
+        consulted: the allowlist and the tiers decide what a CALLER may do, and
+        nothing may decide that the gateway cannot stop its own machine. The
+        manifest passed is the pinned one, never one a request named."""
+        started = datetime.now(tz=timezone.utc).isoformat()
+        envelope = {
+            "msg_id": send.msg_id, "type": "rcan/v1/invoke", "scope": "SAFETY",
+            "tool_name": send.tool, "tool_args": {}, "actuator_name": send.name,
+            "manifest_path": str(pinned_manifest_path or ""),
+        }
+        error_kind: str | None = None
+        try:
+            outcome = send.actuator.execute(
+                envelope=envelope, manifest_path=pinned_manifest_path,
+                tier=SAFETY_STOP_TIER, config=send.config,
+            )
+            if not isinstance(outcome, ActuatorOutcome):
+                raise TypeError(f"execute returned {type(outcome).__name__}, not an outcome")
+        except Exception as exc:
+            outcome = ActuatorOutcome(success=False, outcome_kind="error",
+                                      error_message=f"{type(exc).__name__}: {exc}")
+            error_kind = type(exc).__name__
+        with _safety_lock:
+            late = send.status == "timed_out"
+            send.status = "done"
+        log = logging.getLogger(__name__)
+        try:
             refused = not outcome.success and outcome.outcome_kind == "denied"
-            reason = f"safety_stop: gateway {state.value} ({why}); sent {tool} to {name}"
+            reason = (f"safety_stop: trip {trip.seq} ({trip.state.value}: {trip.why}); "
+                      f"sent {send.tool} to {send.name}")
+            if late:
+                reason += (f"; it answered after the gateway stopped waiting "
+                           f"({STOP_TIMEOUT_S:g} s)")
             if not outcome.success:
                 reason += f"; it did not succeed: {outcome.error_message}"
             (log.warning if outcome.success else log.error)(
                 "%s (outcome: %s)", reason, outcome.outcome_kind,
             )
+            _record_with_outcome(
+                decision="deny" if refused else "allow", reason=reason,
+                kid=None, msg_id=send.msg_id, outcome=outcome, error_kind=error_kind,
+                actuator_name=send.name, envelope_dict=envelope, ruri=None,
+                rrn=_pinned_rrn, started_at=started,
+                ended_at=datetime.now(tz=timezone.utc).isoformat(),
+                caller=None, tier=None,
+            )
+        except Exception:
+            log.warning("safety_stop: recording the stop for %r failed (non-fatal)",
+                        send.name, exc_info=True)
+
+    def _write_safety_records(records: list) -> None:
+        """Record trips, other state changes and stop timeouts. Never raises."""
+        log = logging.getLogger(__name__)
+        for kind, first, second in records:
             try:
+                error_kind = None
+                if kind == "trip":
+                    prev, trip = first, second
+                    if trip.sends:
+                        what = "sending " + ", ".join(f"{s.tool} to {s.name}"
+                                                      for s in trip.sends)
+                    else:
+                        what = "no actuator declares a stop, so nothing was told to stop"
+                    reason = (f"safety_trip: {prev.value} -> {trip.state.value} "
+                              f"({trip.why}); {what}")
+                    msg_id, decision = f"safety-trip-{trip.seq}", "deny"
+                    (log.warning if trip.sends else log.error)("%s", reason)
+                elif kind == "state":
+                    # Back to READY by some path other than /v1/safety/clear
+                    # (which records itself): an embedder calling
+                    # SafetyMonitor.clear directly, say.
+                    prev, state = first, second
+                    reason = (f"safety_transition: {prev.value} -> {state.value} "
+                              f"(not through /v1/safety/clear)")
+                    msg_id = f"safety-transition-{uuid.uuid4().hex[:12]}"
+                    decision = "allow" if state is GatewayState.READY else "deny"
+                    log.warning("%s", reason)
+                else:  # "timeout": a fault, not a decision
+                    trip, send = first, second
+                    reason = (f"safety_stop_timeout: trip {trip.seq}: {send.tool} to "
+                              f"{send.name} did not answer within {STOP_TIMEOUT_S:g} s; "
+                              f"the gateway stopped waiting for it")
+                    msg_id, decision = f"{send.msg_id}-timeout", "allow"
+                    error_kind = "StopTimeout"
+                    log.error("%s", reason)
                 _record_with_outcome(
-                    decision="deny" if refused else "allow", reason=reason,
-                    kid=None, msg_id=msg_id, outcome=outcome, error_kind=error_kind,
-                    actuator_name=name, envelope_dict=stop_envelope, ruri=None,
-                    rrn=rrn, started_at=started, ended_at=ended, caller=None, tier=None,
+                    decision=decision, reason=reason, kid=None, msg_id=msg_id,
+                    error_kind=error_kind,
+                    envelope_dict={"msg_id": msg_id, "type": "SAFETY"}, ruri=None,
+                    rrn=_pinned_rrn, started_at=datetime.now(tz=timezone.utc).isoformat(),
+                    caller=None, tier=None,
                 )
             except Exception:
-                log.warning("safety_stop: recording the stop failed (non-fatal)",
-                            exc_info=True)
+                log.warning("safety: recording a %s failed (non-fatal)", kind, exc_info=True)
+
+    def _safety_check() -> GatewayState:
+        """Tick the monitor, act on any trip, and return the state to act on.
+        Called by the watchdog every SAFETY_TICK_S and by every request."""
+        records: list = []
+        with _safety_lock:
+            state = _observe_locked(records)
+            _advance_locked(records)
+        _write_safety_records(records)
+        return state
 
     def _safety_watchdog(stopping: threading.Event) -> None:
         """Tick the monitor while the app is served, requests or none."""
         while not stopping.wait(SAFETY_TICK_S):
+            _safety.last_tick = time.monotonic()
             try:
                 _safety_check()
             except Exception:
                 logging.getLogger(__name__).exception(
                     "safety_watchdog: a tick failed; the next runs in %.1f s", SAFETY_TICK_S,
                 )
+
+    # For tests and in-process integrations: one synchronous tick.
+    app.state.safety_tick = _safety_check
 
     def _dispatch(
         *,
@@ -1098,7 +1297,9 @@ def make_app(
         # Hoisted so the emitter has the robot's authoritative RRN on the allow
         # path and all POST-manifest denies, independent of the rrn-binding toggle.
         _fm = _manifest_frontmatter(envelope.manifest_path)
-        manifest_rrn = (_fm.get("metadata") or {}).get("rrn") or _fm.get("rrn") or ""
+        _md = _fm.get("metadata")
+        manifest_rrn = str((_md.get("rrn") if isinstance(_md, dict) else None)
+                           or _fm.get("rrn") or "")
 
         # MF-003 — RRN binding (flagged). Bind the envelope identity to the robot's
         # registered RRN so a correctly-signed envelope for robot A can't actuate B.
@@ -1188,8 +1389,23 @@ def make_app(
         effective_hitl = hitl_policy
         if hitl_from_manifest:
             fm = _manifest_frontmatter(envelope.manifest_path)
-            gates = (fm.get("safety") or {}).get("hitl_gates")
-            effective_hitl = HiTLPolicy.from_manifest_gates(gates)
+            safety_block = fm.get("safety") or {}
+            try:
+                gates = safety_block.get("hitl_gates")
+                effective_hitl = HiTLPolicy.from_manifest_gates(gates)
+            except (AttributeError, TypeError):
+                # A safety block or hitl_gates that is not the declared shape:
+                # fail closed with a signed deny, never a 500 and never "no
+                # gates".
+                reason = "the manifest's safety.hitl_gates could not be read"
+                signed, marker = _record(
+                    "deny", f"hitl_required: {reason}", manifest_result.kid,
+                    envelope.msg_id, envelope_dict=envelope_dict, ruri=envelope.ruri,
+                    rrn=manifest_rrn, started_at=started_at, caller=caller, tier=tier,
+                )
+                detail = {"deny": "hitl_required", "reason": reason}
+                _attach_signature(detail, signed, marker)
+                raise HTTPException(status_code=403, detail=detail) from None
         if effective_hitl is not None:
             ok, reason = check_hitl(envelope_dict, effective_hitl, motion=is_motion)
             if not ok:
@@ -1384,8 +1600,12 @@ def make_app(
         keep its own heartbeat alive. It only keeps a READY gateway READY: it
         never resumes a tripped one. Runs on the event loop, not the worker
         pool, so a flood of blocking requests does not starve it.
+
+        A heartbeat is answered 503, never 200, while the safety watchdog is not
+        ticking, and that same check puts the gateway in SAFE_STOP: a supervisor
+        must never be told all is well by a gateway that has stopped enforcing.
         """
-        tier, _caller = _known_principal(authorization)
+        tier, caller = _known_principal(authorization)
         monitor = _require_monitor()
         if authorization[7:] not in _supervisors:
             raise HTTPException(status_code=403, detail={
@@ -1394,7 +1614,16 @@ def make_app(
                           "(role: supervisor in bearers.yaml), which cannot move the "
                           f"robot; this credential holds the {tier} tier",
             })
-        monitor.on_heartbeat()
+        if _watchdog_stuck():
+            state = _safety_check()        # fails closed: SAFE_STOP, and the stops go out
+            raise HTTPException(status_code=503, detail={
+                "deny": "safety_watchdog",
+                "reason": f"the safety watchdog has not ticked for over "
+                          f"{WATCHDOG_STALE_S:g} s; the gateway is in {state.value}",
+            })
+        now = clock()
+        monitor.on_heartbeat(now=now)
+        _safety.last_heartbeat = (caller, now)
         return {"state": monitor.state.value,
                 "heartbeat_staleness_s": monitor.heartbeat_staleness_s}
 
@@ -1402,12 +1631,18 @@ def make_app(
     def safety_clear(authorization: str | None = Header(default=None)):
         """The operator's resume signal, after a safe-stop or an ESTOP.
 
-        Two conditions, both kept from the existing design: SafetyMonitor.clear
-        needs the `commission` tier, and recovery needs FRESH heartbeats (the
-        pendant integration spec's staleness rule). A clear sent while the
-        heartbeat is stale is refused rather than allowed to drop straight back
-        into SAFE_STOP on the next tick. Allowed or refused, it is audited with
-        the credential that sent it.
+        Conditions, in the order they are checked, all under the safety lock:
+        - Any trip not yet acted on is acted on first: its stops are sent before
+          anything is cleared. While a stop of the last trip has neither
+          answered nor timed out, the clear is refused with 409 (finding 5).
+        - While the safety watchdog is not ticking, it is refused with 503.
+        - Recovery needs FRESH heartbeats (the pendant integration spec's rule):
+          a clear sent into a silence is refused rather than allowed to drop
+          straight back into SAFE_STOP on the next tick.
+        - SafetyMonitor.clear needs the `commission` tier.
+
+        Allowed or refused, it is recorded like any other decision: the audit
+        chain, a signed receipt on the response, and a line in the export.
 
         It restores the gateway's state only. Each actuator keeps its own latch
         (so-arm101-actuator: `arm.estop.clear`, commission tier), so a resume is
@@ -1416,31 +1651,51 @@ def make_app(
         tier, caller = _known_principal(authorization)
         monitor = _require_monitor()
         msg_id = f"safety-clear-{uuid.uuid4().hex[:12]}"
-        age = time.monotonic() - monitor.last_heartbeat_at
-        if age > monitor.heartbeat_staleness_s:
-            reason = (
-                f"safety.clear: refused, the last heartbeat was {age:.1f} s ago "
-                f"(limit {monitor.heartbeat_staleness_s:g} s); send heartbeats, then clear"
-            )
-            if audit_chain is not None:
-                audit_chain.append(AuditEntry(
-                    msg_id=msg_id, timestamp_ms=int(time.time() * 1000),
-                    decision="deny", decision_reason=reason, envelope_kid=None,
-                    caller=caller, tier=tier,
-                ))
-            raise HTTPException(status_code=403, detail={
-                "deny": "safety_clear", "reason": reason, "state": monitor.state.value,
-            })
+        started_at = datetime.now(tz=timezone.utc).isoformat()
+        records: list = []
+        status = 200
         with _safety_lock:
-            cleared, reason = monitor.clear(
-                tier=tier, audit_chain=audit_chain, msg_id=msg_id, caller=caller,
-            )
-            if cleared:
-                _safety_seen[0] = monitor.state
-        if not cleared:
-            raise HTTPException(status_code=403, detail={
-                "deny": "safety_clear", "reason": reason, "state": monitor.state.value,
-            })
-        return {"state": monitor.state.value, "reason": reason}
+            _observe_locked(records)
+            _advance_locked(records)
+            trip = _safety.trip
+            age = clock() - monitor.last_heartbeat_at
+            if trip is not None and not trip.settled():
+                waiting = ", ".join(f"{s.tool} to {s.name}" for s in trip.sends
+                                    if s.status not in ("done", "timed_out"))
+                status, reason = 409, (
+                    f"safety.clear: refused, the stop for trip {trip.seq} is still being "
+                    f"sent ({waiting}); retry once it has answered"
+                )
+            elif _watchdog_stuck():
+                status, reason = 503, (
+                    f"safety.clear: refused, the safety watchdog has not ticked for over "
+                    f"{WATCHDOG_STALE_S:g} s"
+                )
+            elif age > monitor.heartbeat_staleness_s:
+                status, reason = 403, (
+                    f"safety.clear: refused, the last heartbeat was {age:.1f} s ago "
+                    f"(limit {monitor.heartbeat_staleness_s:g} s); send heartbeats, "
+                    f"then clear"
+                )
+            else:
+                cleared, reason = monitor.clear(tier=tier, msg_id=msg_id, caller=caller)
+                if cleared:
+                    _safety.seen = monitor.state
+                    _safety.trip = None
+                else:
+                    status = 403
+        _write_safety_records(records)
+        signed, marker = _record(
+            "allow" if status == 200 else "deny", reason, None, msg_id,
+            envelope_dict={"msg_id": msg_id, "type": "ESTOP_CLEAR"}, ruri=None,
+            rrn=_pinned_rrn, started_at=started_at, caller=caller, tier=tier,
+        )
+        if status != 200:
+            detail = {"deny": "safety_clear", "reason": reason, "state": monitor.state.value}
+            _attach_signature(detail, signed, marker)
+            raise HTTPException(status_code=status, detail=detail)
+        response = {"state": monitor.state.value, "reason": reason}
+        _attach_signature(response, signed, marker)
+        return response
 
     return app

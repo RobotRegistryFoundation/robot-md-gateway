@@ -40,8 +40,8 @@ class SafetyMonitor:
                           "outcome": "estop preempted"},
             )
 
-    def on_heartbeat(self) -> None:
-        self.last_heartbeat_at = time.monotonic()
+    def on_heartbeat(self, *, now: float | None = None) -> None:
+        self.last_heartbeat_at = now if now is not None else time.monotonic()
         if self.state == GatewayState.SAFE_STOP:
             # Resume requires explicit operator signal, NOT a heartbeat alone.
             pass
