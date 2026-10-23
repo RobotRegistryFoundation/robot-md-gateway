@@ -305,6 +305,7 @@ def main() -> None:
                 load_actuators_section,
             )
             from .cert.audit import AuditChain
+            from .cert.safety import GatewayState, SafetyMonitor
             from .receiver import make_app
 
             tool_allowlist = _build_tool_allowlist_from_env()
@@ -317,6 +318,31 @@ def main() -> None:
             # In-memory audit chain so executed invokes are recorded (and /v1/audit/last
             # works). Restart-wiped by design; persistence is out of scope here.
             audit_chain = AuditChain()
+            # SF-002 IN EVERY SERVED GATEWAY, with no switch to turn it off.
+            #
+            # IT BOOTS HELD (decision G2 in #35). The monitor starts in
+            # SAFE_STOP, so a gateway that starts, or restarts, refuses
+            # everything but a declared stop until an operator clears it: POST
+            # /v1/safety/clear at commission tier, with fresh heartbeats from
+            # the supervisor credential. It used to start READY, so a restart
+            # (systemd's Restart=on-failure, a crash, a reboot) resumed a robot
+            # that had tripped, with no one deciding to: the trip lived only in
+            # memory. It also starts with no heartbeat at all (the last one is
+            # infinitely old), so that clear needs a heartbeat that actually
+            # arrived, not the moment the process started. Once cleared, a
+            # silence of heartbeat_staleness_s (3 s) puts the gateway back in
+            # SAFE_STOP and stops every actuator that declares a stop.
+            # make_app logs `no_safety_monitor` for any app built without one.
+            safety_monitor = SafetyMonitor(
+                state=GatewayState.SAFE_STOP, last_heartbeat_at=float("-inf"),
+            )
+            logging.getLogger("robot_md_gateway.safety").info(
+                "safety monitor on, held: the gateway refuses all but declared stops "
+                "until POST /v1/safety/clear (commission tier, with fresh heartbeats); "
+                "after that, POST /v1/safety/heartbeat (supervisor credential) at "
+                "least every %g s or it enters safe_stop and stops its actuators",
+                safety_monitor.heartbeat_staleness_s,
+            )
 
             from .attestation import load_signing_identity_from_env
 
@@ -367,6 +393,7 @@ def main() -> None:
                     require_rrn_binding=require_rrn_binding,
                     pinned_manifest_path=pinned_manifest_path,
                     audit_chain=audit_chain,
+                    safety_monitor=safety_monitor,
                     actuators=actuators,
                     actuator_configs=actuator_configs,
                     bearers=bearers,
@@ -396,6 +423,7 @@ def main() -> None:
                     require_rrn_binding=require_rrn_binding,
                     pinned_manifest_path=pinned_manifest_path,
                     audit_chain=audit_chain,
+                    safety_monitor=safety_monitor,
                     actuator=actuator_instance,
                     actuator_config=actuator_section["config"],
                     bearers=bearers,

@@ -203,6 +203,24 @@ def test_init_yes_golden_path(
     assert token in test_sh.read_text()
 
 
+def test_next_says_the_gateway_starts_held_and_what_arms_it(
+    tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
+):
+    """Second review of #35, departure (f): `init` writes no supervisor and no
+    commission entry, and a served gateway starts held, so "Next:" says so."""
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/" + cmd)
+    assert init_wizard.run(interactive=False, cwd=tmp_path, force=False,
+                           no_token_stdout=True) == 0
+    out = capsys.readouterr().out
+    after = out[out.index("Next:"):]
+    assert "It starts held (safe_stop) and refuses everything but a stop" in after
+    assert "so that a restart never resumes a robot by itself" in after
+    assert "`role: supervisor` entry" in after and "`tier: commission` entry" in after
+    store = BearerStore.from_yaml(tmp_path / "bearers.yaml")
+    assert not [e for e in store._by_token.values()
+                if e.role == "supervisor" or e.tier == "commission"]
+
+
 def test_no_token_stdout_suppresses_token(
     tmp_path: Path, valid_robot_md: Path, monkeypatch, capsys
 ):

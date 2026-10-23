@@ -40,8 +40,8 @@ class SafetyMonitor:
                           "outcome": "estop preempted"},
             )
 
-    def on_heartbeat(self) -> None:
-        self.last_heartbeat_at = time.monotonic()
+    def on_heartbeat(self, *, now: float | None = None) -> None:
+        self.last_heartbeat_at = now if now is not None else time.monotonic()
         if self.state == GatewayState.SAFE_STOP:
             # Resume requires explicit operator signal, NOT a heartbeat alone.
             pass
@@ -72,6 +72,7 @@ class SafetyMonitor:
         tier: str,
         audit_chain=None,  # noqa: ANN001 - duck-typed AuditChain
         msg_id: str | None = None,
+        caller: str | None = None,
     ) -> tuple[bool, str]:
         """Leave ESTOP_ACTIVE without restarting the process.
 
@@ -86,7 +87,8 @@ class SafetyMonitor:
 
         The decision is written into `audit_chain` when one is supplied, allow
         or deny alike - a refused clear is exactly the event an operator later
-        needs to find.
+        needs to find - with the tier and, when given, the `caller` (the
+        credential's name from bearers.yaml, never a person's).
 
         Returns ``(cleared, reason)``. Honest about what it does NOT do: it
         restores this state machine only. It does not touch an actuator's own
@@ -100,11 +102,13 @@ class SafetyMonitor:
                 f"safety.clear: {tier!r}-tier principal cannot clear "
                 f"{prev.value}; requires the 'commission' tier"
             )
-            self._audit_clear(audit_chain, decision="deny", reason=reason, msg_id=msg_id)
+            self._audit_clear(audit_chain, decision="deny", reason=reason, msg_id=msg_id,
+                              caller=caller, tier=tier)
             return False, reason
         self.state = GatewayState.READY
         reason = f"safety.clear: {prev.value} -> {self.state.value}"
-        self._audit_clear(audit_chain, decision="allow", reason=reason, msg_id=msg_id)
+        self._audit_clear(audit_chain, decision="allow", reason=reason, msg_id=msg_id,
+                          caller=caller, tier=tier)
         # Deliberately records NO cert property. SF-001 is the claim that an
         # ESTOP wire trip preempts everything else (docs/hil/track-3-test-plan.md:
         # "100% of 10 trip events stop actuation within 100ms"), and a clear is
@@ -116,7 +120,10 @@ class SafetyMonitor:
         return True, reason
 
     @staticmethod
-    def _audit_clear(audit_chain, decision: str, reason: str, msg_id: str | None) -> None:
+    def _audit_clear(
+        audit_chain, decision: str, reason: str, msg_id: str | None,
+        caller: str | None = None, tier: str | None = None,
+    ) -> None:
         if audit_chain is None:
             return
         from .audit import AuditEntry
@@ -127,6 +134,8 @@ class SafetyMonitor:
             decision=decision,
             decision_reason=reason,
             envelope_kid=None,
+            caller=caller,
+            tier=tier,
         ))
 
     def can_actuate(self) -> bool:

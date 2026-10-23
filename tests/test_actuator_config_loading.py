@@ -42,12 +42,12 @@ class TestBearerTierValidation:
     def test_commission_tier_loads(self, tmp_path):
         path = _write(tmp_path, """\
 bearers:
-  - token: commission-token
+  - token: commission-token-of-at-least-32-chars
     tier: commission
     caller: hil-commission
 """)
         store = BearerStore.from_yaml(path)
-        entry = store.resolve("commission-token")
+        entry = store.resolve("commission-token-of-at-least-32-chars")
         assert entry is not None
         assert entry.tier == "commission"
 
