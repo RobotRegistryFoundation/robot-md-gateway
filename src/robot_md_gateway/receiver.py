@@ -1002,8 +1002,21 @@ def make_app(
             error_kind = type(exc).__name__
         ended_at = datetime.now(tz=timezone.utc).isoformat()
 
+        # A DRIVER'S REFUSAL IS RECORDED AS A DENY. outcome_kind == "denied" is
+        # the actuator's own policy gate saying no, and the caller is told so
+        # with a signed 403 just below. This record used to say
+        # decision="allow", reason="ok" whatever the driver answered, so the
+        # audit chain and the signed receipt (status "failure") filed a refusal
+        # as an action that ran and failed. Any other unsuccessful outcome is a
+        # fault, not a decision: the gates allowed it and the driver broke, so it
+        # stays an allow, with the error carried by the outcome fields.
+        refused = not outcome.success and outcome.outcome_kind == "denied"
+        if refused:
+            decision, reason = "deny", f"actuator_policy: {outcome.error_message or 'refused'}"
+        else:
+            decision, reason = "allow", "ok"
         signed_outcome, marker = _record_with_outcome(
-            decision="allow", reason="ok",
+            decision=decision, reason=reason,
             kid=manifest_result.kid, msg_id=envelope.msg_id,
             outcome=outcome, error_kind=error_kind,
             actuator_name=target_actuator.name,
@@ -1012,7 +1025,7 @@ def make_app(
             intent_chain_hash=intent_chain_hash,
         )
 
-        if not outcome.success and outcome.outcome_kind == "denied":
+        if refused:
             # A driver refusing on POLICY is a decision, not a fault, and it must
             # reach the caller the way every other decision does: a signed 403 the
             # client can render, verify, and keep. It used to fall into the 500

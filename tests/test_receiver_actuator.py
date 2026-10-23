@@ -388,7 +388,12 @@ class TestActuatorPolicyDenial:
         assert len(chain.entries) == 2
         entry = chain.entries[-1]
         assert entry.entry_kind == "outcome"
-        assert entry.decision == "allow"          # the GATES allowed it
+        # Recorded as what the wire says it is: a refusal, with the driver's
+        # reason. This used to read "allow" (the gates allowed it), which filed
+        # the refusal as an action that ran (tests/cert/test_refusals_are_
+        # recorded_as_deny.py).
+        assert entry.decision == "deny"
+        assert entry.decision_reason == "actuator_policy: no drive approval is open"
         assert entry.actuator_name == "refuser"   # the DRIVER refused it
         assert entry.actuator_outcome_kind == "denied"
 
