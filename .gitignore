@@ -15,3 +15,7 @@ venv/
 .env.local
 dist/
 signed_refusal.json
+
+# Bearer tokens (robot-md-gateway init writes both next to ROBOT.md). Never commit them.
+bearers.yaml
+dispatch-test.sh

@@ -2,12 +2,19 @@
 Description=robot-md-gateway — enforcement gateway between agent intent and actuators
 After=network-online.target
 Wants=network-online.target
+# Fail closed: no bearer file, no gateway. install.sh creates it; without it
+# systemd refuses the start here, once and loudly, rather than crash-looping.
+AssertPathExists=/etc/robot-md-dispatcher/bearers.yaml
 
 [Service]
 # Runs the dispatcher as an unprivileged user that has access to the robot's
 # serial bus (e.g. /dev/ttyACM0 via the `dialout` group).
 User=robot
 Group=dialout
+# Group= replaces the user's primary group, and install.sh makes the config dir
+# root:robot 0750. Without `robot` here the service cannot open anything in
+# /etc/robot-md-dispatcher: not bearers.yaml, not ROBOT.md.
+SupplementaryGroups=robot
 WorkingDirectory=/opt/robot-md-dispatcher
 
 # Operator-provided config. EnvironmentFile entries:
@@ -20,8 +27,12 @@ EnvironmentFile=/etc/robot-md-dispatcher/dispatcher.env
 
 # The package's own command. The legacy `robot-md-dispatcher` alias is slated
 # for removal; the unit keeps its old name so existing installs upgrade in place.
+# --bearers is what gives the served gateway bearer auth (and its actuator
+# section); `serve` does not read ROBOT_MD_BEARERS_FILE, only the legacy
+# launcher does. A missing or empty file stops the gateway at startup.
 ExecStart=/opt/robot-md-dispatcher/.venv/bin/robot-md-gateway serve \
-    --host 127.0.0.1 --port 8080
+    --host 127.0.0.1 --port 8080 \
+    --bearers /etc/robot-md-dispatcher/bearers.yaml
 
 Restart=on-failure
 RestartSec=3s

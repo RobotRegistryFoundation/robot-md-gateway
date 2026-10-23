@@ -7,8 +7,9 @@
 #   /var/log/robot-md-dispatcher/   — writable log path (journal is primary; this is a spare)
 #   /etc/systemd/system/robot-md-dispatcher.service  — symlink to the unit
 #
-# After running this, edit /etc/robot-md-dispatcher/{dispatcher.env, bearers.yaml}
-# and place ROBOT.md next to them, then:
+# After running this, place ROBOT.md in /etc/robot-md-dispatcher/, give each
+# client a token from the generated bearers.yaml (README.md, "Bearer tokens"),
+# then:
 #
 #   systemctl daemon-reload
 #   systemctl enable --now robot-md-dispatcher
@@ -116,30 +117,24 @@ EOF
     chown root:robot "$CONFIG_DIR/dispatcher.env"
 fi
 
-if [[ ! -f "$CONFIG_DIR/bearers.yaml" ]]; then
-    cat >"$CONFIG_DIR/bearers.yaml" <<'EOF'
-# One entry per caller. Rotate by replacing tokens and reloading the service.
-# Generate tokens with: python3 -c "import secrets;print(secrets.token_urlsafe(32))"
-# - token: REPLACE_ME
-#   tier: read
-#   caller: example-read
-# - token: REPLACE_ME
-#   tier: actuate
-#   caller: example-actuate
-EOF
-    chmod 0640 "$CONFIG_DIR/bearers.yaml"
-    chown root:robot "$CONFIG_DIR/bearers.yaml"
-    echo "created $CONFIG_DIR/bearers.yaml — edit it before enabling the service"
-fi
+# The unit runs `serve --bearers $CONFIG_DIR/bearers.yaml` and will not start
+# without that file. Create it with one generated actuate-tier token, mode 0600,
+# owned by the service user. An existing file is never touched, and the token
+# is never printed.
+"$REPO_DIR/systemd/create-bearers.sh" "$CONFIG_DIR/bearers.yaml" robot robot
 
 install -m 0644 "$REPO_DIR/systemd/robot-md-dispatcher.service" \
     /etc/systemd/system/robot-md-dispatcher.service
 
 echo "installed. next steps:"
-echo "  1. edit $CONFIG_DIR/bearers.yaml and place ROBOT.md at $CONFIG_DIR/ROBOT.md"
-echo "  2. systemctl daemon-reload && systemctl enable --now robot-md-dispatcher"
-echo "  3. tailscale serve --bg --https=443 http://127.0.0.1:8080"
-echo "  4. tailscale funnel 443 on"
+echo "  1. place ROBOT.md at $CONFIG_DIR/ROBOT.md"
+echo "  2. give each client a token from $CONFIG_DIR/bearers.yaml (sudo cat it;"
+echo "     one entry per client: README.md, 'Bearer tokens')"
+echo "  3. systemctl daemon-reload && systemctl enable --now robot-md-dispatcher"
+echo "  4. send POST /v1/safety/heartbeat at least every 3 s from the supervising"
+echo "     client, or the gateway enters safe_stop (README.md, 'Heartbeat and safe-stop')"
+echo "  5. tailscale serve --bg --https=443 http://127.0.0.1:8080"
+echo "  6. tailscale funnel 443 on"
 
 if [[ -n "$INTERACTIVE_USER_ADDED" ]]; then
     cat <<EOF

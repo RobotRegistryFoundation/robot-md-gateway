@@ -216,6 +216,41 @@ sudo cp ./bearers.yaml ./ROBOT.md /etc/robot-md-dispatcher/
 sudo systemctl daemon-reload && sudo systemctl enable --now robot-md-dispatcher
 ```
 
+Run `install.sh` before the copy. It creates `bearers.yaml` as the `robot` user
+with mode 0600, and copying onto an existing file keeps that owner and mode.
+
+### Bearer tokens
+
+The unit runs `serve --bearers /etc/robot-md-dispatcher/bearers.yaml`. Without
+that file systemd refuses to start it (`AssertPathExists=`). A file with no
+entries stops the gateway at startup. If there is no file, `install.sh` creates
+one with one generated `actuate`-tier token. It is mode 0600, owned by the
+`robot` service user, and never printed. The installer never overwrites an
+existing file. Neither file is ever committed: `bearers.yaml` and
+`dispatch-test.sh` are in `.gitignore`.
+
+How a client gets its token:
+
+1. On the robot, read it with `sudo cat /etc/robot-md-dispatcher/bearers.yaml`.
+2. Prefer one entry per client, so each receipt names the credential that
+   acted (`caller`). Edit with `sudoedit`, which keeps the owner and mode, then
+   `sudo systemctl restart robot-md-dispatcher`:
+
+   ```yaml
+   bearers:
+     - token: "..."          # python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+       tier: actuate         # read | actuate | commission
+       caller: craig-iphone  # names the credential, never a person
+   ```
+
+3. Give the token to the client out of band, for example in the app's settings
+   or in an environment variable on the agent host. The client sends it as
+   `Authorization: Bearer <token>`.
+
+The heartbeat accepts any of these tiers. Resuming after a safe-stop
+(`POST /v1/safety/clear`) and clearing so-arm101's latch (`arm.estop.clear`)
+need a `commission` entry. Give that one only to whoever clears stops.
+
 ### Onboarding checklist for the operator
 
 The systemd service runs as the unprivileged `robot` user, which the install

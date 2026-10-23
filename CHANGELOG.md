@@ -41,12 +41,33 @@
   `actuator_policy: <the driver's message>`, and `status: "denied"` with
   `error.kind: "actuator_policy"`, on the wire and in the export. A crash is
   still not a refusal: allow, with an error outcome, and a 500.
+- **The systemd unit runs the gateway with bearer auth.**
+  `systemd/robot-md-dispatcher.service` ran `serve` without `--bearers`, and
+  `serve` does not read `ROBOT_MD_BEARERS_FILE` (only the legacy launcher
+  does), so a gateway installed this way loaded no bearers: every request was
+  `anon`, and the actuator section of `bearers.yaml` was never read either. The
+  unit now passes `--bearers /etc/robot-md-dispatcher/bearers.yaml` and refuses
+  to start without the file (`AssertPathExists=`). A missing or empty file stops
+  the gateway at startup. `install.sh` creates the file if there is none, through
+  the new `systemd/create-bearers.sh`: one generated actuate-tier token, mode
+  0600, owned by the `robot` service user, never printed, never overwriting an
+  existing file. It used to write a comment-only file, mode 0640. `bearers.yaml`
+  and `dispatch-test.sh` are now in `.gitignore`.
 
 ### Added
 
 - `POST /v1/safety/heartbeat` (any known bearer; never anon) and
   `POST /v1/safety/clear` (commission tier, fresh heartbeat). Both answer 404 on
   a gateway built without a monitor. The ESTOP wire stays off HTTP.
+
+### Fixed
+
+- **The unit's service can read its own config directory.** The unit runs as
+  `User=robot` with `Group=dialout`, and `Group=` replaces the user's primary
+  group, while `install.sh` makes `/etc/robot-md-dispatcher` `root:robot 0750`.
+  The service could therefore open nothing in it, `ROBOT.md` included. The unit
+  now adds `SupplementaryGroups=robot`. Found while adding `--bearers`, which
+  would otherwise have stopped the gateway at startup on every install.
 
 ### Operators will notice
 
@@ -58,6 +79,11 @@
   actuator's own clear (`arm.estop.clear`, commission, allowlisted). The
   HIL PHASE-5 harness and any other client that drives a served gateway needs
   a heartbeat running alongside it.
+- **The systemd unit needs its bearer file.** A fresh `install.sh` creates
+  one; read the generated token with `sudo cat` (README, "Bearer tokens").
+  An install from before this release kept its comment-only `bearers.yaml`.
+  The installer leaves an existing file alone, so the gateway refuses to start
+  until that file has at least one entry.
 
 ## [0.5.0a9] - 2026-10-09
 
