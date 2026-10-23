@@ -2,6 +2,63 @@
 
 ## [Unreleased]
 
+### Security
+
+- **`serve` runs a safety monitor, always, and a tripped gateway now stops the
+  machine.** `make_app` has taken a `SafetyMonitor` since Plan 6 Phase 4, but
+  the `serve` path never passed one, so a deployed gateway had no heartbeat
+  staleness rule (SF-002) at all. Where a monitor was wired, only an incoming
+  request ever ticked it, and entering `safe_stop` only refused new requests: a
+  paced move already dispatched ran to its end. Now `serve` always passes a
+  monitor (3 s staleness, from the pendant integration spec), with no switch to
+  turn it off. A watchdog thread ticks it every 0.1 s for as long as the app is
+  served, and the moment it leaves READY (a stale heartbeat, or the in-process
+  ESTOP wire) the gateway sends every actuator that declares `stop_capabilities`
+  its stop, once per trip, as itself: no bearer, no gate. For
+  so-arm101-actuator that is `arm.estop` (latch, end a paced move at its next
+  setpoint, hold the pose in software). Each of those stops is recorded in the
+  audit chain and the export as `safety_stop: ...`. An actuator that declares no
+  stop cannot be stopped this way, and the log says so (`safety_stop: ...
+  nothing was told to stop`). `make_app` without a monitor still works, for
+  tests and embedders, and logs `no_safety_monitor` as a warning.
+- **A heartbeat alone still never resumes.** Resume is `POST /v1/safety/clear`
+  at the `commission` tier (`SafetyMonitor.clear`'s existing rule), and it is
+  refused while the heartbeat is stale, so a clear cannot drop straight back
+  into `safe_stop`. The clear is audited with the credential's `caller` and
+  `tier`, allowed or refused. The actuator keeps its own latch: so-arm101 needs
+  `arm.estop.clear` at commission tier as well.
+- **A declared stop gets through a tripped gateway.** The safety-state check
+  runs before every other gate, and it refused every request outside READY,
+  the stop tools included. A tool some actuator declares in `stop_capabilities`
+  now passes it in every state, and nothing else does: not the clear, not a
+  read. The stop still passes every other gate, and the actuator it is routed
+  to must declare it (`arm.estop` sent to a camera is refused as
+  `safety_state`).
+- **A driver's refusal is recorded as a deny.** An actuator answering
+  `outcome_kind="denied"` reached the caller as a signed 403 (`actuator_policy`)
+  but was recorded as `decision="allow"`, `reason="ok"`, and signed with
+  `status: "failure"`. It is now `decision="deny"`, reason
+  `actuator_policy: <the driver's message>`, and `status: "denied"` with
+  `error.kind: "actuator_policy"`, on the wire and in the export. A crash is
+  still not a refusal: allow, with an error outcome, and a 500.
+
+### Added
+
+- `POST /v1/safety/heartbeat` (any known bearer; never anon) and
+  `POST /v1/safety/clear` (commission tier, fresh heartbeat). Both answer 404 on
+  a gateway built without a monitor. The ESTOP wire stays off HTTP.
+
+### Operators will notice
+
+- **A served gateway needs a heartbeat.** With nothing sending one, it enters
+  `safe_stop` 3 s after it starts and stops every actuator that declares a
+  stop (so-arm101 latches). Send `POST /v1/safety/heartbeat` at least every 3 s
+  from the client that supervises the robot, not from the robot itself. After
+  a trip: heartbeats, then `POST /v1/safety/clear` (commission), then the
+  actuator's own clear (`arm.estop.clear`, commission, allowlisted). The
+  HIL PHASE-5 harness and any other client that drives a served gateway needs
+  a heartbeat running alongside it.
+
 ## [0.5.0a9] - 2026-10-09
 
 ### Security

@@ -46,7 +46,7 @@ plaintext goals, never SDK sessions. Every envelope is checked for:
 3. **Tool allowlist** — the requested tool is in the operator's policy (default-deny on unknown). A tool the actuator declares as motion (`motion_capabilities`) must also be invoked under an actuation scope (`MANIPULATE`, `NAVIGATE`, `ACTUATE`, `EXECUTE`, `COMMISSION`, in any case): the same motion relabelled `OBSERVE` is refused, because the tier, confidence and HiTL gates key off that caller-written field. For a motion tool those gates also apply the strictest motion scope's rule (HiTL on any of MANIPULATE, NAVIGATE, ACTUATE, EXECUTE covers all four), so relabelling among them buys nothing.
 4. **Confidence + HiTL gates** *(Phase 4 — Plan 6)* — model-asserted confidence above threshold; human-in-the-loop approval if scope demands it.
 5. **Replay protection + freshness** *(Plan 6; freshness v0.5.0a7)*: the envelope's `msg_id` is checked against a bounded FIFO window of ids already seen (oldest evicted first), and when the envelope carries a `timestamp_ms` it must fall inside a configurable window, by default 300 seconds either side of the gateway's clock. An envelope that carries no `timestamp_ms` is not freshness-checked unless `ROBOT_MD_REQUIRE_ENVELOPE_TIMESTAMP` is on: the iOS client signs the field into its pre-image, older CLI signers do not send it at all, and refusing them all would be a silent break. The window is bounded, so this limits how long a captured envelope stays useful; it is not a permanent ledger of every id ever seen.
-6. **ESTOP precedence** *(Plan 6)* — physical or operator stop signal preempts any pending action. A stop tool sent through `/v1/invoke` (one an actuator declares in `stop_capabilities`) runs on worker threads of its own (`STOP_LANES`), so it does not wait behind other requests for a thread; whether it then preempts a motion in progress is up to the actuator (so-arm101-actuator latches first and ends a paced move at its next setpoint). A flood of requests that saturates the gateway's CPU still delays it, because CPU and the GIL are shared by every thread (the stop latched 4.7 s after it was sent under 200 looping clients on two cores, in simulation; 0.05 s with no other traffic): the software stop is not the physical e-stop.
+6. **ESTOP precedence** *(Plan 6)* — physical or operator stop signal preempts any pending action. A stop tool sent through `/v1/invoke` (one an actuator declares in `stop_capabilities`) runs on worker threads of its own (`STOP_LANES`), so it does not wait behind other requests for a thread; whether it then preempts a motion in progress is up to the actuator (so-arm101-actuator latches first and ends a paced move at its next setpoint). A flood of requests that saturates the gateway's CPU still delays it, because CPU and the GIL are shared by every thread (the stop latched 4.7 s after it was sent under 200 looping clients on two cores, in simulation; 0.05 s with no other traffic): the software stop is not the physical e-stop. A declared stop tool also gets through a gateway in `safe_stop` or `estop_active`, which refuses everything else (see [Heartbeat and safe-stop](#heartbeat-and-safe-stop-sf-002)).
 
 **Which of those run depends on one setting, so read this before quoting the
 list.** Checks 1, 2, 3, 4 and 6 run on every request. The envelope signature
@@ -260,6 +260,56 @@ tailscale serve --bg --https=443 http://127.0.0.1:8080
 tailscale funnel 443 on
 ```
 
+## Heartbeat and safe-stop (SF-002)
+
+`robot-md-gateway serve` always runs a safety monitor, and there is no switch to
+turn it off. **A served gateway needs a heartbeat**, at least every 3 seconds
+(send one every second):
+
+```bash
+curl -fsS -X POST -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8080/v1/safety/heartbeat
+```
+
+Any bearer in `bearers.yaml` may send it. A request with no bearer is refused
+(401), and so is an unknown one (403).
+
+**When the heartbeat stops.** After 3 seconds without one, including the first
+3 seconds after the service starts, the gateway enters `safe_stop`. A watchdog
+checks every 0.1 s, so this happens whether or not requests are arriving. On
+entering `safe_stop`, or `estop_active` through the in-process ESTOP wire
+(`app.state.safety_monitor.on_estop_wire`), the gateway sends each actuator that
+declares a stop (`stop_capabilities`) that stop, once, as itself: no bearer and
+no gate is involved. For so-arm101-actuator that is `arm.estop`. It latches,
+ends a paced move at its next setpoint and holds the pose. The hold is done in
+software; it is not a hardware e-stop. From then on every request is refused
+with `deny: safety_state`, except a declared stop tool, which gets through in
+every state and still passes every other gate. An actuator that declares no stop
+cannot be stopped by the gateway: the log says `safety_stop: ... nothing was
+told to stop`, and the gateway refuses that actuator's requests.
+
+**Resuming takes two explicit steps.** A heartbeat alone never resumes.
+
+1. Send heartbeats again, then `POST /v1/safety/clear` with a `commission`-tier
+   bearer. It is refused while the heartbeat is stale and below the commission
+   tier. Allowed or refused, the attempt is audited with the credential's name.
+2. Clear the actuator's own latch. For so-arm101-actuator, invoke
+   `arm.estop.clear` at the commission tier. It must be on
+   `ROBOT_MD_TOOL_ALLOWLIST`. Until then the arm refuses motion itself
+   (`deny: actuator_policy`, `estop_latched`).
+
+Restarting the service also starts it in READY, with a fresh 3-second window,
+and discards the in-memory audit chain. The clear keeps the chain.
+
+**Where the heartbeat should come from.** The design names the
+[robot-md-pendant](https://github.com/RobotRegistryFoundation/robot-md-pendant)
+as the source (`docs/gateway-integration-spec.md`: a signed heartbeat every
+second, 3 s staleness, an explicit resume). Nothing delivers a pendant
+heartbeat to the gateway yet. Until something does, send it from the client
+that supervises the robot: the operator's app, or the host running the agent.
+Do not send it from the robot itself. A heartbeat sent from the robot only
+proves that the gateway is running.
+
 ## Configuration
 
 Environment variables (also settable via CLI flags — flags win):
@@ -318,7 +368,9 @@ way it is signed, audited, and safe to keep as evidence:
 `actuator_policy` — the driver's own refusal — `detail.telemetry` carries the
 driver's machine-readable code when it produced one; branch on that, not on the
 wording of `reason`. The key is absent when the driver had nothing structured to
-say.
+say. A driver's refusal is recorded as a refusal: `status: "denied"` in the
+signed receipt and `decision: "deny"`, reason `actuator_policy: ...`, in the
+audit chain.
 
 **Broken — `500`.** The driver raised. A fault is never dressed up as a
 decision, so it does not arrive as a deny and carries no receipt.
