@@ -622,9 +622,23 @@ def make_app(
         raw_msg_id = envelope_dict.get("msg_id", "<unknown>")
         started_at = datetime.now(tz=timezone.utc).isoformat()
 
+        # A STOP ALWAYS GETS THROUGH THE SAFETY STATE. This check used to refuse
+        # every request outside READY, the stop tools included, so a gateway in
+        # SAFE_STOP or ESTOP_ACTIVE refused the one command an operator sends
+        # when something is wrong. The exemption is exactly a tool some actuator
+        # declares in `stop_capabilities`: nothing else, not the clear (it makes
+        # the robot movable again), not a read. It skips this check and no
+        # other; the stop still passes every gate below, and once the actuator
+        # is chosen it must be one that declares this tool as its stop.
+        stop_past_safety_state = False
         if safety_monitor is not None:
             safety_monitor.tick()
-            if not safety_monitor.can_actuate():
+            tool = envelope_dict.get("tool_name")
+            if safety_monitor.can_actuate():
+                pass
+            elif isinstance(tool, str) and tool in _stop_tools:
+                stop_past_safety_state = True
+            else:
                 reason = f"gateway state={safety_monitor.state.value}"
                 signed, marker = _record(
                     "deny", f"safety_state: {reason}", None, raw_msg_id,
@@ -962,6 +976,26 @@ def make_app(
         else:
             target_actuator = actuator
             target_config = actuator_config
+
+        # The stop that passed the safety state above must be a stop for the
+        # actuator that receives it. `arm.estop` is the arm's stop; routed to a
+        # camera that declares no such stop, it is just a tool, and a tripped
+        # gateway refuses it like any other.
+        if stop_past_safety_state and envelope.tool_name not in as_tool_set(
+            getattr(target_actuator, "stop_capabilities", None)
+        ):
+            reason = (
+                f"gateway state={safety_monitor.state.value}; {envelope.tool_name} "
+                f"is not a declared stop of actuator {target_actuator.name!r}"
+            )
+            signed, marker = _record(
+                "deny", f"safety_state: {reason}", manifest_result.kid, envelope.msg_id,
+                envelope_dict=envelope_dict, ruri=envelope.ruri,
+                rrn=manifest_rrn, started_at=started_at, caller=caller, tier=tier,
+            )
+            detail = {"deny": "safety_state", "reason": reason}
+            _attach_signature(detail, signed, marker)
+            raise HTTPException(status_code=403, detail=detail)
 
         # RECORD BEFORE DISPATCH (RCAN 6.3). Every gate above has passed and the
         # actuator has been chosen; the next statement is the one that can move
