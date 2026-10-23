@@ -137,11 +137,12 @@ echo "  3. give the actuate token to the agent's client, and the supervisor toke
 echo "     to the supervising person's device, never the agent's host and never"
 echo "     the robot (sudo cat $CONFIG_DIR/bearers.yaml; README.md, 'Bearer tokens')"
 echo "  4. systemctl daemon-reload && systemctl enable --now robot-md-dispatcher"
-echo "  5. from that device, POST /v1/safety/heartbeat at least every 3 s; then, as"
+echo "  5. tailscale serve --bg --https=443 http://127.0.0.1:8080 (the gateway listens"
+echo "     on 127.0.0.1 only; this is how the supervisor's device reaches it)"
+echo "  6. tailscale funnel 443 on"
+echo "  7. from that device, POST /v1/safety/heartbeat at least every 3 s; then, as"
 echo "     the operator, POST /v1/safety/clear. A heartbeat gap of 3 s puts it back"
 echo "     in safe_stop (README.md, 'Heartbeat and safe-stop')"
-echo "  6. tailscale serve --bg --https=443 http://127.0.0.1:8080"
-echo "  7. tailscale funnel 443 on"
 
 if [[ -n "$INTERACTIVE_USER_ADDED" ]]; then
     cat <<EOF

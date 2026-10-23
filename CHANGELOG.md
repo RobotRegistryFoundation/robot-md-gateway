@@ -53,16 +53,44 @@
   replayed stop is processed and recorded as `REPLAY_DETECTED`, and the key
   registry is never consulted for a stop. The actuator gets the pinned manifest
   or none. A stop still needs a bearer the gateway knows, the operator's
-  allowlist and per-tool tiers.
-- **A request is checked against the safety state again just before dispatch.**
-  The gates can take seconds (a key fetched on a cold cache), and a request
-  admitted in READY was dispatched after a trip in that time.
+  allowlist and per-tool tiers. Not refusing a stale stop departs from rcan-spec's
+  replay-prevention page and follows its safety and offline pages; the spec
+  contradicts itself there (RobotRegistryFoundation/rcan-spec#240).
+- **A stop is sent before it is recorded.** With the attestation export on, a
+  declared stop wrote its intent (a process-wide lock and an fsync) before it
+  reached the actuator, so storage that stopped answering held it back. It is
+  now sent first, and its intent and outcome are written after it, linked as
+  before; the intent says so.
+- **Only a declared stop from a known bearer gets a stop lane.** Lanes were
+  chosen by tool name, so requests that only named a stop tool (for an actuator
+  that does not declare it, or for none) took them, from anyone. With
+  signatures required, each such request first resolved a made-up key id (up
+  to 5 s), and a few anonymous ones could hold every lane in front of a real
+  stop. Everything else now shares the default pool.
+- **A request is checked against the safety state again just before dispatch,
+  and a trip during the dispatch is answered with a second stop.** The gates
+  can take seconds (a key fetched on a cold cache), and a request admitted in
+  READY was dispatched after a trip in that time. The state is now also checked
+  after the intent record, as the last step before the actuator is called (a
+  refusal there carries the intent's hash). A trip that begins while the
+  actuator runs could still deliver the trip's stop before the dispatch, and an
+  actuator whose stop does not latch (castor-hal transports) kept the dispatched
+  goal. The gateway now sends that actuator its stop again once the call
+  returns, says so in the response (`stopped_again`) and the record, and a clear
+  waits for that stop.
 - **What actuators declare is checked at startup.** A tool declared both as a
   stop and as a motion refuses to start the gateway. An actuator whose own
   declared tiers would refuse its stop at tier `read` gets a `stop_unreachable`
-  error and every motion through it is refused; so does one that refuses the
-  gateway's stop when a trip sends it, from then until a restart. An actuator
-  that declares no stop is logged as `no_declared_stop`.
+  error and every motion through it is refused; so does one that refuses or
+  fails the gateway's stop when a trip sends it (`denied`, `error`, an
+  exception), from then until a restart. An actuator that declares no stop is
+  logged as `no_declared_stop`.
+- **The clear refuses to arm motion that no trip could stop.** While any
+  configured actuator may move and declares no stop, `POST /v1/safety/clear`
+  answers 409, so a served gateway, which starts held, never arms with it.
+  "May move" includes an actuator that says nothing about motion, as
+  so-arm101-actuator 0.2.2 does. One that declares an empty
+  `motion_capabilities` is exempt; the built-in `noop` now declares one.
 - **A damaged ROBOT.md is a signed deny, never a 500.** A non-UTF-8 byte, a
   frontmatter or `metadata:` that is not a mapping, a signature footer that is
   not base64, and a `safety.hitl_gates` of the wrong shape each escaped as an
@@ -88,10 +116,13 @@
   It used to write a comment-only file, mode 0640. `bearers.yaml` and
   `dispatch-test.sh` are now in `.gitignore`.
 - **A placeholder token no longer loads as a credential.** robot-md's installer
-  wrote `REPLACE-WITH-MINTED-TOKEN`; with a tier added by hand the gateway
-  accepted it, at that tier. `BearerStore.from_yaml` now refuses empty and
-  placeholder tokens, and warns (`weak_bearer_token`) on one shorter than 32
-  characters.
+  wrote `REPLACE-WITH-MINTED-TOKEN`, and this repository's `install.sh`
+  template held `REPLACE_ME` from the first scaffold; with an entry kept or
+  uncommented, the gateway accepted the public string at that entry's tier.
+  `BearerStore.from_yaml` now refuses an empty token and every placeholder a
+  template has shipped: anything containing `REPLACE`, anything starting with
+  `<`, and `...`. It refuses a supervisor or commission token shorter than 32
+  characters, and warns (`weak_bearer_token`) on any other.
 
 ### Added
 
@@ -131,6 +162,11 @@
   running alongside it.
 - **A stop needs a bearer the gateway knows.** One with no bearer, or an
   unknown one, is now refused, signed and recorded.
+- **so-arm101-actuator 0.2.2 can no longer be armed.** It declares no stop, so
+  the clear answers 409. Run so-arm101-actuator main, or 0.3.0 or later once
+  released (README, "The arm's driver").
+- **A supervisor or commission token needs at least 32 characters**, or the
+  gateway refuses to start.
 - **The systemd unit needs its bearer file.** A fresh `install.sh` creates
   one; read the generated tokens with `sudo cat` (README, "Bearer tokens").
   An install from before this release kept its comment-only `bearers.yaml`.
