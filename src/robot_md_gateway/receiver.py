@@ -807,6 +807,8 @@ def make_app(
             return f"the safety watchdog has not ticked for over {WATCHDOG_STALE_S:g} s"
         if state is GatewayState.SAFE_STOP:
             age = clock() - safety_monitor.last_heartbeat_at
+            if age == float("inf"):
+                return "no heartbeat has been received"
             last = _safety.last_heartbeat
             source = (f"; the last one came from supervisor {last[0]!r}" if last
                       else "; no heartbeat had been accepted")
@@ -1672,10 +1674,11 @@ def make_app(
                     f"{WATCHDOG_STALE_S:g} s"
                 )
             elif age > monitor.heartbeat_staleness_s:
+                last = ("no heartbeat has been received" if age == float("inf")
+                        else f"the last heartbeat was {age:.1f} s ago")
                 status, reason = 403, (
-                    f"safety.clear: refused, the last heartbeat was {age:.1f} s ago "
-                    f"(limit {monitor.heartbeat_staleness_s:g} s); send heartbeats, "
-                    f"then clear"
+                    f"safety.clear: refused, {last} (limit "
+                    f"{monitor.heartbeat_staleness_s:g} s); send heartbeats, then clear"
                 )
             else:
                 cleared, reason = monitor.clear(tier=tier, msg_id=msg_id, caller=caller)
