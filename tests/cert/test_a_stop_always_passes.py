@@ -508,3 +508,18 @@ def test_an_actuator_that_refuses_the_gateways_stop_gets_no_more_motion():
     assert motion.json()["detail"]["deny"] == "stop_unreachable"
     assert "refused the gateway's own stop" in motion.json()["detail"]["reason"]
     assert [c[0] for c in arm.calls] == ["arm.estop"]
+
+
+def test_an_operators_stop_against_a_damaged_manifest_is_not_a_500(tmp_path):
+    """The review, finding 1: an operator's `arm.estop` must not 500 on a bad
+    manifest. The stop path reads no manifest at all, neither the one the
+    request names nor the pinned one, which it only passes on."""
+    damaged = (FIXTURES / "signed-good.md").read_bytes().replace(b"Test Robot", b"Test \xffRobot")
+    named, pinned = tmp_path / "named.md", tmp_path / "ROBOT.md"
+    named.write_bytes(damaged)
+    pinned.write_bytes(damaged.replace(b"metadata:", b"metadata: oops\nwas:", 1))
+    for kw in ({}, {"pinned_manifest_path": pinned}):
+        client, arm, _ = _app(**kw)
+        response = _post(client, _envelope(manifest_path=str(named)))
+        assert response.status_code == 200, response.text
+        assert [c[0] for c in arm.calls] == ["arm.estop"]
