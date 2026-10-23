@@ -36,6 +36,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from robot_md_gateway.actuator import ActuatorOutcome
+from robot_md_gateway.auth import _BearerEntry
 from robot_md_gateway.cert.audit import AuditChain
 from robot_md_gateway.cert.envelope import canonical_json
 from robot_md_gateway.cert.gates import ConfidencePolicy, HiTLPolicy
@@ -50,7 +51,10 @@ ENV_KID = "envelope-kid"
 ENV_PRIV = Ed25519PrivateKey.generate()
 ENV_PUB = ENV_PRIV.public_key().public_bytes(
     serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
-BEARERS = {"read-token": "read", "actuate-token": "actuate"}
+BEARERS = {"read-token": "read", "actuate-token": "actuate",
+           "commission-token": "commission"}
+SUPERVISOR = {"supervisor-token": _BearerEntry(token="supervisor-token", tier="read",
+                                              caller_id="pendant", role="supervisor")}
 ALLOWED = ("arm.move_to", "arm.estop", "arm.state")
 TRIPPED_AND_NOT = [GatewayState.READY, GatewayState.SAFE_STOP, GatewayState.ESTOP_ACTIVE]
 
@@ -464,3 +468,43 @@ def test_a_telemetry_only_actuator_starts_and_is_named_as_unstoppable(caplog):
                  safety_monitor=SafetyMonitor())
     assert "no_declared_stop: actuator 'j1939'" in caplog.text
     assert "stop_unreachable" not in caplog.text
+
+
+def test_an_actuator_that_refuses_the_gateways_stop_gets_no_more_motion():
+    """The review's P6, for an actuator that declares no tiers, so the startup
+    check cannot see it: it refuses the gateway's stop at tier read. The move
+    in flight cannot be stopped; every motion after it is refused."""
+    class _ReadCannotStop(_Arm):
+        def execute(self, *, envelope, manifest_path, tier, config):
+            if envelope["tool_name"] == "arm.estop" and tier == "read":
+                self.calls.append((envelope["tool_name"], tier, manifest_path))
+                return ActuatorOutcome(success=False, outcome_kind="denied",
+                                       error_message="tier read may not stop")
+            return super().execute(envelope=envelope, manifest_path=manifest_path,
+                                   tier=tier, config=config)
+
+    clock, arm, chain = _FakeClock(), _ReadCannotStop(), AuditChain()
+    app = make_app(resolver=_Resolver(), bearer_tiers=BEARERS, bearers=SUPERVISOR,
+                   tool_allowlist=ToolAllowlist(allowed_tools=ALLOWED),
+                   safety_monitor=SafetyMonitor(last_heartbeat_at=clock()), audit_chain=chain,
+                   actuator=arm, actuator_config={}, clock=clock)
+    client = TestClient(app)
+    clock.t += 10
+    app.state.safety_tick()
+    deadline = time.monotonic() + 5
+    while not [e for e in chain.entries if e.decision_reason.startswith("safety_stop:")]:
+        assert time.monotonic() < deadline, "the gateway's stop was never recorded"
+        time.sleep(0.01)
+    [stop] = [e for e in chain.entries if e.decision_reason.startswith("safety_stop:")]
+    assert stop.decision == "deny"
+    assert stop.decision_reason.endswith("motion through it is refused from now on")
+    assert client.post("/v1/safety/heartbeat",
+                       headers={"Authorization": "Bearer supervisor-token"}).status_code == 200
+    assert client.post("/v1/safety/clear",
+                       headers={"Authorization": "Bearer commission-token"}).status_code == 200
+    motion = _post(client, _envelope(tool="arm.move_to", scope="MANIPULATE"),
+                   token="actuate-token")
+    assert motion.status_code == 403
+    assert motion.json()["detail"]["deny"] == "stop_unreachable"
+    assert "refused the gateway's own stop" in motion.json()["detail"]["reason"]
+    assert [c[0] for c in arm.calls] == ["arm.estop"]

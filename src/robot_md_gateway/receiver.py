@@ -946,12 +946,22 @@ def make_app(
             outcome = ActuatorOutcome(success=False, outcome_kind="error",
                                       error_message=f"{type(exc).__name__}: {exc}")
             error_kind = type(exc).__name__
+        refused = not outcome.success and outcome.outcome_kind == "denied"
         with _safety_lock:
             late = send.status == "timed_out"
             send.status = "done"
+            if refused:
+                # An actuator that refuses the gateway's own stop cannot be
+                # stopped on a trip, whatever it declared: no motion through it
+                # from now on, as for one found at startup (finding 8).
+                _stop_unaccepted.setdefault(id(send.actuator), (
+                    f"actuator {send.name!r} refused the gateway's own stop ({send.tool} at "
+                    f"tier {SAFETY_STOP_TIER!r}: {outcome.error_message}), so the gateway "
+                    f"cannot stop it on a trip; motion through it is refused until the "
+                    f"gateway restarts"
+                ))
         log = logging.getLogger(__name__)
         try:
-            refused = not outcome.success and outcome.outcome_kind == "denied"
             reason = (f"safety_stop: trip {trip.seq} ({trip.state.value}: {trip.why}); "
                       f"sent {send.tool} to {send.name}")
             if late:
@@ -959,6 +969,8 @@ def make_app(
                            f"({STOP_TIMEOUT_S:g} s)")
             if not outcome.success:
                 reason += f"; it did not succeed: {outcome.error_message}"
+            if refused:
+                reason += "; motion through it is refused from now on"
             (log.warning if outcome.success else log.error)(
                 "%s (outcome: %s)", reason, outcome.outcome_kind,
             )
