@@ -181,3 +181,67 @@ def test_a_short_token_loads_with_a_warning(tmp_path, caplog):
     with caplog.at_level("WARNING", logger="robot_md_gateway.auth"):
         BearerStore.from_yaml(path)
     assert "weak_bearer_token: caller 'c' has a 5-character token" in caplog.text
+
+
+# --- every placeholder a template shipped (second review, blocking 3) ----------
+
+
+@pytest.mark.parametrize("token", [
+    "REPLACE_ME",                         # systemd/install.sh, since the first scaffold
+    "replace-me-read", "replace-me-actuate",   # this README
+    "REPLACE-WITH-MINTED-TOKEN",          # robot-md's installer
+    "<secrets.token_urlsafe(32)>", "<...>", "<that token>",
+    "...",                                # this README's bearers.yaml example
+])
+@pytest.mark.parametrize("tier", ["read", "actuate", "commission"])
+def test_every_placeholder_a_template_shipped_refuses_to_load(tmp_path, token, tier):
+    path = _write(tmp_path, [{"token": token, "tier": tier, "caller": "example"}])
+    with pytest.raises(ValueError, match="still has a placeholder token"):
+        BearerStore.from_yaml(path)
+
+
+def test_this_repos_own_old_placeholder_no_longer_loads_as_a_credential(tmp_path):
+    """The review's reproduction, which now fails: main's systemd/install.sh
+    template with one entry uncommented."""
+    path = tmp_path / "bearers.yaml"
+    path.write_text("- token: REPLACE_ME\n  tier: actuate\n  caller: example-actuate\n")
+    with pytest.raises(ValueError, match="'example-actuate' still has a placeholder token"):
+        BearerStore.from_yaml(path)
+
+
+def test_a_token_with_dots_in_it_is_not_a_placeholder(tmp_path):
+    token = "x" * 40 + ".y"                 # dots, but not only dots
+    path = _write(tmp_path, [{"token": token, "tier": "actuate", "caller": "c"}])
+    assert BearerStore.from_yaml(path).resolve(token).tier == "actuate"
+
+
+# --- short supervisor and commission tokens (second review, departure (d)) ------
+
+
+@pytest.mark.parametrize("row, held", [
+    ({"tier": "commission"}, "commission"),
+    ({"role": "supervisor"}, "supervisor"),
+    ({"role": "supervisor", "tier": "read"}, "supervisor"),
+])
+def test_a_short_supervisor_or_commission_token_refuses_to_load(tmp_path, row, held):
+    """These keep the robot movable or arm it, so a guessable one is refused."""
+    path = _write(tmp_path, [{"token": "s" * 31, "caller": "c", **row}])
+    with pytest.raises(ValueError, match=f"is a {held} credential with a 31-character token; "
+                                         f"a {held} token must have at least 32"):
+        BearerStore.from_yaml(path)
+
+
+@pytest.mark.parametrize("row", [{"tier": "commission"}, {"role": "supervisor"}])
+def test_a_32_character_supervisor_or_commission_token_loads(tmp_path, caplog, row):
+    path = _write(tmp_path, [{"token": "s" * 32, "caller": "c", **row}])
+    with caplog.at_level("WARNING", logger="robot_md_gateway.auth"):
+        BearerStore.from_yaml(path)
+    assert "weak_bearer_token" not in caplog.text
+
+
+@pytest.mark.parametrize("tier", ["read", "actuate"])
+def test_a_short_read_or_actuate_token_still_loads_with_a_warning(tmp_path, caplog, tier):
+    path = _write(tmp_path, [{"token": "s" * 31, "tier": tier, "caller": "c"}])
+    with caplog.at_level("WARNING", logger="robot_md_gateway.auth"):
+        assert BearerStore.from_yaml(path).resolve("s" * 31).tier == tier
+    assert "weak_bearer_token: caller 'c' has a 31-character token" in caplog.text

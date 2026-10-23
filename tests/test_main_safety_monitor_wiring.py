@@ -74,6 +74,10 @@ def test_serve_has_no_switch_to_turn_the_monitor_off(monkeypatch):
             _serve(monkeypatch, flag)
 
 
+PENDANT = "pendant-token-of-at-least-32-characters"
+OPERATOR = "operator-token-of-at-least-32-characters"
+
+
 def test_a_served_gateway_boots_held_until_a_commission_clear(monkeypatch, tmp_path):
     """The restart case end to end: nothing but a declared stop passes until a
     supervisor's heartbeats and a commission clear arm the gateway."""
@@ -82,8 +86,9 @@ def test_a_served_gateway_boots_held_until_a_commission_clear(monkeypatch, tmp_p
     bearers = tmp_path / "bearers.yaml"
     bearers.write_text(yaml.safe_dump({"bearers": [
         {"token": "agent", "tier": "actuate", "caller": "agent"},
-        {"token": "pendant", "role": "supervisor", "caller": "pendant"},
-        {"token": "operator", "tier": "commission", "caller": "operator"},
+        # A supervisor or commission token must have at least 32 characters.
+        {"token": PENDANT, "role": "supervisor", "caller": "pendant"},
+        {"token": OPERATOR, "tier": "commission", "caller": "operator"},
     ]}))
     app = _serve(monkeypatch, "--bearers", str(bearers))
 
@@ -97,11 +102,11 @@ def test_a_served_gateway_boots_held_until_a_commission_clear(monkeypatch, tmp_p
     with TestClient(app) as client:
         held = invoke(client)
         too_early = client.post("/v1/safety/clear",
-                                headers={"Authorization": "Bearer operator"})
-        beat = client.post("/v1/safety/heartbeat", headers={"Authorization": "Bearer pendant"})
+                                headers={"Authorization": f"Bearer {OPERATOR}"})
+        beat = client.post("/v1/safety/heartbeat", headers={"Authorization": f"Bearer {PENDANT}"})
         not_by_the_agent = client.post("/v1/safety/clear",
                                        headers={"Authorization": "Bearer agent"})
-        cleared = client.post("/v1/safety/clear", headers={"Authorization": "Bearer operator"})
+        cleared = client.post("/v1/safety/clear", headers={"Authorization": f"Bearer {OPERATOR}"})
         armed = invoke(client)
 
     assert held.status_code == 403

@@ -49,10 +49,28 @@ class _BearerEntry:
 #: The one role a bearer entry may declare (`role: supervisor` in bearers.yaml).
 SUPERVISOR = "supervisor"
 
-#: Shorter tokens load, with a `weak_bearer_token` warning. Refusing them would
-#: break hand-written files that work today; robot-md's installer refuses them
-#: at the same length. `secrets.token_urlsafe(32)` gives 43 characters.
+#: The shortest token a supervisor or commission entry may have: those can keep
+#: a robot movable or arm it, so a shorter one stops the gateway at startup.
+#: Any other entry with a shorter token loads, with a `weak_bearer_token`
+#: warning, so a hand-written file that works today keeps working. robot-md's
+#: installer refuses shorter tokens for every entry. `secrets.token_urlsafe(32)`
+#: gives 43 characters.
 MIN_TOKEN_CHARS = 32
+
+
+def _placeholder(token: str) -> bool:
+    """Whether a token is one of the placeholders a template has shipped. Each
+    is a public string, and an entry that kept one would be a credential anyone
+    can read in a published file:
+    - `REPLACE_ME` (this repository's systemd/install.sh, from the first
+      scaffold), `replace-me-read` and `replace-me-actuate` (this README), and
+      `REPLACE-WITH-MINTED-TOKEN` (robot-md's installer): anything containing
+      REPLACE, in any case;
+    - `<secrets.token_urlsafe(32)>`, `<...>` and `<that token>`: anything that
+      starts with "<";
+    - `...` (this README's bearers.yaml example): nothing but dots."""
+    text = token.strip()
+    return "REPLACE" in text.upper() or text.startswith("<") or set(text) <= {"."}
 
 
 class BearerStore:
@@ -109,15 +127,27 @@ class BearerStore:
         for e in entries:
             if e.tier not in ("read", "actuate", "commission"):
                 raise ValueError(f"invalid tier {e.tier!r} for caller {e.caller_id}")
-            # A placeholder is a public string. robot-md's installer shipped
-            # `REPLACE-WITH-MINTED-TOKEN`, and a file that kept it (with a tier
-            # added by hand) loaded it as a working credential, at any tier.
+            # A placeholder is a public string. Templates in this repository and
+            # in robot-md's installer shipped several (`_placeholder`), and a
+            # file that kept one (with a tier added by hand, or an example
+            # entry uncommented) loaded it as a working credential, at any tier.
             if not isinstance(e.token, str) or not e.token.strip():
                 raise ValueError(f"{path}: caller {e.caller_id!r} has no token")
-            if "REPLACE-WITH" in e.token.upper() or e.token.startswith("<"):
+            if _placeholder(e.token):
                 raise ValueError(
                     f"{path}: caller {e.caller_id!r} still has a placeholder token. Mint "
                     f"one: python3 -c 'import secrets; print(secrets.token_urlsafe(32))'"
+                )
+            if len(e.token) < MIN_TOKEN_CHARS and (e.role == SUPERVISOR
+                                                   or e.tier == "commission"):
+                # These two keep a robot movable (the heartbeat) or arm it (the
+                # clear), so a guessable one is refused, not warned about.
+                held = "supervisor" if e.role == SUPERVISOR else "commission"
+                raise ValueError(
+                    f"{path}: caller {e.caller_id!r} is a {held} credential with a "
+                    f"{len(e.token)}-character token; a {held} token must have at least "
+                    f"{MIN_TOKEN_CHARS}. Mint one: python3 -c 'import secrets; "
+                    f"print(secrets.token_urlsafe(32))'"
                 )
             if len(e.token) < MIN_TOKEN_CHARS:
                 logging.getLogger(__name__).warning(
