@@ -90,7 +90,7 @@
 - **A placeholder token no longer loads as a credential.** robot-md's installer
   wrote `REPLACE-WITH-MINTED-TOKEN`; with a tier added by hand the gateway
   accepted it, at that tier. `BearerStore.from_yaml` now refuses empty and
-  placeholder tokens, and warns (`weak_bearer_token`) on one shorter than 16
+  placeholder tokens, and warns (`weak_bearer_token`) on one shorter than 32
   characters.
 
 ### Added

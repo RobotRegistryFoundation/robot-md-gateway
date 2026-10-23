@@ -228,7 +228,7 @@ stays held.
 The unit runs `serve --bearers /etc/robot-md-dispatcher/bearers.yaml`. Without
 that file systemd refuses to start it (`AssertPathExists=`). A file with no
 entries, an empty token or a placeholder token (`REPLACE-WITH-...`) stops the
-gateway at startup; a token shorter than 16 characters loads with a
+gateway at startup; a token shorter than 32 characters loads with a
 `weak_bearer_token` warning. If there is no file, `install.sh` creates one with
 two generated tokens, an `actuate`-tier one for the agent's client and a
 supervisor one for the heartbeat, and no commission token. It is `root:robot`

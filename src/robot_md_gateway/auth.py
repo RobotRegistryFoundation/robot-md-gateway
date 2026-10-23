@@ -50,8 +50,9 @@ class _BearerEntry:
 SUPERVISOR = "supervisor"
 
 #: Shorter tokens load, with a `weak_bearer_token` warning. Refusing them would
-#: break hand-written files that work today; robot-md's installer refuses them.
-MIN_TOKEN_CHARS = 16
+#: break hand-written files that work today; robot-md's installer refuses them
+#: at the same length. `secrets.token_urlsafe(32)` gives 43 characters.
+MIN_TOKEN_CHARS = 32
 
 
 class BearerStore:
