@@ -32,6 +32,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from robot_md_gateway.actuator import ActuatorOutcome, NoOpActuator
+from robot_md_gateway.auth import _BearerEntry
 from robot_md_gateway.cert.audit import AuditChain
 from robot_md_gateway.cert.policy import ToolAllowlist
 from robot_md_gateway.cert.safety import GatewayState, SafetyMonitor
@@ -40,6 +41,9 @@ from robot_md_gateway.receiver import make_app
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "manifests"
 STALE_S = 0.3
 BEARERS = {"read-token": "read", "actuate-token": "actuate", "commission-token": "commission"}
+#: The heartbeat credential: role supervisor, read tier, held by the person's device.
+SUPERVISOR = {"supervisor-token": _BearerEntry(token="supervisor-token", tier="read",
+                                              caller_id="pendant", role="supervisor")}
 ALLOWED = ("arm.move_to", "arm.estop", "arm.estop.clear")
 
 
@@ -109,6 +113,7 @@ def _app(arm, chain=None, *, staleness=STALE_S, monitor=None):
         resolver=_Resolver(),
         tool_allowlist=ToolAllowlist(allowed_tools=ALLOWED),
         bearer_tiers=BEARERS,
+        bearers=SUPERVISOR,
         safety_monitor=monitor,
         audit_chain=chain,
         actuator=arm,
@@ -132,7 +137,7 @@ def _invoke(client, tool, scope="MANIPULATE", token="actuate-token", msg_id=None
     )
 
 
-def _heartbeat(client, token="read-token"):
+def _heartbeat(client, token="supervisor-token"):
     return client.post("/v1/safety/heartbeat", headers={"Authorization": f"Bearer {token}"})
 
 
@@ -345,15 +350,22 @@ def test_after_a_resume_the_next_stale_heartbeat_stops_the_machine_again():
 # --------------------------------------------------------------------------- #
 
 
-def test_the_heartbeat_takes_any_known_bearer_and_nothing_else():
+def test_the_heartbeat_takes_only_the_supervisor_credential():
+    """Not a read token, not the agent's actuate token, not the commission
+    token: a credential that can move the robot, or that the agent may hold,
+    must never be what keeps the robot movable."""
     app = _app(_SimArm(), staleness=60.0)
     monitor = app.state.safety_monitor
     with TestClient(app) as client:
         assert client.post("/v1/safety/heartbeat").status_code == 401
         assert _heartbeat(client, token="nobody").status_code == 403
+        for token in ("read-token", "actuate-token", "commission-token"):
+            refused = _heartbeat(client, token=token)
+            assert refused.status_code == 403, token
+            assert refused.json()["detail"]["deny"] == "not_a_supervisor"
         before = monitor.last_heartbeat_at
         time.sleep(0.01)
-        response = _heartbeat(client, token="read-token")
+        response = _heartbeat(client)
     assert response.status_code == 200
     assert response.json() == {"state": "ready", "heartbeat_staleness_s": 60.0}
     assert monitor.last_heartbeat_at > before

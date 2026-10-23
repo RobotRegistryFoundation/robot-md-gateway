@@ -57,6 +57,7 @@ from .attestation import (
     outcome_status,
     telemetry_sha256_of,
 )
+from .auth import SUPERVISOR
 from .cert import report as cert_report
 from .cert.audit import AuditChain, AuditEntry
 from .cert.envelope import (
@@ -203,6 +204,19 @@ def make_app(
             getattr(entry, "tier", "anon"),
             getattr(entry, "caller_id", None),
         )
+    # The tokens SF-002's heartbeat is accepted from: entries with role
+    # supervisor, and only those. A supervisor is read tier, so no credential
+    # that can move the robot can also keep its heartbeat alive.
+    _supervisors: set[str] = set()
+    for token, entry in (bearers or {}).items():
+        if getattr(entry, "role", None) == SUPERVISOR:
+            if getattr(entry, "tier", None) != "read":
+                raise ValueError(
+                    f"supervisor credential {getattr(entry, 'caller_id', None)!r} has "
+                    f"tier {getattr(entry, 'tier', None)!r}; a supervisor must hold "
+                    f"the read tier"
+                )
+            _supervisors.add(token)
 
     def _principal(authorization: str | None) -> tuple[str, str | None]:
         """Resolve an Authorization header to (tier, caller).
@@ -1364,13 +1378,22 @@ def make_app(
     @app.post("/v1/safety/heartbeat")
     async def safety_heartbeat(authorization: str | None = Header(default=None)):
         """SF-002's heartbeat: send at least once per `heartbeat_staleness_s`
-        (3 s), from the client supervising the robot. Any known bearer may send
-        it. It only keeps a READY gateway READY: it never resumes a tripped one.
-        Runs on the event loop, not the worker pool, so a flood of blocking
-        requests does not starve it.
+        (3 s), from the supervisor's device. Accepted ONLY from a supervisor
+        credential (`role: supervisor`), which cannot move the robot; every
+        credential that can is refused, so the agent being supervised can never
+        keep its own heartbeat alive. It only keeps a READY gateway READY: it
+        never resumes a tripped one. Runs on the event loop, not the worker
+        pool, so a flood of blocking requests does not starve it.
         """
-        _known_principal(authorization)
+        tier, _caller = _known_principal(authorization)
         monitor = _require_monitor()
+        if authorization[7:] not in _supervisors:
+            raise HTTPException(status_code=403, detail={
+                "deny": "not_a_supervisor",
+                "reason": "heartbeats are accepted only from a supervisor credential "
+                          "(role: supervisor in bearers.yaml), which cannot move the "
+                          f"robot; this credential holds the {tier} tier",
+            })
         monitor.on_heartbeat()
         return {"state": monitor.state.value,
                 "heartbeat_staleness_s": monitor.heartbeat_staleness_s}
