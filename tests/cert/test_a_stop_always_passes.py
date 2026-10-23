@@ -413,3 +413,54 @@ def test_the_trip_sends_the_stop_at_the_tier_the_startup_check_used():
     app.state.safety_tick()
     assert done.wait(5)
     assert arm.calls == [("arm.estop", "read", None)]
+
+
+# castor-hal's TransportActuator (RobotRegistryFoundation/castor-hal#1) declares
+# these: its four stop spellings, and as motion every goal tool parse_goal maps,
+# which is its fail-safe default when the transport's type is not given.
+CASTOR_HAL_STOPS = frozenset({"estop", "stop", "emergency_stop", "halt"})
+CASTOR_HAL_GOALS = frozenset({
+    "move", "set_joint_positions", "joint_positions", "home", "go_home", "set_velocity",
+    "cmd_vel", "drive", "body_twist", "set_gripper", "gripper", "set_rate", "rate_setpoint",
+    "set_sections", "section_state", "flight_setpoint", "goto", "set_trajectory",
+    "joint_trajectory"})
+
+
+def test_castor_hals_fail_safe_declarations_start_and_get_its_first_stop_on_a_trip():
+    class _Transport(_Arm):
+        name = "castor-transport"
+        stop_capabilities = CASTOR_HAL_STOPS
+        motion_capabilities = CASTOR_HAL_GOALS
+
+    clock = _FakeClock()
+    transport = _Transport()
+    done = threading.Event()
+    original = transport.execute
+
+    def execute(**kw):
+        outcome = original(**kw)
+        done.set()
+        return outcome
+
+    transport.execute = execute
+    app = make_app(resolver=_Resolver(), actuator=transport, actuator_config={},
+                   safety_monitor=SafetyMonitor(last_heartbeat_at=clock()), clock=clock)
+    clock.t += 10
+    app.state.safety_tick()
+    assert done.wait(5)
+    assert transport.calls == [("emergency_stop", "read", None)]
+
+
+def test_a_telemetry_only_actuator_starts_and_is_named_as_unstoppable(caplog):
+    """castor-hal's J1939 tap: no goals and no stop. The gateway starts, says it
+    cannot stop it, and has nothing of it to refuse as motion."""
+    class _Tap(_Arm):
+        name = "j1939"
+        stop_capabilities = frozenset()
+        motion_capabilities = frozenset()
+
+    with caplog.at_level(logging.ERROR, logger="robot_md_gateway.receiver"):
+        make_app(resolver=_Resolver(), actuator=_Tap(), actuator_config={},
+                 safety_monitor=SafetyMonitor())
+    assert "no_declared_stop: actuator 'j1939'" in caplog.text
+    assert "stop_unreachable" not in caplog.text
