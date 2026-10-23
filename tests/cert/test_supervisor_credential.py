@@ -161,3 +161,23 @@ def test_the_supervisor_can_stop_the_robot():
         response = _post(client, "arm.estop", "SAFETY", "sup-token")
     assert response.status_code == 200, response.text
     assert arm.calls == ["arm.estop"]
+
+
+# --- placeholders (review of #35, Q7 a) ---------------------------------------
+
+
+@pytest.mark.parametrize("token", ["REPLACE-WITH-MINTED-TOKEN", "replace-with-minted-token",
+                                   "<that token>", "", "   "])
+def test_a_placeholder_or_empty_token_refuses_to_load(tmp_path, token):
+    """robot-md's installer wrote `REPLACE-WITH-MINTED-TOKEN`; with a tier
+    added by hand, the gateway loaded that public string as a credential."""
+    path = _write(tmp_path, [{"token": token, "tier": "commission", "caller": "operator"}])
+    with pytest.raises(ValueError, match=r"placeholder token|has no token"):
+        BearerStore.from_yaml(path)
+
+
+def test_a_short_token_loads_with_a_warning(tmp_path, caplog):
+    path = _write(tmp_path, [{"token": "short", "tier": "read", "caller": "c"}])
+    with caplog.at_level("WARNING", logger="robot_md_gateway.auth"):
+        BearerStore.from_yaml(path)
+    assert "weak_bearer_token: caller 'c' has a 5-character token" in caplog.text

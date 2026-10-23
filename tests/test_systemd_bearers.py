@@ -8,8 +8,9 @@ actuator). install.sh wrote a bearers.yaml of comments only, mode 0640.
 What these tests pin:
 - the unit passes --bearers and refuses to start when the file is missing;
 - the unit's service can actually read its config directory;
-- install.sh creates the bearer file with a generated token, mode 0600, owned
-  by the service user, never printed and never overwritten;
+- install.sh creates the bearer file with a generated actuate token and a
+  generated supervisor token, root:robot 0640, never printed and never
+  overwritten, not even by a run racing another;
 - the gateway itself refuses to serve when --bearers names a missing or empty
   file;
 - a bearers.yaml never gets committed from a checkout.
@@ -89,7 +90,7 @@ def test_the_unit_and_the_installer_agree_on_the_path():
 
 def test_install_sh_creates_the_bearer_file_through_the_helper():
     text = INSTALL.read_text()
-    assert '"$REPO_DIR/systemd/create-bearers.sh" "$CONFIG_DIR/bearers.yaml" robot robot' in text
+    assert '"$REPO_DIR/systemd/create-bearers.sh" "$CONFIG_DIR/bearers.yaml" root robot' in text
     # The old comment-only file, readable by the group, is gone.
     assert "chmod 0640 \"$CONFIG_DIR/bearers.yaml\"" not in text
 
@@ -104,21 +105,42 @@ def _create(path: Path) -> subprocess.CompletedProcess:
                           capture_output=True, text=True, check=False)
 
 
-def test_the_helper_writes_one_generated_token_0600_owned_by_the_service_user(tmp_path):
+def test_the_helper_writes_an_actuate_and_a_supervisor_token_0640(tmp_path):
     path = tmp_path / "bearers.yaml"
     result = _create(path)
 
     assert result.returncode == 0, result.stderr
     st = path.stat()
-    assert stat.S_IMODE(st.st_mode) == 0o600
+    assert stat.S_IMODE(st.st_mode) == 0o640
     assert (st.st_uid, st.st_gid) == (os.getuid(), os.getgid())
     store = BearerStore.from_yaml(path)            # the gateway can load it
-    [entry] = store._by_token.values()
-    assert entry.tier == "actuate"
-    assert entry.caller_id == "actuate-default"
-    assert len(entry.token) >= 40
+    entries = sorted(store._by_token.values(), key=lambda e: e.caller_id)
+    assert [(e.caller_id, e.tier, e.role) for e in entries] == [
+        ("actuate-default", "actuate", None), ("supervisor-default", "read", "supervisor")]
+    assert all(len(e.token) >= 40 for e in entries)
+    assert entries[0].token != entries[1].token
+    # No commission entry: clearing a stop is added by hand, deliberately.
+    assert "commission" not in {e.tier for e in entries}
     # Never printed: not on stdout, not on stderr.
-    assert entry.token not in result.stdout + result.stderr
+    assert not any(e.token in result.stdout + result.stderr for e in entries)
+
+
+def test_runs_racing_each_other_leave_exactly_one_file(tmp_path):
+    """The name is taken with link(2): of runs racing for it, one wins, the
+    others leave it unchanged, and no temporary file is left behind."""
+    owner, group = _me()
+    path = tmp_path / "bearers.yaml"
+    runs = [subprocess.Popen(["bash", str(CREATE), str(path), owner, group],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(8)]
+    results = [(r.wait(), r.stdout.read()) for r in runs]
+    for r in runs:
+        r.stdout.close()
+        r.stderr.close()
+    assert all(code == 0 for code, _ in results)
+    assert sum(out.startswith("created") for _, out in results) == 1
+    assert [p.name for p in tmp_path.iterdir()] == ["bearers.yaml"]
+    BearerStore.from_yaml(path)
 
 
 def test_the_helper_never_overwrites_an_existing_file(tmp_path):
@@ -131,11 +153,11 @@ def test_the_helper_never_overwrites_an_existing_file(tmp_path):
     assert "left unchanged" in again.stdout
 
 
-def test_every_install_gets_its_own_token(tmp_path):
+def test_every_install_gets_its_own_tokens(tmp_path):
     a, b = tmp_path / "a.yaml", tmp_path / "b.yaml"
     assert _create(a).returncode == 0 and _create(b).returncode == 0
-    tokens = [next(iter(BearerStore.from_yaml(p)._by_token)) for p in (a, b)]
-    assert tokens[0] != tokens[1]
+    tokens = [set(BearerStore.from_yaml(p)._by_token) for p in (a, b)]
+    assert not tokens[0] & tokens[1]
 
 
 def test_the_helper_leaves_nothing_behind_when_it_cannot_finish(tmp_path):
@@ -190,4 +212,5 @@ def test_the_yaml_the_helper_writes_is_the_documented_shape(tmp_path):
     assert _create(path).returncode == 0
     data = yaml.safe_load(path.read_text())
     assert set(data) == {"bearers"}
-    assert set(data["bearers"][0]) == {"token", "tier", "caller"}
+    assert [set(row) for row in data["bearers"]] == [
+        {"token", "tier", "caller"}, {"token", "role", "caller"}]

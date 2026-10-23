@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,10 @@ class _BearerEntry:
 
 #: The one role a bearer entry may declare (`role: supervisor` in bearers.yaml).
 SUPERVISOR = "supervisor"
+
+#: Shorter tokens load, with a `weak_bearer_token` warning. Refusing them would
+#: break hand-written files that work today; robot-md's installer refuses them.
+MIN_TOKEN_CHARS = 16
 
 
 class BearerStore:
@@ -103,6 +108,23 @@ class BearerStore:
         for e in entries:
             if e.tier not in ("read", "actuate", "commission"):
                 raise ValueError(f"invalid tier {e.tier!r} for caller {e.caller_id}")
+            # A placeholder is a public string. robot-md's installer shipped
+            # `REPLACE-WITH-MINTED-TOKEN`, and a file that kept it (with a tier
+            # added by hand) loaded it as a working credential, at any tier.
+            if not isinstance(e.token, str) or not e.token.strip():
+                raise ValueError(f"{path}: caller {e.caller_id!r} has no token")
+            if "REPLACE-WITH" in e.token.upper() or e.token.startswith("<"):
+                raise ValueError(
+                    f"{path}: caller {e.caller_id!r} still has a placeholder token. Mint "
+                    f"one: python3 -c 'import secrets; print(secrets.token_urlsafe(32))'"
+                )
+            if len(e.token) < MIN_TOKEN_CHARS:
+                logging.getLogger(__name__).warning(
+                    "weak_bearer_token: caller %r has a %d-character token; mint one of "
+                    "at least %d (python3 -c 'import secrets; "
+                    "print(secrets.token_urlsafe(32))')", e.caller_id, len(e.token),
+                    MIN_TOKEN_CHARS,
+                )
         # One token, one credential. A token listed twice used to keep whichever
         # entry came last, silently; listed once as a supervisor and once with
         # the actuate tier, it would be a heartbeat that can also move the robot.
