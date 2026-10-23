@@ -59,6 +59,10 @@ class NoOpActuator:
         "Built-in default. Logs envelope, returns no_op. Use until a driver is wired."
     )
     config_schema: dict = {}
+    #: It moves nothing, and says so: an actuator that declares no motion and
+    #: no stop does not keep a gateway from being cleared (armed).
+    motion_capabilities: frozenset[str] = frozenset()
+    stop_capabilities: frozenset[str] = frozenset()
 
     def execute(
         self,

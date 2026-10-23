@@ -134,7 +134,9 @@ def test_a_read_bearer_stops_whatever_scope_it_writes(state, scope):
     assert response.json()["scope"] == "SAFETY"
     assert arm.calls == [("arm.estop", "read", None)]
     assert _intent(chain).startswith(
-        "dispatching: a declared stop of actuator 'arm', judged as SAFETY")
+        "dispatched: a declared stop of actuator 'arm', judged as SAFETY")
+    # Sent first, recorded after (note H1 of the second review), and it says so.
+    assert _intent(chain).endswith("so this entry was written after the actuator was called")
     assert [(e.entry_kind, e.decision) for e in chain.entries] == [
         ("intent", "allow"), ("outcome", "allow")]
 
@@ -507,6 +509,53 @@ def test_an_actuator_that_refuses_the_gateways_stop_gets_no_more_motion():
     assert motion.status_code == 403
     assert motion.json()["detail"]["deny"] == "stop_unreachable"
     assert "refused the gateway's own stop" in motion.json()["detail"]["reason"]
+    assert [c[0] for c in arm.calls] == ["arm.estop"]
+
+
+@pytest.mark.parametrize("answer", [
+    lambda: ActuatorOutcome(success=False, outcome_kind="error",
+                            error_message="tier 'read' may not call arm.estop"),
+    lambda: (_ for _ in ()).throw(OSError("bus write failed")),
+    lambda: {"success": True},                     # not an outcome at all
+])
+def test_an_actuator_that_fails_the_gateways_stop_gets_no_more_motion(answer):
+    """Departure (e) of the second review: so-arm101-actuator main answers a
+    tier refusal with `error`, not `denied`, and that used to leave motion
+    through it allowed. Any unsuccessful answer to the gateway's own stop now
+    counts: no motion through that actuator until the gateway restarts."""
+    class _StopFails(_Arm):
+        def execute(self, *, envelope, manifest_path, tier, config):
+            if envelope["tool_name"] == "arm.estop":
+                self.calls.append((envelope["tool_name"], tier, manifest_path))
+                return answer()
+            return super().execute(envelope=envelope, manifest_path=manifest_path,
+                                   tier=tier, config=config)
+
+    clock, arm, chain = _FakeClock(), _StopFails(), AuditChain()
+    app = make_app(resolver=_Resolver(), bearer_tiers=BEARERS, bearers=SUPERVISOR,
+                   tool_allowlist=ToolAllowlist(allowed_tools=ALLOWED),
+                   safety_monitor=SafetyMonitor(last_heartbeat_at=clock()), audit_chain=chain,
+                   actuator=arm, actuator_config={}, clock=clock)
+    client = TestClient(app)
+    clock.t += 10
+    app.state.safety_tick()
+    deadline = time.monotonic() + 5
+    while not [e for e in chain.entries if e.decision_reason.startswith("safety_stop:")]:
+        assert time.monotonic() < deadline, "the gateway's stop was never recorded"
+        time.sleep(0.01)
+    [stop] = [e for e in chain.entries if e.decision_reason.startswith("safety_stop:")]
+    assert stop.decision == "allow"           # a fault, not a refusal: the error is recorded
+    assert stop.actuator_outcome_kind == "error"
+    assert stop.decision_reason.endswith("motion through it is refused from now on")
+    assert client.post("/v1/safety/heartbeat",
+                       headers={"Authorization": "Bearer supervisor-token"}).status_code == 200
+    assert client.post("/v1/safety/clear",
+                       headers={"Authorization": "Bearer commission-token"}).status_code == 200
+    motion = _post(client, _envelope(tool="arm.move_to", scope="MANIPULATE"),
+                   token="actuate-token")
+    assert motion.status_code == 403
+    assert motion.json()["detail"]["deny"] == "stop_unreachable"
+    assert "failed the gateway's own stop" in motion.json()["detail"]["reason"]
     assert [c[0] for c in arm.calls] == ["arm.estop"]
 
 

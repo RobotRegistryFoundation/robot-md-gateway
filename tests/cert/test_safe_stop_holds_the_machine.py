@@ -247,9 +247,14 @@ def test_a_motion_in_flight_is_stopped_and_the_machine_holds():
         _trip(app, clock)
         mover.join(15)
         assert monitor.state is GatewayState.SAFE_STOP
-        [stop] = arm.stops
+        stop, again = arm.stops
         assert stop["while_moving"], "the stop must reach the arm while it moves"
         assert box["r"].json()["telemetry"]["stopped_by_estop"] is True
+        # The trip began while the move was being dispatched, so the arm is sent
+        # its stop again once the move returns (blocking 1 of the second review).
+        assert not again["while_moving"]
+        assert box["r"].json()["stopped_again"].endswith(
+            "so arm.estop was sent to arm again after it returned")
 
         # ... and it HOLDS: nothing moves it afterwards, and a new motion is
         # refused by the gateway and recorded as a refusal.
@@ -350,7 +355,8 @@ def test_a_manifest_that_does_not_parse_cannot_cancel_the_trip_stop(tmp_path, co
         _trip(app, clock)
         mover.join(15)
     assert monitor.state is GatewayState.SAFE_STOP
-    assert len(arm.stops) == 1, "the gateway's stop was not sent"
+    assert arm.stops and arm.stops[0]["while_moving"], "the gateway's stop was not sent"
+    assert len(arm.stops) == 2            # and again once the move returned
     assert box["r"].json()["telemetry"]["stopped_by_estop"] is True
     assert _reasons(chain, "safety_stop:")
 
@@ -423,7 +429,8 @@ def test_a_clear_racing_an_unacted_trip_sends_the_stop_first_and_waits_for_it():
     assert monitor.state is GatewayState.READY
     assert first.status_code == 409
     assert "still being sent" in first.json()["detail"]["reason"]
-    assert len(arm.stops) == 1 and arm.stops[0]["while_moving"]
+    stop, again = arm.stops               # again: sent once the move returned
+    assert stop["while_moving"] and not again["while_moving"]
     assert box["r"].json()["telemetry"]["stopped_by_estop"] is True
     assert second.status_code == 200, second.text
 
