@@ -305,6 +305,7 @@ def main() -> None:
                 load_actuators_section,
             )
             from .cert.audit import AuditChain
+            from .cert.safety import SafetyMonitor
             from .receiver import make_app
 
             tool_allowlist = _build_tool_allowlist_from_env()
@@ -317,6 +318,20 @@ def main() -> None:
             # In-memory audit chain so executed invokes are recorded (and /v1/audit/last
             # works). Restart-wiped by design; persistence is out of scope here.
             audit_chain = AuditChain()
+            # SF-002 IN EVERY SERVED GATEWAY, with no switch to turn it off. The
+            # monitor starts READY and needs its first heartbeat within
+            # heartbeat_staleness_s (3 s); after that, a silence that long puts
+            # the gateway in SAFE_STOP and stops every actuator that declares a
+            # stop. Only POST /v1/safety/clear at commission tier, with fresh
+            # heartbeats, resumes it. make_app logs `no_safety_monitor` for any
+            # app built without one.
+            safety_monitor = SafetyMonitor()
+            logging.getLogger("robot_md_gateway.safety").info(
+                "safety monitor on: POST /v1/safety/heartbeat at least every %g s "
+                "or the gateway enters safe_stop and stops its actuators; resume "
+                "with POST /v1/safety/clear (commission tier)",
+                safety_monitor.heartbeat_staleness_s,
+            )
 
             from .attestation import load_signing_identity_from_env
 
@@ -367,6 +382,7 @@ def main() -> None:
                     require_rrn_binding=require_rrn_binding,
                     pinned_manifest_path=pinned_manifest_path,
                     audit_chain=audit_chain,
+                    safety_monitor=safety_monitor,
                     actuators=actuators,
                     actuator_configs=actuator_configs,
                     bearers=bearers,
@@ -396,6 +412,7 @@ def main() -> None:
                     require_rrn_binding=require_rrn_binding,
                     pinned_manifest_path=pinned_manifest_path,
                     audit_chain=audit_chain,
+                    safety_monitor=safety_monitor,
                     actuator=actuator_instance,
                     actuator_config=actuator_section["config"],
                     bearers=bearers,

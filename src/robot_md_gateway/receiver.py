@@ -19,7 +19,8 @@ Subsequent plans fill in:
 - confidence + HiTL gates (RC-003 / RC-004) — DONE Plan 6 Phase 1
   (opt-in via confidence_policy / hitl_policy),
 - ESTOP precedence (SF-001) + safe-stop (SF-002) — DONE Plan 6 Phase 4
-  (opt-in via safety_monitor),
+  (opt-in via safety_monitor for make_app; `serve` always passes one, and a
+  watchdog enforces staleness and stops the actuators on a trip),
 - audit bundle export (EV-001) — DONE Plan 6 Phase 4 (opt-in via audit_chain),
 - key revocation polling (RR-001 / RR-002) — DONE Plan 6 Phase 2
   (opt-in via revocation_resolver).
@@ -28,10 +29,13 @@ Subsequent plans fill in:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
+import threading
 import time
+import uuid
 import weakref
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,7 +79,7 @@ from .cert.policy import (
 )
 from .cert.revocation import RevocationCache, RRFRevocationResolver
 from .cert.rrn_binding import verify_rrn_binding
-from .cert.safety import SafetyMonitor
+from .cert.safety import GatewayState, SafetyMonitor
 from .manifest_provenance import RRFResolver, verify_manifest
 
 _DEFAULT_ALLOWLIST = ToolAllowlist(allowed_tools=("mcp__robot__render", "mcp__robot__validate"))
@@ -84,6 +88,20 @@ _DEFAULT_ALLOWLIST = ToolAllowlist(allowed_tools=("mcp__robot__render", "mcp__ro
 #: Every other request shares the default pool of 40. A stop is quick and
 #: idempotent, so a handful is plenty, and a burst of stops only queues stops.
 STOP_LANES = 8
+
+#: How often the safety watchdog ticks the monitor, in seconds. SF-002's bench
+#: criterion is SAFE_STOP within 3.5 s of the last heartbeat under a 3 s
+#: staleness rule, so the tick has to land well inside the remaining 0.5 s. An
+#: ESTOP wire trip set through app.state.safety_monitor is acted on within one
+#: tick as well.
+SAFETY_TICK_S = 0.1
+
+#: The tier the gateway passes to an actuator when it sends that actuator's
+#: stop itself. No caller credential is involved in that stop, so this is not a
+#: bearer's tier; it is the lowest tier there is, because a stop is the one act
+#: no tier may be refused (so-arm101-actuator gives `arm.estop` to every tier)
+#: and nothing on this path may need more.
+SAFETY_STOP_TIER = "read"
 
 # Manifest frontmatter cache keyed by path -> (mtime, frontmatter dict). Used by the
 # RRN-binding (B4) and manifest-driven HiTL (B3) gates so they read the manifest's
@@ -270,12 +288,46 @@ def make_app(
     # constructed fresh on every call (which would defeat caching entirely).
     if revocation_resolver is not None and revocation_cache is None:
         revocation_cache = RevocationCache()
-    app = FastAPI(title="robot-md-gateway", version="0.4.0a1")
-    # Operators access these via app.state for ESTOP wire integration,
-    # heartbeat injection, and audit-bundle export. ESTOP and heartbeat are
-    # conceptually GPIO/transport-level signals — not exposed as HTTP routes
-    # because that conflates physical-wire semantics (SF-001 cert claim) with
-    # HTTP-layer auth.
+    if safety_monitor is None:
+        # The opt-out is for tests and embedders, and it is loud. `serve`
+        # always passes a monitor and has no switch to drop it.
+        logging.getLogger(__name__).warning(
+            "no_safety_monitor: this gateway enforces no heartbeat staleness "
+            "(SF-002) and will not stop its actuators if its clients go silent. "
+            "`robot-md-gateway serve` always runs one; pass "
+            "make_app(safety_monitor=SafetyMonitor()) anywhere else that drives "
+            "hardware."
+        )
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        # The watchdog runs for exactly as long as the app is served. It is a
+        # thread, not a task on the event loop, because a stop it sends is a
+        # blocking call into a driver (a serial bus, say), and the loop must
+        # keep answering heartbeats and stops while one is in progress.
+        if safety_monitor is None:
+            yield
+            return
+        stopping = threading.Event()
+        watchdog = threading.Thread(
+            target=_safety_watchdog, args=(stopping,),
+            name="robot-md-gateway-safety-watchdog", daemon=True,
+        )
+        watchdog.start()
+        try:
+            yield
+        finally:
+            stopping.set()
+            watchdog.join(timeout=5)
+
+    app = FastAPI(title="robot-md-gateway", version="0.4.0a1", lifespan=_lifespan)
+    # Operators access these via app.state for ESTOP wire integration and
+    # audit-bundle export. The ESTOP wire is a GPIO/transport-level signal and
+    # stays off HTTP: putting it behind HTTP-layer auth would conflate
+    # physical-wire semantics (the SF-001 claim) with a bearer check. The
+    # heartbeat and the operator's clear are HTTP routes (/v1/safety/*) because
+    # SF-002 is a network-loss rule: the heartbeat has to cross the same network
+    # whose loss it detects, and nothing else delivered one to this process.
     app.state.safety_monitor = safety_monitor
     app.state.audit_chain = audit_chain
     app.state.revocation_cache = revocation_cache
@@ -608,14 +660,132 @@ def make_app(
             caller=caller, tier=tier,
         )
 
+    # ---- SF-001 / SF-002: what a trip does to the machine -------------------
+    #
+    # Refusing new requests is not stopping the machine. A paced move already
+    # dispatched keeps going, and a goal an actuator holds stays set, until the
+    # actuator is told to stop. So every time the monitor leaves READY (stale
+    # heartbeat, ESTOP wire) the gateway sends each actuator that declares one
+    # its own stop tool, once per trip, whether or not any request is arriving.
+    #
+    # `_safety_seen` is the state this gateway last acted on. Reading it and
+    # ticking the monitor happen under one lock, so a watchdog tick and a
+    # request tick racing over the same transition send one stop, not two.
+    _safety_lock = threading.Lock()
+    _safety_seen: list = [safety_monitor.state if safety_monitor is not None else None]
+
+    def _safety_check() -> GatewayState:
+        """Tick the monitor; if it has just left READY, stop the actuators.
+
+        Called by the watchdog every SAFETY_TICK_S and by every request.
+        Returns the state the caller should act on.
+        """
+        with _safety_lock:
+            safety_monitor.tick()
+            state = safety_monitor.state
+            age = time.monotonic() - safety_monitor.last_heartbeat_at
+            left_ready = _safety_seen[0] is GatewayState.READY and state is not GatewayState.READY
+            _safety_seen[0] = state
+        if left_ready:
+            if state is GatewayState.SAFE_STOP:
+                why = (f"no heartbeat for {age:.1f} s, limit "
+                       f"{safety_monitor.heartbeat_staleness_s:g} s")
+            else:
+                why = "ESTOP wire tripped"
+            _stop_actuators(state, why)
+        return state
+
+    def _stop_actuators(state: GatewayState, why: str) -> None:
+        """Send every actuator that declares a stop its stop, as the gateway.
+
+        No caller credential is involved and no gate is consulted: the
+        allowlist and the tiers decide what a CALLER may do, and nothing may
+        decide that the gateway cannot stop its own machine. Each actuator gets
+        the first of its `stop_capabilities` (sorted, so it is the same one on
+        every run). What the stop does is the actuator's: so-arm101-actuator's
+        `arm.estop` latches, ends a paced move at its next setpoint and holds
+        the pose, in software.
+
+        Never raises. A stop that fails is logged and recorded, and the next
+        actuator is still stopped. An actuator that declares no stop cannot be
+        stopped from here, and the log says exactly that rather than implying
+        otherwise; the gateway still refuses it every request but its stop.
+        """
+        log = logging.getLogger(__name__)
+        pairs = (sorted(actuators.items()) if multi_actuator_mode
+                 else [(getattr(actuator, "name", "actuator"), actuator)])
+        targets = []
+        for name, act in pairs:
+            stops = sorted(as_tool_set(getattr(act, "stop_capabilities", None)))
+            if stops:
+                config = actuator_configs.get(name, {}) if multi_actuator_mode else actuator_config
+                targets.append((name, act, config, stops[0]))
+        if not targets:
+            log.error(
+                "safety_stop: gateway entered %s (%s), and no actuator declares a "
+                "stop tool, so nothing was told to stop. New requests are refused "
+                "until an operator clears it.", state.value, why,
+            )
+            return
+        fm = _manifest_frontmatter(str(pinned_manifest_path)) if pinned_manifest_path else {}
+        rrn = (fm.get("metadata") or {}).get("rrn") or fm.get("rrn") or ""
+        for name, act, config, tool in targets:
+            msg_id = f"safety-stop-{uuid.uuid4().hex[:12]}"
+            stop_envelope = {
+                "msg_id": msg_id, "type": "rcan/v1/invoke", "scope": "SAFETY",
+                "tool_name": tool, "tool_args": {}, "actuator_name": name,
+                "manifest_path": str(pinned_manifest_path or ""),
+            }
+            started = datetime.now(tz=timezone.utc).isoformat()
+            try:
+                outcome = act.execute(
+                    envelope=stop_envelope, manifest_path=pinned_manifest_path,
+                    tier=SAFETY_STOP_TIER, config=config,
+                )
+                error_kind: str | None = None
+            except Exception as exc:
+                outcome = ActuatorOutcome(
+                    success=False, outcome_kind="error", error_message=str(exc),
+                )
+                error_kind = type(exc).__name__
+            ended = datetime.now(tz=timezone.utc).isoformat()
+            refused = not outcome.success and outcome.outcome_kind == "denied"
+            reason = f"safety_stop: gateway {state.value} ({why}); sent {tool} to {name}"
+            if not outcome.success:
+                reason += f"; it did not succeed: {outcome.error_message}"
+            (log.warning if outcome.success else log.error)(
+                "%s (outcome: %s)", reason, outcome.outcome_kind,
+            )
+            try:
+                _record_with_outcome(
+                    decision="deny" if refused else "allow", reason=reason,
+                    kid=None, msg_id=msg_id, outcome=outcome, error_kind=error_kind,
+                    actuator_name=name, envelope_dict=stop_envelope, ruri=None,
+                    rrn=rrn, started_at=started, ended_at=ended, caller=None, tier=None,
+                )
+            except Exception:
+                log.warning("safety_stop: recording the stop failed (non-fatal)",
+                            exc_info=True)
+
+    def _safety_watchdog(stopping: threading.Event) -> None:
+        """Tick the monitor while the app is served, requests or none."""
+        while not stopping.wait(SAFETY_TICK_S):
+            try:
+                _safety_check()
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "safety_watchdog: a tick failed; the next runs in %.1f s", SAFETY_TICK_S,
+                )
+
     def _invoke(envelope_dict: dict, authorization: str | None):
         # `caller` rides every audit entry and every signed receipt from here
         # down. It is the CREDENTIAL's name, never a person's.
         tier, caller = _principal(authorization)
 
-        # SF-001/SF-002: safety state preempts all other gates. Per-request
-        # tick is sufficient — if no requests are arriving, no actuation can
-        # occur, so missing a tick during idle is safe by construction.
+        # SF-001/SF-002: safety state preempts all other gates. The request
+        # ticks the monitor too, so it never acts on a state older than itself;
+        # the watchdog is what enforces staleness between requests, because a
+        # motion already dispatched keeps going whether or not anyone is asking.
         # FastAPI guarantees envelope_dict is a dict — Body(...) typed dict
         # rejects non-object JSON with 422 before the handler runs, so we
         # can read msg_id directly with a default for the missing-field case.
@@ -632,14 +802,14 @@ def make_app(
         # is chosen it must be one that declares this tool as its stop.
         stop_past_safety_state = False
         if safety_monitor is not None:
-            safety_monitor.tick()
+            state = _safety_check()
             tool = envelope_dict.get("tool_name")
-            if safety_monitor.can_actuate():
+            if state is GatewayState.READY:
                 pass
             elif isinstance(tool, str) and tool in _stop_tools:
                 stop_past_safety_state = True
             else:
-                reason = f"gateway state={safety_monitor.state.value}"
+                reason = f"gateway state={state.value}"
                 signed, marker = _record(
                     "deny", f"safety_state: {reason}", None, raw_msg_id,
                     envelope_dict=envelope_dict, ruri=envelope_dict.get("ruri"),
@@ -1142,5 +1312,81 @@ def make_app(
             raise HTTPException(status_code=404, detail="audit chain empty")
         last = audit_chain.entries[-1]
         return last.__dict__
+
+    def _known_principal(authorization: str | None) -> tuple[str, str | None]:
+        """(tier, caller) for a bearer this gateway knows; 401/403 otherwise,
+        the same answers /v1/audit/last gives. Never anon: an unauthenticated
+        heartbeat would let anyone who can reach the port keep a robot movable,
+        and over Tailscale Funnel that is anyone at all."""
+        if authorization is None or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="missing Authorization header")
+        principal = _bearer_index.get(authorization[7:])
+        if principal is None:
+            raise HTTPException(status_code=403, detail="unknown bearer")
+        return principal
+
+    def _require_monitor() -> SafetyMonitor:
+        if safety_monitor is None:
+            raise HTTPException(status_code=404, detail="this gateway runs no safety monitor")
+        return safety_monitor
+
+    @app.post("/v1/safety/heartbeat")
+    async def safety_heartbeat(authorization: str | None = Header(default=None)):
+        """SF-002's heartbeat: send at least once per `heartbeat_staleness_s`
+        (3 s), from the client supervising the robot. Any known bearer may send
+        it. It only keeps a READY gateway READY: it never resumes a tripped one.
+        Runs on the event loop, not the worker pool, so a flood of blocking
+        requests does not starve it.
+        """
+        _known_principal(authorization)
+        monitor = _require_monitor()
+        monitor.on_heartbeat()
+        return {"state": monitor.state.value,
+                "heartbeat_staleness_s": monitor.heartbeat_staleness_s}
+
+    @app.post("/v1/safety/clear")
+    def safety_clear(authorization: str | None = Header(default=None)):
+        """The operator's resume signal, after a safe-stop or an ESTOP.
+
+        Two conditions, both kept from the existing design: SafetyMonitor.clear
+        needs the `commission` tier, and recovery needs FRESH heartbeats (the
+        pendant integration spec's staleness rule). A clear sent while the
+        heartbeat is stale is refused rather than allowed to drop straight back
+        into SAFE_STOP on the next tick. Allowed or refused, it is audited with
+        the credential that sent it.
+
+        It restores the gateway's state only. Each actuator keeps its own latch
+        (so-arm101-actuator: `arm.estop.clear`, commission tier), so a resume is
+        two explicit acts.
+        """
+        tier, caller = _known_principal(authorization)
+        monitor = _require_monitor()
+        msg_id = f"safety-clear-{uuid.uuid4().hex[:12]}"
+        age = time.monotonic() - monitor.last_heartbeat_at
+        if age > monitor.heartbeat_staleness_s:
+            reason = (
+                f"safety.clear: refused, the last heartbeat was {age:.1f} s ago "
+                f"(limit {monitor.heartbeat_staleness_s:g} s); send heartbeats, then clear"
+            )
+            if audit_chain is not None:
+                audit_chain.append(AuditEntry(
+                    msg_id=msg_id, timestamp_ms=int(time.time() * 1000),
+                    decision="deny", decision_reason=reason, envelope_kid=None,
+                    caller=caller, tier=tier,
+                ))
+            raise HTTPException(status_code=403, detail={
+                "deny": "safety_clear", "reason": reason, "state": monitor.state.value,
+            })
+        with _safety_lock:
+            cleared, reason = monitor.clear(
+                tier=tier, audit_chain=audit_chain, msg_id=msg_id, caller=caller,
+            )
+            if cleared:
+                _safety_seen[0] = monitor.state
+        if not cleared:
+            raise HTTPException(status_code=403, detail={
+                "deny": "safety_clear", "reason": reason, "state": monitor.state.value,
+            })
+        return {"state": monitor.state.value, "reason": reason}
 
     return app
