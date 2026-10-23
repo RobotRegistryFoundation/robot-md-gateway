@@ -98,9 +98,9 @@ SAFETY_TICK_S = 0.1
 
 #: The tier the gateway passes to an actuator when it sends that actuator's
 #: stop itself. No caller credential is involved in that stop, so this is not a
-#: bearer's tier; it is the lowest tier there is, because a stop is the one act
-#: no tier may be refused (so-arm101-actuator gives `arm.estop` to every tier)
-#: and nothing on this path may need more.
+#: bearer's tier; it is the lowest tier a bearer can hold, because a stop is the
+#: one act no bearer tier may be refused (so-arm101-actuator gives `arm.estop`
+#: to read, actuate and commission) and nothing on this path may need more.
 SAFETY_STOP_TIER = "read"
 
 # Manifest frontmatter cache keyed by path -> (mtime, frontmatter dict). Used by the
