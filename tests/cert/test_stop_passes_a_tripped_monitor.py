@@ -6,9 +6,10 @@ READY: the stop tools too. A gateway in SAFE_STOP or ESTOP_ACTIVE therefore
 refused the one command an operator sends when something is wrong.
 
 The exemption is exactly: a tool that the receiving actuator declares in
-`stop_capabilities`. It is an exemption from the safety-state check only; the
-stop still passes every other gate (bearer tier, allowlist, manifest), and it
-is still recorded like any other dispatch.
+`stop_capabilities`. Such a stop takes its own path (see
+test_a_stop_always_passes.py for the gates it skips), and it still meets the
+operator's allowlist and per-tool tiers, needs a bearer the gateway knows, and
+is recorded like any other dispatch.
 """
 
 from __future__ import annotations
@@ -166,9 +167,9 @@ def test_a_stop_routed_by_name_to_its_actuator_runs_in_multi_actuator_mode():
     assert arm.calls == ["arm.estop"] and cam.calls == []
 
 
-def test_the_exempt_stop_still_passes_every_other_gate():
-    """Only the safety-state check is skipped. A stop the operator has not
-    allowlisted is still refused by the allowlist, signed and audited."""
+def test_a_stop_still_meets_the_operators_allowlist():
+    """The allowlist is the operator's own list of tools. A stop the operator
+    has not allowlisted is refused by it, signed and audited."""
     arm, chain = _Arm(), AuditChain()
     with _client(GatewayState.SAFE_STOP, allowed=("arm.move_to",), chain=chain,
                  actuator=arm, actuator_config={}) as client:
@@ -180,22 +181,23 @@ def test_the_exempt_stop_still_passes_every_other_gate():
     assert [e.decision for e in chain.entries] == ["deny"]
 
 
-def test_a_stop_from_an_unknown_bearer_is_not_given_a_higher_tier():
-    """The exemption does not touch the principal: a request with no bearer is
-    still anon all the way to the actuator."""
-    seen: list[str] = []
-
-    class _TierSpy(_Arm):
-        def execute(self, *, envelope, manifest_path, tier, config):
-            seen.append(tier)
-            return super().execute(envelope=envelope, manifest_path=manifest_path,
-                                   tier=tier, config=config)
-
-    with _client(GatewayState.SAFE_STOP, actuator=_TierSpy(), actuator_config={}) as client:
-        response = client.post("/v1/invoke", json={
+@pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer nobody-knows-this"}])
+def test_a_stop_from_an_unknown_bearer_is_refused_and_recorded(headers):
+    """A stop skips the signature, so the bearer is what identifies it: one
+    this gateway knows, of any tier. Over Tailscale Funnel an unknown caller is
+    anyone on the internet. The refusal is a signed, recorded deny, and the
+    actuator never sees the request."""
+    arm, chain = _Arm(), AuditChain()
+    with _client(GatewayState.SAFE_STOP, chain=chain, actuator=arm,
+                 actuator_config={}) as client:
+        response = client.post("/v1/invoke", headers=headers, json={
             "msg_id": "anon-stop", "type": "rcan/v1/invoke", "ruri": "rcan://RRN-test/arm",
             "scope": "HALT", "tool_name": "arm.estop", "tool_args": {},
             "manifest_path": str(FIXTURES / "signed-good.md"),
         })
-    assert response.status_code == 200, response.text
-    assert seen == ["anon"]
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"]["deny"] == "tier_policy"
+    assert arm.calls == []
+    [entry] = chain.entries
+    assert (entry.decision, entry.tier) == ("deny", "anon")
+    assert entry.decision_reason.startswith("tier_policy: a stop needs a bearer")

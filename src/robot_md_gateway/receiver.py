@@ -33,11 +33,12 @@ import contextlib
 import hashlib
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,6 +146,18 @@ class _Trip:
     def settled(self) -> bool:
         """Every stop has answered, or the gateway has stopped waiting for it."""
         return all(s.status in ("done", "timed_out") for s in self.sends)
+
+
+def _declared_required_tiers(act: object) -> Mapping:
+    """The tiers an actuator says each of its tools needs, where it says so: a
+    `required_tiers` mapping on the actuator, else a module-level
+    REQUIRED_TIERS mapping beside its class (so-arm101-actuator has one).
+    Empty when it says nothing, and then nothing can be checked."""
+    for value in (getattr(act, "required_tiers", None),
+                  getattr(sys.modules.get(type(act).__module__), "REQUIRED_TIERS", None)):
+        if isinstance(value, Mapping):
+            return value
+    return {}
 
 
 # Manifest frontmatter cache keyed by path -> (mtime, frontmatter dict). Used by the
@@ -320,12 +333,48 @@ def make_app(
     # reads nothing that can fail at the moment it matters, not ROBOT.md and
     # not a declaration (review of #35, finding 1).
     _stop_targets: list[tuple[str, object, dict, str]] = []
+    # WHAT EACH ACTUATOR DECLARES, checked here, once (review of #35, finding 8):
+    # - a tool declared both as a stop and as a motion would pass a tripped
+    #   gateway AND be sent unprompted on every trip: the gateway refuses to
+    #   start, because that is a defect in the actuator, not a setting;
+    # - an actuator that would refuse its own declared stop at
+    #   SAFETY_STOP_TIER cannot be stopped by the gateway on a trip, so every
+    #   motion through it is refused (`_stop_unaccepted`), with a signed deny;
+    # - an actuator that declares no stop cannot be stopped on a trip at all.
+    #   That is logged as an error rather than refused: the gateway cannot
+    #   tell its motions apart either.
+    _stop_unaccepted: dict[int, str] = {}
     for _name, _act in (sorted(actuators.items()) if multi_actuator_mode
                         else [(getattr(actuator, "name", "actuator"), actuator)]):
-        _declared = sorted(as_tool_set(getattr(_act, "stop_capabilities", None)))
-        if _declared:
-            _config = actuator_configs.get(_name, {}) if multi_actuator_mode else actuator_config
-            _stop_targets.append((_name, _act, _config, _declared[0]))
+        _stops = as_tool_set(getattr(_act, "stop_capabilities", None))
+        _both = sorted(_stops & as_tool_set(getattr(_act, "motion_capabilities", None)))
+        if _both:
+            raise ValueError(
+                f"actuator {_name!r} declares {', '.join(_both)} as both a stop and a "
+                f"motion; a stop passes a tripped gateway and is sent on every trip, so "
+                f"a tool cannot be both. Fix the actuator's stop_capabilities or "
+                f"motion_capabilities."
+            )
+        if not _stops:
+            if safety_monitor is not None:
+                logging.getLogger(__name__).error(
+                    "no_declared_stop: actuator %r declares no stop_capabilities, so when "
+                    "the gateway trips it sends this actuator nothing and cannot stop it; "
+                    "it still refuses this actuator every request until a clear", _name,
+                )
+            continue
+        _tool = sorted(_stops)[0]
+        _config = actuator_configs.get(_name, {}) if multi_actuator_mode else actuator_config
+        _stop_targets.append((_name, _act, _config, _tool))
+        _accepting = _declared_required_tiers(_act).get(_tool)
+        if _accepting is not None and SAFETY_STOP_TIER not in as_tool_set(_accepting):
+            _stop_unaccepted[id(_act)] = (
+                f"actuator {_name!r} requires one of {sorted(as_tool_set(_accepting))} for "
+                f"its stop {_tool}, and the gateway sends its own stop at tier "
+                f"{SAFETY_STOP_TIER!r}, so it could not stop this actuator on a trip; motion "
+                f"through it is refused"
+            )
+            logging.getLogger(__name__).error("stop_unreachable: %s", _stop_unaccepted[id(_act)])
     # The robot's RRN for the gateway's own records (trips, stops, clears),
     # read once from the pinned manifest. Best effort: "" if it cannot be read.
     _pinned_rrn = ""
@@ -542,6 +591,7 @@ def make_app(
         kid: str | None,
         caller: str | None,
         tier: str | None,
+        note: str | None = None,
     ) -> str | None:
         """Write the RECORD BEFORE DISPATCH, and return its audit chain hash.
 
@@ -583,7 +633,8 @@ def make_app(
                     msg_id=msg_id,
                     timestamp_ms=int(time.time() * 1000),
                     decision="allow",
-                    decision_reason="dispatching: all gates passed, actuator not yet called",
+                    decision_reason=(f"dispatching: {note}; actuator not yet called" if note
+                                     else "dispatching: all gates passed, actuator not yet called"),
                     envelope_kid=kid,
                     caller=caller,
                     tier=tier,
@@ -1007,13 +1058,16 @@ def make_app(
         tier: str,
         caller: str | None,
         started_at: str,
+        note: str | None = None,
     ) -> dict:
         """Record, dispatch to the actuator, record again, and answer.
 
         Everything after the gates: the intent written before dispatch, the
         call into the actuator, the outcome record, and the 200, 403 or 500
         that goes back. Shared by the gated path and the stop path, so the
-        records and the response cannot drift apart between them.
+        records and the response cannot drift apart between them. `note`
+        replaces "all gates passed" in the intent record (the stop path says
+        which gates a stop skips).
         """
         # RECORD BEFORE DISPATCH (RCAN 6.3). Every gate above has passed and the
         # actuator has been chosen; the next statement is the one that can move
@@ -1033,7 +1087,7 @@ def make_app(
             msg_id=msg_id, envelope_dict=envelope_dict,
             ruri=ruri, rrn=rrn,
             tool_name=tool_name, actuator_name=target_actuator.name,
-            kid=kid, caller=caller, tier=tier,
+            kid=kid, caller=caller, tier=tier, note=note,
         )
 
         # Capture outcome regardless of success so the audit entry records
@@ -1129,47 +1183,139 @@ def make_app(
         _attach_signature(response, signed_outcome, marker)
         return response
 
+    def _deny(gate: str, reason: str, *, kid: str | None, msg_id: str, envelope_dict: dict,
+              ruri: str | None, rrn: str, started_at: str, caller: str | None,
+              tier: str) -> None:
+        """Record a refusal and answer it with a signed 403. Always raises."""
+        signed, marker = _record(
+            "deny", f"{gate}: {reason}", kid, msg_id, envelope_dict=envelope_dict,
+            ruri=ruri, rrn=rrn, started_at=started_at, caller=caller, tier=tier,
+        )
+        detail = {"deny": gate, "reason": reason}
+        _attach_signature(detail, signed, marker)
+        raise HTTPException(status_code=403, detail=detail)
+
+    def _declared_stop(envelope_dict: dict) -> tuple[str, Actuator, dict] | None:
+        """(name, actuator, config) when this request is a DECLARED STOP: its
+        tool is in the `stop_capabilities` of the actuator it goes to. With
+        several actuators and no `actuator_name`, exactly one of them must
+        declare it. Anything else is not a stop and takes the gated path: a
+        stop tool named for an actuator that does not declare it is just a
+        tool there."""
+        tool = envelope_dict.get("tool_name")
+        if not isinstance(tool, str) or tool not in _stop_tools:
+            return None
+
+        def declares(act: object) -> bool:
+            return tool in as_tool_set(getattr(act, "stop_capabilities", None))
+
+        if not multi_actuator_mode:
+            if not declares(actuator):
+                return None
+            return getattr(actuator, "name", "actuator"), actuator, actuator_config
+        name = envelope_dict.get("actuator_name")
+        if name is not None:
+            act = actuators.get(name) if isinstance(name, str) else None
+            return (name, act, actuator_configs.get(name, {})) if declares(act) else None
+        declaring = [(n, a) for n, a in sorted(actuators.items()) if declares(a)]
+        if len(declaring) != 1:
+            return None
+        name, act = declaring[0]
+        return name, act, actuator_configs.get(name, {})
+
+    def _invoke_stop(envelope_dict: dict, stop: tuple[str, Actuator, dict], *,
+                     tier: str, caller: str | None, started_at: str) -> dict:
+        """A caller's DECLARED STOP (review of #35, finding 4).
+
+        A stop is judged as SAFETY, whatever scope the envelope carries, and it
+        passes whatever state the gateway is in. Of the gates, it meets only
+        those that cannot refuse it by accident: the schema, a bearer this
+        gateway knows (any tier), the operator's tool allowlist and per-tool
+        tiers. It skips the rest, each for a stated reason:
+        - signature, freshness, revocation: a halt must never need the key
+          registry (an offline lookup after a restart refused every signed
+          stop), and a stop from a revoked key is still a stop (rcan-spec
+          revocation and offline rules);
+        - replay: a fresh duplicate stop is processed, and logged as
+          REPLAY_DETECTED (rcan-spec replay-prevention);
+        - manifest pin, provenance, RRN binding: the actuator is given the
+          pinned manifest, or none, never the one the request names;
+        - confidence and HiTL: they key off the scope, and a stop is not
+          gated on a model's confidence or on a person's approval.
+        What it skipped is written into the intent record.
+        """
+        name, target, config = stop
+        try:
+            envelope = InvokeEnvelope(**envelope_dict)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        common = dict(kid=None, msg_id=envelope.msg_id, envelope_dict=envelope_dict,
+                      ruri=envelope.ruri, rrn=_pinned_rrn, started_at=started_at,
+                      caller=caller, tier=tier)
+        if tier == "anon":
+            # Over Tailscale Funnel an unknown caller is anyone on the internet.
+            _deny("tier_policy", "a stop needs a bearer this gateway knows (any tier); "
+                  "this request carried none, or one it does not know", **common)
+        ok, reason = check_tier(tier, "SAFETY", msg_id=envelope.msg_id)
+        if not ok:
+            _deny("tier_policy", reason, **common)
+        allowed, reason = check_tool(envelope.tool_name, tool_allowlist, msg_id=envelope.msg_id)
+        if not allowed:
+            _deny("tool_allowlist", reason, **common)
+        allowed, reason = check_tool_tier(
+            envelope.tool_name, tier, tool_tier_requirements, msg_id=envelope.msg_id
+        )
+        if not allowed:
+            _deny("tool_tier", reason, **common)
+
+        notes = [f"a declared stop of actuator {name!r}, judged as SAFETY"]
+        if envelope.scope.upper() != "SAFETY":
+            notes[0] += f" (the envelope said {envelope.scope!r})"
+        if require_envelope_signature:
+            notes.append("signature, freshness and revocation are not checked on a stop")
+            if replay_cache.has_seen(envelope.msg_id):
+                notes.append(f"REPLAY_DETECTED: msg_id {envelope.msg_id} was seen before; "
+                             f"a stop is processed anyway")
+            else:
+                replay_cache.record(envelope.msg_id)
+        if safety_monitor is not None and safety_monitor.state is not GatewayState.READY:
+            notes.append(f"gateway state={safety_monitor.state.value}")
+        return _dispatch(
+            envelope_dict=envelope_dict, msg_id=envelope.msg_id, ruri=envelope.ruri,
+            scope="SAFETY", tool_name=envelope.tool_name,
+            target_actuator=target, target_config=config,
+            manifest_path=pinned_manifest_path, kid=None, rrn=_pinned_rrn,
+            tier=tier, caller=caller, started_at=started_at, note="; ".join(notes),
+        )
+
     def _invoke(envelope_dict: dict, authorization: str | None):
         # `caller` rides every audit entry and every signed receipt from here
         # down. It is the CREDENTIAL's name, never a person's.
         tier, caller = _principal(authorization)
-
-        # SF-001/SF-002: safety state preempts all other gates. The request
-        # ticks the monitor too, so it never acts on a state older than itself;
-        # the watchdog is what enforces staleness between requests, because a
-        # motion already dispatched keeps going whether or not anyone is asking.
         # FastAPI guarantees envelope_dict is a dict — Body(...) typed dict
         # rejects non-object JSON with 422 before the handler runs, so we
         # can read msg_id directly with a default for the missing-field case.
         raw_msg_id = envelope_dict.get("msg_id", "<unknown>")
         started_at = datetime.now(tz=timezone.utc).isoformat()
 
-        # A STOP ALWAYS GETS THROUGH THE SAFETY STATE. This check used to refuse
-        # every request outside READY, the stop tools included, so a gateway in
-        # SAFE_STOP or ESTOP_ACTIVE refused the one command an operator sends
-        # when something is wrong. The exemption is exactly a tool some actuator
-        # declares in `stop_capabilities`: nothing else, not the clear (it makes
-        # the robot movable again), not a read. It skips this check and no
-        # other; the stop still passes every gate below, and once the actuator
-        # is chosen it must be one that declares this tool as its stop.
-        stop_past_safety_state = False
+        # A DECLARED STOP TAKES ITS OWN PATH, before the safety state and the
+        # gates below: see _invoke_stop for what it does and does not check.
+        stop = _declared_stop(envelope_dict)
+        if stop is not None:
+            return _invoke_stop(envelope_dict, stop, tier=tier, caller=caller,
+                                started_at=started_at)
+
+        # SF-001/SF-002: safety state preempts all other gates. The request
+        # ticks the monitor too, so it never acts on a state older than itself;
+        # the watchdog is what enforces staleness between requests, because a
+        # motion already dispatched keeps going whether or not anyone is asking.
         if safety_monitor is not None:
             state = _safety_check()
-            tool = envelope_dict.get("tool_name")
-            if state is GatewayState.READY:
-                pass
-            elif isinstance(tool, str) and tool in _stop_tools:
-                stop_past_safety_state = True
-            else:
-                reason = f"gateway state={state.value}"
-                signed, marker = _record(
-                    "deny", f"safety_state: {reason}", None, raw_msg_id,
-                    envelope_dict=envelope_dict, ruri=envelope_dict.get("ruri"),
-                    rrn="", started_at=started_at, caller=caller, tier=tier,
-                )
-                detail = {"deny": "safety_state", "reason": reason}
-                _attach_signature(detail, signed, marker)
-                raise HTTPException(status_code=403, detail=detail)
+            if state is not GatewayState.READY:
+                _deny("safety_state", f"gateway state={state.value}", kid=None,
+                      msg_id=raw_msg_id, envelope_dict=envelope_dict,
+                      ruri=envelope_dict.get("ruri"), rrn="", started_at=started_at,
+                      caller=caller, tier=tier)
 
         if require_envelope_signature:
             env_result = verify_envelope(envelope_dict, resolver=resolver)
@@ -1516,25 +1662,28 @@ def make_app(
             target_actuator = actuator
             target_config = actuator_config
 
-        # The stop that passed the safety state above must be a stop for the
-        # actuator that receives it. `arm.estop` is the arm's stop; routed to a
-        # camera that declares no such stop, it is just a tool, and a tripped
-        # gateway refuses it like any other.
-        if stop_past_safety_state and envelope.tool_name not in as_tool_set(
-            getattr(target_actuator, "stop_capabilities", None)
+        common = dict(kid=manifest_result.kid, msg_id=envelope.msg_id,
+                      envelope_dict=envelope_dict, ruri=envelope.ruri, rrn=manifest_rrn,
+                      started_at=started_at, caller=caller, tier=tier)
+        # NO MOTION THROUGH AN ACTUATOR THE GATEWAY COULD NOT STOP (finding 8):
+        # one whose declared stop it would refuse at SAFETY_STOP_TIER, the tier
+        # the gateway's own stop is sent at. Found once, at startup.
+        unstoppable = _stop_unaccepted.get(id(target_actuator))
+        if unstoppable is not None and envelope.tool_name in as_tool_set(
+            getattr(target_actuator, "motion_capabilities", None)
         ):
-            reason = (
-                f"gateway state={safety_monitor.state.value}; {envelope.tool_name} "
-                f"is not a declared stop of actuator {target_actuator.name!r}"
-            )
-            signed, marker = _record(
-                "deny", f"safety_state: {reason}", manifest_result.kid, envelope.msg_id,
-                envelope_dict=envelope_dict, ruri=envelope.ruri,
-                rrn=manifest_rrn, started_at=started_at, caller=caller, tier=tier,
-            )
-            detail = {"deny": "safety_state", "reason": reason}
-            _attach_signature(detail, signed, marker)
-            raise HTTPException(status_code=403, detail=detail)
+            _deny("stop_unreachable", unstoppable, **common)
+
+        # CHECK THE STATE AGAIN, AS LATE AS POSSIBLE (finding 7). The gates
+        # above can take seconds (a key fetched from the registry on a cold
+        # cache), and a trip in that time must not be followed by a dispatch.
+        # A trip after this point is left to the trip's stop, which goes to
+        # every actuator that declares one.
+        if safety_monitor is not None:
+            state = _safety_check()
+            if state is not GatewayState.READY:
+                _deny("safety_state", f"gateway state={state.value} (it changed while "
+                      f"this request was being checked)", **common)
 
         return _dispatch(
             envelope_dict=envelope_dict, msg_id=envelope.msg_id, ruri=envelope.ruri,
