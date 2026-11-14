@@ -376,29 +376,39 @@ def test_a_damaged_manifest_is_a_signed_refusal_for_a_motion_not_a_500(tmp_path)
 
 
 def test_a_stop_whose_thread_could_not_start_is_retried(monkeypatch):
-    """Never mark a trip handled until each stop was sent or definitively failed."""
-    real = threading.Thread
+    """Never mark a trip handled until each stop was sent or definitively failed.
 
-    class _NoThreadOnce(real):
+    No stop thread can start until the test allows it. The real watchdog ticks
+    every 0.1 s and retries too, and when only the first start failed, it
+    could send the stop before the test's clear, which then rightly answered
+    200 (the fourth review saw it once under load)."""
+    real = threading.Thread
+    allowed = threading.Event()
+
+    class _NoThreadYet(real):
         failed: ClassVar[list] = []
 
         def start(self):
-            if self.name.startswith("robot-md-gateway-stop-") and not _NoThreadOnce.failed:
-                _NoThreadOnce.failed.append(self.name)
+            if self.name.startswith("robot-md-gateway-stop-") and not allowed.is_set():
+                _NoThreadYet.failed.append(self.name)
                 raise RuntimeError("can't start new thread")
             return super().start()
 
     arm = _SimArm()
     app, _monitor, clock = _app(arm)
     with TestClient(app) as client:
-        monkeypatch.setattr(receiver_mod.threading, "Thread", _NoThreadOnce)
+        monkeypatch.setattr(receiver_mod.threading, "Thread", _NoThreadYet)
         _trip(app, clock)
-        assert _NoThreadOnce.failed and arm.stops == []
+        assert _NoThreadYet.failed and arm.stops == []
         _heartbeat(client)
         early = _clear(client)                # the trip still owes its stop
-        app.state.safety_tick()               # the next tick retries it
+        assert arm.stops == []
+        allowed.set()
+        app.state.safety_tick()               # the next tick retries it, and it starts
         assert _wait_for(lambda: arm.stops)
+        assert _stopped(app)
     assert early.status_code == 409
+    assert "still being sent" in early.json()["detail"]["reason"]
     assert len(arm.stops) == 1
 
 
