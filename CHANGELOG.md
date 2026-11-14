@@ -80,16 +80,17 @@
   actuator runs could still deliver the trip's stop before the dispatch, and an
   actuator whose stop does not latch (castor-hal transports) kept the dispatched
   goal. After a motion that a trip overlapped, the gateway now waits for the
-  trip's own stop to that actuator to answer (at most 10 s) and then sends
-  that stop again; it says so in the response (`stopped_again`) and the
-  record, and a clear waits for that stop. Which of the two landed first
+  trip's own stop to that actuator to answer and then sends that stop again,
+  on a thread of its own; it says so in the response (`stopped_again`) and the
+  record, and a clear waits for that stop. The motion's request waits for the
+  two at most 10 s in all. Which of the two landed first
   cannot be told from the order they return in: a stop that lands and then
   waits for an acknowledgement returns after a goal that landed after it. The
   wait keeps the two stops off one bus at once: sent while the first still
   waited for the bus, the second queued behind it, so-arm101-actuator refused
   it as busy, and the failure left the arm refusing motion until a restart. A
-  read gets no second stop. A failed second stop is recorded and not held
-  against the actuator.
+  read gets no second stop. A second stop that is refused or fails is recorded
+  and not held against the actuator; one that does not answer within 10 s is.
 - **What actuators declare is checked at startup.** A tool declared both as a
   stop and as a motion refuses to start the gateway. An actuator whose own
   declared tiers would refuse its stop at tier `read` gets a `stop_unreachable`

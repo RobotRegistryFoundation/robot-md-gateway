@@ -115,10 +115,12 @@ the same time. The motion's goal may land after that stop, and the order in
 which the two calls return does not say which landed first: a stop that lands
 and then waits for an acknowledgement returns after a goal that landed after
 it. So once a motion tool returns, the gateway waits for the trip's own stop to
-that actuator to answer (at most 10 s, `STOP_TIMEOUT_S`) and then sends the
-stop again (`stopped_again` in the response, and in the outcome record). It
-waits first so that the two stops never queue on one bus. A read gets no
-second stop: it leaves no goal behind.
+that actuator to answer and then sends the stop again (`stopped_again` in the
+response, and in the outcome record). It waits first so that the two stops
+never queue on one bus. The stop sent again runs on a thread of its own, as a
+trip's stops do, and the motion's request waits for the two at most 10 s in
+all (`STOP_TIMEOUT_S`), so a stop that hangs holds the request no longer than
+that. A read gets no second stop: it leaves no goal behind.
 
 **A declared stop is the exception: it is sent first and recorded after.** Its
 intent and outcome are still both written, in that order and linked the same
@@ -429,10 +431,14 @@ included, is a trip:
   wait matters for so-arm101-actuator, whose stop latches at once and then
   waits for the bus that a paced move gives up at its next setpoint: a second
   stop sent while the first still waited was refused as busy. After the wait it
-  is a stop repeated while latched, which writes the hold again. A stop sent
-  again that fails is recorded and not held against the actuator. A paced
-  driver must latch: one that does not would finish a move admitted before the
-  trip, and the stop sent again would arrive only at its end.
+  is a stop repeated while latched, which writes the hold again. The stop sent
+  again runs on a thread of its own, and the motion's request waits for the
+  two stops at most 10 s in all. A stop sent again that is refused or fails is
+  recorded and not held against the actuator, since a latching driver may
+  refuse a repeat; one that does not answer within 10 s is, as the trip's own
+  would be (`deny: stop_unreachable` until a restart). A paced driver must
+  latch: one that does not would finish a move admitted before the trip, and
+  the stop sent again would arrive only at its end.
 
 From then on every request is refused with `deny: safety_state`, except a
 declared stop (item 6 under [What it does](#what-it-does)).
@@ -579,7 +585,9 @@ Any of the three can also carry `stopped_again`: the gateway tripped while a
 motion was being dispatched, so it sent that actuator its stop again after the
 call returned and the trip's own stop had answered. The text names the trip and
 the stop. Whatever else the response says, the actuator has since been told to
-stop.
+stop. If that stop had not answered within 10 s of the call's return, the text
+ends by saying so: the response did not wait for it any longer, and the
+gateway goes on waiting for it as for a trip's own stop.
 
 ### What is inside the signed receipt
 
