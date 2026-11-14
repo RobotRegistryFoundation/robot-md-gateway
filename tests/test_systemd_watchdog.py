@@ -54,6 +54,32 @@ def _received(sock, seconds: float) -> list[str]:
     return messages
 
 
+def _received_until(sock, message: str, timeout: float) -> list[str]:
+    """Every message up to and including the first `message`; all that came
+    within `timeout` if it never did. Waits for it, not for a window."""
+    messages, deadline = [], time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with contextlib.suppress(TimeoutError):
+            messages.append(sock.recv(256).decode())
+            if messages[-1] == message:
+                break
+    return messages
+
+
+def _refusals(monkeypatch, message: str) -> threading.Event:
+    """An event set once a `message` the gateway sends does not go."""
+    refused, send = threading.Event(), sd_notify.notify
+
+    def notify(sent_message, env=os.environ):
+        sent = send(sent_message, env)
+        if sent_message == message and not sent:
+            refused.set()
+        return sent
+
+    monkeypatch.setattr(sd_notify, "notify", notify)
+    return refused
+
+
 def _fill():
     """Fill the socket's queue, as a PID 1 that has stopped reading it would
     leave it (net.unix.max_dgram_qlen, 10 by default)."""
@@ -146,30 +172,36 @@ def test_ready_goes_once_there_is_room_and_only_once(systemd_socket, monkeypatch
     """A READY=1 that could not go is sent again on the next tick: lost, the
     unit's start would time out."""
     monkeypatch.delenv("WATCHDOG_USEC", raising=False)
+    refused = _refusals(monkeypatch, "READY=1")
     _fill()
     app, _monitor, _clock = _app(_SimArm())
     with TestClient(app):
-        time.sleep(0.5)                                   # ticks whose READY=1 cannot go
-        everything = _received(systemd_socket, 1.0)       # the filler, then room
-    assert everything.count("READY=1") == 1
-    assert everything[-1] == "READY=1" and set(everything[:-1]) == {"X=1"}
+        assert refused.wait(60)                           # a READY=1 could not go
+        before = _received_until(systemd_socket, "READY=1", 60)   # the filler, then room
+        after = _received(systemd_socket, 0.5)
+    assert before[-1] == "READY=1" and set(before[:-1]) == {"X=1"}
+    assert "READY=1" not in after
 
 
 def test_a_systemd_that_stops_reading_does_not_stall_the_safety_tick(systemd_socket,
                                                                        monkeypatch):
     """R5-37-03: PID 1 stops reading, its queue fills, then the supervisor
     goes and no request arrives. The watchdog still trips and stops the arm.
-    With a blocking send it was stuck inside a ping, and nothing tripped."""
+    With a blocking send it was stuck inside a ping, and nothing tripped.
+
+    Each step waits for what it needs, not for a window of time, so a loaded
+    machine makes it slower, not wrong: READY=1, then a ping the full queue
+    refused, then the arm's stop."""
     monkeypatch.setenv("WATCHDOG_USEC", "400000")         # a ping every 0.1 s
+    refused = _refusals(monkeypatch, "WATCHDOG=1")
     arm = _SimArm()
     app, _monitor, clock = _app(arm)
     with TestClient(app):
-        assert "READY=1" in _received(systemd_socket, 0.3)
+        assert _received_until(systemd_socket, "READY=1", 60)[-1:] == ["READY=1"]
         _fill()                                           # it stops reading
-        time.sleep(0.3)                                   # pings that cannot go
+        assert refused.wait(60)                           # a ping met the full queue
         clock.advance(STALE_S + 1)                        # the supervisor has gone
-        stopped = _wait_for(lambda: arm.stops, 3)
-    assert stopped
+        assert _wait_for(lambda: arm.stops, 60)
 
 
 def test_a_watchdog_whose_ticks_fail_stops_pinging(systemd_socket, monkeypatch):
