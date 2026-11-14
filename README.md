@@ -372,9 +372,20 @@ an operator arms it. A restart is never a resume. To arm it, in this order:
 
    It refuses a gateway whose address is the machine it runs on (a loopback
    address, or one bound to an interface there, such as the robot's own
-   tailnet name) unless `--i-am-on-the-robot` is given. It stops at once on a
-   401 or 403: only a supervisor credential can send heartbeats. Stopping it
-   stops the heartbeat, and the gateway trips 3 s later.
+   tailnet name) unless `--i-am-on-the-robot` is given. An SSH tunnel to the
+   robot (`ssh -L`) is refused too, since from here it is a loopback address
+   like the robot's own gateway; use the tailnet address. The guard catches a
+   mistake, and keeping the supervisor token off the robot is the control: it
+   cannot see a process in its own network namespace on the robot (a
+   container), nor a name that resolves to a public relay (Funnel without
+   MagicDNS). It stops at once on a 401 or 403: only a supervisor credential
+   can send heartbeats. Stopping it stops the heartbeat, and the gateway trips
+   3 s later.
+
+   Neither command follows a redirect: a 3xx from the gateway's URL is a
+   refusal, so the token goes nowhere but the address given. Neither refuses
+   plain `http://`, and over the tailnet address that is fine, since WireGuard
+   encrypts it; over an ordinary LAN, plain `http://` sends the token in clear.
 
 3. As the operator, clear it with the `commission` credential. Where
    `ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE` is on, as on bob, the clear must be a

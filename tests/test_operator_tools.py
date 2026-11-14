@@ -494,3 +494,118 @@ def test_the_command_line_names_a_missing_key(monkeypatch, tmp_path, capsys):
     assert _run(monkeypatch, "clear", "--gateway", GATEWAY, "--key",
                 str(tmp_path / "missing.json"), token=COMMISSION_TOKEN) == 2
     assert "robot-md-gateway clear:" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# The fourth review: a redirect, a near-miss flag, and what the guard says
+# --------------------------------------------------------------------------- #
+
+
+class _Elsewhere(http.server.BaseHTTPRequestHandler):
+    """Another host. It records whatever reaches it."""
+
+    seen: ClassVar[list] = []
+
+    def do_GET(self):
+        type(self).seen.append((self.command, self.headers.get("Authorization")))
+        self.send_response(405)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_POST = do_GET
+
+    def log_message(self, *args):
+        pass
+
+
+def _redirecting_to(location: str):
+    class _Redirect(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    return _Redirect
+
+
+@pytest.fixture
+def redirect_elsewhere():
+    """The review's R4-36-06: the gateway's URL answers 302 to a listener on
+    another address. Yields the URL that redirects."""
+    _Elsewhere.seen = []
+    elsewhere = http.server.ThreadingHTTPServer(("127.0.0.2", 0), _Elsewhere)
+    location = f"http://127.0.0.2:{elsewhere.server_port}/elsewhere"
+    front = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _redirecting_to(location))
+    for server in (elsewhere, front):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{front.server_port}", location
+    finally:
+        for server in (elsewhere, front):
+            server.shutdown()
+            server.server_close()
+
+
+def test_a_redirect_is_a_refusal_and_the_token_goes_nowhere_else(redirect_elsewhere):
+    """urllib followed a 302 to a POST with a GET to the new location, with the
+    Authorization header, whatever the host."""
+    front, location = redirect_elsewhere
+    status, body = operator.post(front + "/v1/safety/heartbeat", SUPERVISOR_TOKEN, None)
+    assert status == 302
+    assert body["detail"]["deny"] == "redirect"
+    assert f"a redirect to {location}; it was not followed" in body["detail"]["reason"]
+    status, _ = operator.post(front + "/v1/safety/clear", COMMISSION_TOKEN, {"type": "x"})
+    assert status == 302
+    assert _Elsewhere.seen == []                   # nothing, and no token, reached it
+
+
+def test_a_redirect_stops_the_heartbeat_and_refuses_the_clear(redirect_elsewhere):
+    front, _location = redirect_elsewhere
+    lines: list[str] = []
+    assert heartbeat(front, SUPERVISOR_TOKEN, i_am_on_the_robot=True, sleep=lambda s: None,
+                     keep_going=_times(5), out=lines.append) == 2
+    assert lines[-1].startswith("heartbeat refused (302): ")
+    assert lines[-1].endswith("Give --gateway the gateway's own address. Stopping.")
+    lines.clear()
+    envelope = build_clear(OPERATOR_KEY, OPERATOR_KID)
+    assert clear(front, COMMISSION_TOKEN, envelope=envelope, out=lines.append) == 1
+    [refused] = lines                              # no "the gateway has seen this msg_id"
+    assert refused.startswith("clear refused (302): ")
+    assert _Elsewhere.seen == []
+
+
+@pytest.mark.parametrize("command, argv", [
+    ("heartbeat", ["--tok", "SECRET-VALUE"]),
+    ("heartbeat", ["--tok=SECRET-VALUE"]),
+    ("clear", ["--token-fil", "SECRET-VALUE"]),
+    ("heartbeat", ["SECRET-VALUE"]),
+])
+def test_an_unrecognized_argument_is_named_without_its_value(monkeypatch, capsys, command, argv):
+    """The review's N2: argparse printed "unrecognized arguments: --tok
+    SECRET-VALUE", and a near-miss flag is followed by the token itself."""
+    assert _run(monkeypatch, command, "--gateway", GATEWAY, *argv) == 2
+    err = capsys.readouterr().err
+    assert "SECRET-VALUE" not in err
+    assert "unrecognized arguments: " in err
+    assert "what was typed with them is not shown" in err
+    if argv[0].startswith("-"):
+        assert f"unrecognized arguments: {argv[0].split('=')[0]};" in err
+
+
+def test_a_value_argparse_cannot_use_is_not_repeated(monkeypatch, capsys):
+    assert _run(monkeypatch, "heartbeat", "--gateway", GATEWAY, "--interval",
+                "SECRET-VALUE") == 2
+    err = capsys.readouterr().err
+    assert "SECRET-VALUE" not in err
+    assert "argument --interval: invalid float value: '(not shown)'" in err
+
+
+def test_the_guard_says_that_an_ssh_tunnel_looks_like_the_robot():
+    with pytest.raises(OperatorError, match=r"An SSH tunnel to the robot \(ssh -L\) looks the "
+                                            r"same from here"):
+        heartbeat("http://127.0.0.1:8080", SUPERVISOR_TOKEN, sleep=lambda s: None,
+                  keep_going=_times(1))

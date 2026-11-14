@@ -147,7 +147,9 @@
   `/v1/safety/clear` once, with `--key` a signed `ESTOP_CLEAR` envelope (a new
   `msg_id` each run) from robot-md's keystore file or an Ed25519 PEM. Both read
   the token from `--token-file` or `ROBOT_MD_GATEWAY_TOKEN`, and refuse
-  `--token`.
+  `--token`. Neither follows a redirect (a 3xx is a refusal, and the token is
+  sent nowhere else), and neither repeats a value in an error, so a near-miss
+  such as `--tok X` does not print the token.
 - `POST /v1/safety/heartbeat` (supervisor credential only) and
   `POST /v1/safety/clear` (commission tier, fresh heartbeat, and a signed
   `ESTOP_CLEAR` body where signatures are required). Both answer 404 on a

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -220,6 +221,28 @@ class _NoTokenOnTheCommandLine(argparse.Action):
         parser.error("no --token: give it in --token-file, or in ROBOT_MD_GATEWAY_TOKEN")
 
 
+def _without_values(operator_parser: argparse.ArgumentParser) -> None:
+    """The operator's two commands never repeat a value in an error. A
+    near-miss such as `--tok X` or `--token-fil X` is followed by the token
+    itself, and argparse quotes a value it cannot use ("invalid float value:
+    'X'"). Their `error()` blanks every quoted value; unrecognized arguments
+    are reported by `_unrecognized`, since argparse reports those from the
+    top-level parser, not from the subcommand's (the fourth review's N2)."""
+    original = operator_parser.error
+
+    def error(message: str):
+        original(re.sub(r"'[^']*'", "'(not shown)'", message))
+
+    operator_parser.error = error
+
+
+def _unrecognized(parser: argparse.ArgumentParser, extras: list[str]) -> None:
+    """Name what was not recognized by its flags alone, never a value."""
+    flags = [arg.split("=", 1)[0] for arg in extras if arg.startswith("-")]
+    parser.error("unrecognized arguments: " + (" ".join(flags) or "(values only)")
+                 + "; what was typed with them is not shown")
+
+
 def _operator(args: argparse.Namespace) -> int:
     """`heartbeat` and `clear`: see operator.py."""
     from .operator import OperatorError, build_clear, clear, heartbeat, load_signing_key, read_token
@@ -357,8 +380,13 @@ def main() -> None:
     for operator_parser in (beat, clear_p):
         operator_parser.add_argument("--token", nargs="?", action=_NoTokenOnTheCommandLine,
                                      help=argparse.SUPPRESS)
+        _without_values(operator_parser)
 
-    args = parser.parse_args()
+    args, extras = parser.parse_known_args()
+    if extras:
+        if args.cmd in ("heartbeat", "clear"):
+            _unrecognized(beat if args.cmd == "heartbeat" else clear_p, extras)
+        parser.error("unrecognized arguments: " + " ".join(extras))
 
     if args.cmd == "serve":
         if args.robot_md:

@@ -19,6 +19,7 @@ write either by hand.
 
 Both read their bearer token from a file or from ROBOT_MD_GATEWAY_TOKEN, never
 from the command line, where the process list and the shell history keep it.
+Neither follows a redirect, so the token goes only to the address given.
 Neither decides anything: the gateway does. They print what it answered.
 """
 
@@ -82,11 +83,26 @@ def _parse(raw: bytes) -> object:
         return raw.decode("utf-8", errors="replace")
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect. urllib follows a 301, 302 or 303 answer to a
+    POST with a GET to the new location, and sends the Authorization header
+    there, whatever the host (the fourth review's N1). The gateway never
+    redirects, so a 3xx comes from something in front of it, and the token in
+    that header is the supervisor's or the commission one."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None                     # urllib then raises HTTPError with the 3xx
+
+
+_OPENER = urllib.request.build_opener(_NoRedirects)
+
+
 def post(url: str, token: str, body: dict | None = None, *,
          timeout: float = 5.0) -> tuple[int, object]:
     """POST `body` as JSON (no body at all for None) with the bearer token.
     Returns (status, the parsed answer). An HTTP error status is returned, not
-    raised; no answer at all raises OSError."""
+    raised, and a redirect is returned as a refusal (`deny: redirect`), never
+    followed; no answer at all raises OSError."""
     headers = {"Authorization": f"Bearer {token}"}
     data = None
     if body is not None:
@@ -94,10 +110,21 @@ def post(url: str, token: str, body: dict | None = None, *,
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, method="POST", headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             return response.status, _parse(response.read())
     except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            where = exc.headers.get("Location") if exc.headers is not None else None
+            return exc.code, {"detail": {"deny": "redirect", "reason": (
+                f"{url} answered {exc.code}, a redirect"
+                + (f" to {where}" if where else "")
+                + "; it was not followed, so the token was sent nowhere else. Give "
+                  "--gateway the gateway's own address")}}
         return exc.code, _parse(exc.read())
+
+
+def _redirected(status: int) -> bool:
+    return 300 <= status < 400
 
 
 def _reason(body: object) -> str:
@@ -157,9 +184,10 @@ def heartbeat(
 ) -> int:
     """Send heartbeats until `keep_going()` is false, and print each change in
     what the gateway answers. Returns 2 when the gateway refuses this
-    credential (401 or 403), since sending again cannot change that, or when
-    the interval is not shorter than the gateway's staleness limit; 0
-    otherwise. No answer, or a 503, is printed and retried.
+    credential (401 or 403), since sending again cannot change that, when its
+    URL answers with a redirect, which is not followed, or when the interval
+    is not shorter than the gateway's staleness limit; 0 otherwise. No answer,
+    or a 503, is printed and retried.
 
     Heartbeats go out on a fixed cadence, one per `interval` from the start of
     the last one, so a slow answer does not push the next one late; and a
@@ -176,7 +204,9 @@ def heartbeat(
         raise OperatorError(
             f"{gateway} is this machine ({', '.join(mine)}). Send heartbeats from the "
             f"supervising person's device, never from the robot: a heartbeat sent "
-            f"from the robot proves only that the gateway is running. If this is "
+            f"from the robot proves only that the gateway is running. An SSH tunnel "
+            f"to the robot (ssh -L) looks the same from here, since it ends at a "
+            f"loopback address; use the robot's tailnet address instead. If this is "
             f"meant, pass --i-am-on-the-robot."
         )
     if mine:
@@ -193,6 +223,9 @@ def heartbeat(
             if status in (401, 403):
                 out(f"heartbeat refused ({status}): {_reason(body)}. Stopping: sending "
                     f"again with this credential cannot change that.")
+                return 2
+            if _redirected(status):
+                out(f"heartbeat refused ({status}): {_reason(body)}. Stopping.")
                 return 2
             if status != 200:
                 now = f"heartbeat not accepted ({status}): {_reason(body)}; retrying"
@@ -282,6 +315,8 @@ def clear(
         return 0
     reason = _reason(body)
     out(f"clear refused ({status}): {reason}")
+    if _redirected(status):
+        return 1                        # it never reached the gateway: no hint applies
     if envelope is None and "ESTOP_CLEAR" in reason:
         out("This gateway requires a signed clear: pass --key, and --kid for a PEM key.")
     elif envelope is not None:
