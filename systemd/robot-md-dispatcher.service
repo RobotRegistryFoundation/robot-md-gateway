@@ -11,11 +11,18 @@ AssertPathExists=/etc/robot-md-dispatcher/bearers.yaml
 # first tick, then WATCHDOG=1 every quarter of WatchdogSec. If it dies or stops
 # ticking, systemd stops the gateway (SIGABRT) and Restart=on-failure starts it
 # again, held. Without this, a dead watchdog went unnoticed until the next
-# request or heartbeat. A restart sends no stop: the process and its paced
-# moves end, and hardware that keeps its last goal keeps it.
+# request or heartbeat. Nothing answers on the port from the kill until the
+# new process listens: RestartSec plus the gateway's start-up.
 Type=notify
 NotifyAccess=main
 WatchdogSec=5s
+# Where the gateway keeps its clean-shutdown marker ($STATE_DIRECTORY, here
+# /var/lib/robot-md-dispatcher, writable under ProtectSystem=strict). A start
+# that finds no marker (after a watchdog kill, a crash, an out-of-memory kill,
+# or a stop while armed) sends every declared stop before it serves anything.
+# A clean stop while held leaves one, and the next start leaves the hardware
+# alone. Without this line every start sends the stops.
+StateDirectory=robot-md-dispatcher
 # Runs the dispatcher as an unprivileged user that has access to the robot's
 # serial bus (e.g. /dev/ttyACM0 via the `dialout` group).
 User=robot

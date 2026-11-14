@@ -276,6 +276,13 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.cmd == "serve":
+        # BEFORE ANYTHING ELSE: did the previous process shut down cleanly?
+        # The marker is read and removed here, so this process leaves one
+        # only if it reaches the end of the normal exit path below. Without
+        # one, every declared stop is sent at start (clean_shutdown.py).
+        from . import clean_shutdown
+
+        unclean = clean_shutdown.consume()
         if args.robot_md:
             os.environ["ROBOT_MD_PATH"] = args.robot_md
         if args.bearers:
@@ -287,6 +294,19 @@ def main() -> None:
             level=os.environ.get("ROBOT_MD_LOG_LEVEL", "INFO"),
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
         )
+        shutdown_log = logging.getLogger("robot_md_gateway.clean_shutdown")
+
+        def _at_shutdown(not_clean: str | None) -> None:
+            # The end of the app's shutdown, on the normal exit path. Leave
+            # the marker only when the gateway says nothing it moved can still
+            # be moving (`make_app`: held, its watchdog ticking, every stop it
+            # sent answered). A kill or a crash never gets here, and the next
+            # start sends every declared stop.
+            if not_clean is None and clean_shutdown.write():
+                shutdown_log.info("clean_shutdown: marker left; the next start sends no stop")
+            elif not_clean is not None:
+                shutdown_log.warning("clean_shutdown: no marker left: %s; the next start "
+                                     "sends every declared stop", not_clean)
 
         import uvicorn
 
@@ -308,6 +328,13 @@ def main() -> None:
             from .cert.safety import GatewayState, SafetyMonitor
             from .receiver import make_app
 
+            if unclean is None:
+                shutdown_log.info(
+                    "clean_shutdown: the previous process shut down cleanly, held, with "
+                    "every stop it sent answered; no stop is sent at start")
+            else:
+                shutdown_log.warning(
+                    "clean_shutdown: %s, so every declared stop is sent at start", unclean)
             tool_allowlist = _build_tool_allowlist_from_env()
             tool_tier_requirements = _build_tool_tier_requirements_from_env()
             require_envelope_signature = _require_envelope_signature_from_env()
@@ -399,6 +426,8 @@ def main() -> None:
                     bearers=bearers,
                     signing_identity=signing_identity,
                     attestation_export_file=attestation_export_file,
+                    stops_at_start=unclean,
+                    on_shutdown=_at_shutdown,
                 )
             else:
                 actuator_section = (
@@ -429,6 +458,8 @@ def main() -> None:
                     bearers=bearers,
                     signing_identity=signing_identity,
                     attestation_export_file=attestation_export_file,
+                    stops_at_start=unclean,
+                    on_shutdown=_at_shutdown,
                 )
 
         uvicorn.run(fastapi_app, host=args.host, port=args.port)

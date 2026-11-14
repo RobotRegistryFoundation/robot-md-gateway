@@ -214,3 +214,9 @@ def test_the_unit_waits_for_the_watchdog_and_restarts_without_it():
     [watchdog_sec] = _directive("WatchdogSec")
     assert watchdog_sec.endswith("s") and 1 < float(watchdog_sec[:-1]) <= 10
     assert _directive("Restart") == ["on-failure"]        # a watchdog kill is a failure
+
+
+def test_the_unit_gives_the_gateway_a_place_for_its_clean_shutdown_marker():
+    """Without StateDirectory= there is no STATE_DIRECTORY, and every start
+    sends every declared stop (clean_shutdown.py)."""
+    assert _directive("StateDirectory") == ["robot-md-dispatcher"]

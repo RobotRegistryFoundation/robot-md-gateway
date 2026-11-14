@@ -148,6 +148,13 @@ class _StopSend:
     #: `_stop_again_if_tripped`): which dispatch, for the record. None on a
     #: trip's own stop.
     again: str | None = None
+    #: "start" for a stop sent at start-up because the previous process did
+    #: not shut down cleanly; "clear" for one a clear sends again to an
+    #: actuator whose stop has not succeeded since then. When one of these
+    #: fails or does not answer, motion through the actuator is refused until
+    #: a stop to it succeeds (`_unconfirmed`), not until a restart. None on
+    #: every other stop.
+    startup: str | None = None
 
 
 @dataclass
@@ -158,10 +165,18 @@ class _Trip:
     state: GatewayState
     why: str
     sends: list[_StopSend]
+    #: "trip" for a departure from READY; "start" for the stops sent at
+    #: start-up after an unclean end; "clear" for those a clear sends again.
+    kind: str = "trip"
 
     def settled(self) -> bool:
         """Every stop has answered, or the gateway has stopped waiting for it."""
         return all(s.status in ("done", "timed_out") for s in self.sends)
+
+    def what(self) -> str:
+        """How the records name it."""
+        return {"start": "the stops sent at start",
+                "clear": "the stops the last clear sent again"}.get(self.kind, f"trip {self.seq}")
 
 
 def _declares_no_motion(act: object) -> bool:
@@ -271,7 +286,18 @@ def make_app(
     signing_identity: SigningIdentity | None = None,
     attestation_export_file: Path | None = None,
     clock: Callable[[], float] | None = None,
+    stops_at_start: str | None = None,
+    on_shutdown: Callable[[str | None], object] | None = None,
 ) -> FastAPI:
+    # stops_at_start: why every declared stop must be sent as the app is
+    # built, or None to send none. `serve` passes the reason unless the
+    # previous process left a clean-shutdown marker (clean_shutdown.py); tests
+    # and embedders send none unless they ask.
+    # on_shutdown: called once at the end of the app's shutdown (uvicorn's
+    # graceful exit on SIGTERM or Ctrl-C), with why it was not clean, or None
+    # when nothing the gateway moved can still be moving. `serve` leaves the
+    # clean-shutdown marker on None. A process that ends any other way never
+    # calls it.
     # The clock heartbeat staleness and the stop timeout are judged on:
     # time.monotonic, unless a test passes a fake one. Whether the watchdog
     # itself is still ticking is always judged in real time.
@@ -424,6 +450,13 @@ def make_app(
                 f"through it is refused"
             )
             logging.getLogger(__name__).error("stop_unreachable: %s", _stop_unaccepted[id(_act)])
+    # Found at startup, from what the actuators declare: not a stop that failed.
+    _declared_unaccepted = frozenset(_stop_unaccepted)
+    # An actuator whose stop at start-up (`stops_at_start`) failed or did not
+    # answer, and none to it has succeeded since: motion through it is
+    # refused (`stop_unconfirmed`) until one does. The next clear sends it its
+    # stop again, and arms only once that has answered.
+    _unconfirmed: dict[int, str] = {}
     # The robot's RRN for the gateway's own records (trips, stops, clears),
     # read once from the pinned manifest. Best effort: "" if it cannot be read.
     _pinned_rrn = ""
@@ -511,11 +544,54 @@ def make_app(
         try:
             yield
         finally:
+            # Judged before the watchdog is stopped: whether a stopped
+            # watchdog was stuck is part of the answer.
+            _app.state.clean_shutdown = _not_clean_because()
             stopping.set()
             watchdog.join(timeout=5)
             _safety.watchdog = None
+            # Here, not after uvicorn.run returns: on SIGTERM, uvicorn
+            # re-raises the signal once its shutdown is done, and the process
+            # ends without returning.
+            if on_shutdown is not None:
+                try:
+                    on_shutdown(_app.state.clean_shutdown)
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "clean_shutdown: the shutdown hook failed; no marker is left")
+
+    def _not_clean_because() -> str | None:
+        """At the end of the normal exit path: why this process must not leave
+        a clean-shutdown marker (clean_shutdown.py), or None. Each reason
+        means the next start sends every declared stop, so each errs toward
+        stops. Waits up to STOP_TIMEOUT_S for stops still in flight, so the
+        process does not end in the middle of one."""
+        trip = _safety.trip or _safety.last_trip
+        deadline = time.monotonic() + STOP_TIMEOUT_S
+        for send in list(trip.sends) if trip is not None else []:
+            send.settled.wait(max(0.0, deadline - time.monotonic()))
+        with _safety_lock:
+            if _watchdog_stuck():
+                return (f"the safety watchdog had not ticked for over {WATCHDOG_STALE_S:g} s, "
+                        f"so a trip may have gone unacted on")
+            if safety_monitor.state is GatewayState.READY:
+                return ("the gateway was armed (ready) when it stopped, so something it moved "
+                        "may still be moving")
+            trip = _safety.trip or _safety.last_trip
+            if trip is not None and not trip.settled():
+                return f"{trip.what()} had not all answered"
+            if _unconfirmed:
+                return "; ".join(_unconfirmed.values())
+            failed = [r for k, r in _stop_unaccepted.items() if k not in _declared_unaccepted]
+            if failed:
+                return "; ".join(failed)
+        return None
 
     app = FastAPI(title="robot-md-gateway", version="0.4.0a1", lifespan=_lifespan)
+    # Why this process must not leave a clean-shutdown marker; None once its
+    # shutdown has found nothing that could still be moving. Set by the
+    # lifespan's exit, so an app that was never served never leaves one.
+    app.state.clean_shutdown = "the gateway did not shut down through its normal exit path"
     # Operators access these via app.state for ESTOP wire integration and
     # audit-bundle export. The ESTOP wire is a GPIO/transport-level signal and
     # stays off HTTP: putting it behind HTTP-layer auth would conflate
@@ -907,6 +983,7 @@ def make_app(
         watchdog=None,          # the watchdog thread while the app is served
         last_tick=0.0,          # time.monotonic() of the watchdog's last tick
         last_heartbeat=None,    # (caller, clock()) of the last accepted heartbeat
+        resent=False,           # a clear has sent the unconfirmed stops again since the last arm
     )
 
     def _watchdog_stuck() -> bool:
@@ -988,6 +1065,16 @@ def make_app(
             elif send.status == "running" and clock() - send.started > STOP_TIMEOUT_S:
                 send.status = "timed_out"
                 send.settled.set()          # a dispatch waiting on it goes on
+                records.append(("timeout", trip, send))
+                if send.startup is not None:
+                    # A stop at start-up, or one a clear sent again: refused
+                    # until a stop to it succeeds (`_unconfirmed`), and a late
+                    # success counts. At start the actuator may not have been
+                    # ready yet, so this is not held against it until a
+                    # restart, as a trip's own stop is.
+                    _unconfirmed[id(send.actuator)] = _unconfirmed_reason(
+                        send, f"did not answer within {STOP_TIMEOUT_S:g} s")
+                    continue
                 # A stop that does not answer is a stop the gateway cannot
                 # count on, as one that fails is (round 2's departure (e)): no
                 # motion through that actuator until the gateway restarts.
@@ -1002,7 +1089,13 @@ def make_app(
                     f"cannot count on stopping it on a trip; motion through it is refused "
                     f"until the gateway restarts"
                 ))
-                records.append(("timeout", trip, send))
+
+    def _unconfirmed_reason(send: _StopSend, what_happened: str) -> str:
+        which = ("its stop at start" if send.startup == "start"
+                 else "the stop a clear sent it again")
+        return (f"actuator {send.name!r} has not confirmed a stop since the gateway started: "
+                f"{which} ({send.tool}) {what_happened}; motion through it is refused until "
+                f"a stop to it succeeds")
 
     def _send_stop(trip: _Trip, send: _StopSend) -> None:
         """On its own thread: send one actuator its stop, as the gateway, and
@@ -1034,10 +1127,15 @@ def make_app(
                                       error_message=f"{type(exc).__name__}: {exc}")
             error_kind = type(exc).__name__
         refused = not outcome.success and outcome.outcome_kind == "denied"
-        counted = not outcome.success and send.again is None
+        counted = not outcome.success and send.again is None and send.startup is None
         with _safety_lock:
             late = send.status == "timed_out"
             send.status = "done"
+            if outcome.success:
+                _unconfirmed.pop(id(send.actuator), None)    # a stop to it has succeeded
+            elif send.startup is not None:
+                _unconfirmed[id(send.actuator)] = _unconfirmed_reason(
+                    send, f"did not succeed ({outcome.error_message})")
             if counted:
                 # An actuator that refuses the gateway's own stop, or answers it
                 # with an error (an `error` outcome, an exception, a return that
@@ -1053,8 +1151,11 @@ def make_app(
                 ))
         log = logging.getLogger(__name__)
         try:
-            reason = (f"safety_stop: trip {trip.seq} ({trip.state.value}: {trip.why}); "
-                      f"sent {send.tool} to {send.name}")
+            if trip.kind == "trip":
+                reason = (f"safety_stop: trip {trip.seq} ({trip.state.value}: {trip.why}); "
+                          f"sent {send.tool} to {send.name}")
+            else:
+                reason = f"safety_stop: {trip.what()} ({trip.why}); sent {send.tool} to {send.name}"
             if send.again is not None:
                 reason += f" again, because {send.again}"
             if late:
@@ -1062,9 +1163,13 @@ def make_app(
                            f"({STOP_TIMEOUT_S:g} s)")
             if not outcome.success:
                 reason += f"; it did not succeed: {outcome.error_message}"
-                reason += ("; motion through it is refused from now on" if counted else
-                           "; a stop sent again is not held against the actuator: the "
-                           "trip's own stop decides that")
+                if counted:
+                    reason += "; motion through it is refused from now on"
+                elif send.startup is not None:
+                    reason += "; motion through it is refused until a stop to it succeeds"
+                else:
+                    reason += ("; a stop sent again is not held against the actuator: the "
+                               "trip's own stop decides that")
             (log.warning if outcome.success else log.error)(
                 "%s (outcome: %s)", reason, outcome.outcome_kind,
             )
@@ -1086,7 +1191,19 @@ def make_app(
         for kind, first, second in records:
             try:
                 error_kind = None
-                if kind == "trip":
+                if kind in ("start", "clear"):
+                    trip = second
+                    what = ", ".join(f"{s.tool} to {s.name}" for s in trip.sends)
+                    if kind == "start":
+                        reason = (f"safety_start: {trip.why}; " + (
+                            f"sending {what}" if what else
+                            "no actuator declares a stop, so nothing was told to stop"))
+                    else:
+                        reason = (f"safety_clear_resend: {trip.why}; sending {what} again; "
+                                  f"the gateway arms on a clear once each has answered")
+                    msg_id, decision = f"safety-{kind}-{trip.seq}", "deny"
+                    log.warning("%s", reason)
+                elif kind == "trip":
                     prev, trip = first, second
                     if trip.sends:
                         what = "sending " + ", ".join(f"{s.tool} to {s.name}"
@@ -1109,10 +1226,12 @@ def make_app(
                     log.warning("%s", reason)
                 else:  # "timeout": a fault, not a decision
                     trip, send = first, second
-                    reason = (f"safety_stop_timeout: trip {trip.seq}: {send.tool} to "
+                    reason = (f"safety_stop_timeout: {trip.what()}: {send.tool} to "
                               f"{send.name}{' (sent again)' if send.again else ''} did not "
                               f"answer within {STOP_TIMEOUT_S:g} s; the gateway stopped waiting "
-                              f"for it; motion through it is refused from now on")
+                              f"for it; motion through it is refused "
+                              + ("until a stop to it succeeds" if send.startup is not None
+                                 else "from now on"))
                     msg_id, decision = f"{send.msg_id}-timeout", "allow"
                     error_kind = "StopTimeout"
                     log.error("%s", reason)
@@ -1582,6 +1701,9 @@ def make_app(
         # was sent. The cost: a process killed during a stop leaves no intent.
         sent.outcome, sent.error_kind, sent.ended_at = _execute(
             target, envelope_dict, pinned_manifest_path, tier, config)
+        if sent.outcome.success and id(target) in _unconfirmed:
+            with _safety_lock:
+                _unconfirmed.pop(id(target), None)   # a stop to it has succeeded
         return sent
 
     def _stop_answer(sent: SimpleNamespace) -> dict:
@@ -1985,11 +2107,16 @@ def make_app(
         # NO MOTION THROUGH AN ACTUATOR THE GATEWAY COULD NOT STOP (finding 8):
         # one whose declared stop it would refuse at SAFETY_STOP_TIER, the tier
         # the gateway's own stop is sent at. Found once, at startup.
+        moves = envelope.tool_name in as_tool_set(
+            getattr(target_actuator, "motion_capabilities", None))
         unstoppable = _stop_unaccepted.get(id(target_actuator))
-        if unstoppable is not None and envelope.tool_name in as_tool_set(
-            getattr(target_actuator, "motion_capabilities", None)
-        ):
+        if unstoppable is not None and moves:
             _deny("stop_unreachable", unstoppable, **common)
+        # Nor through one whose stop at start-up has not succeeded, until a
+        # stop to it does (`stops_at_start`, `_unconfirmed`).
+        unconfirmed = _unconfirmed.get(id(target_actuator))
+        if unconfirmed is not None and moves:
+            _deny("stop_unconfirmed", unconfirmed, **common)
 
         # CHECK THE STATE AGAIN (finding 7). The gates above can take seconds
         # (a key fetched from the registry on a cold cache), and a trip in that
@@ -2182,6 +2309,12 @@ def make_app(
         - Recovery needs FRESH heartbeats (the pendant integration spec's rule):
           a clear sent into a silence is refused rather than allowed to drop
           straight back into SAFE_STOP on the next tick.
+        - While an actuator's stop at start-up (sent because the previous
+          process did not shut down cleanly) has not succeeded, and none to
+          it has since, the first commission clear sends that stop again and
+          is refused with 409; a clear once it has answered arms the gateway,
+          and motion through an actuator whose stop still did not succeed
+          stays refused (`stop_unconfirmed`).
         - SafetyMonitor.clear needs the `commission` tier.
 
         Allowed or refused, it is recorded like any other decision: the audit
@@ -2226,7 +2359,9 @@ def make_app(
                                     if s.status not in ("done", "timed_out"))
                 status, reason = 409, (
                     f"safety.clear: refused, the stop for trip {trip.seq} is still being "
-                    f"sent ({waiting}); retry once it has answered"
+                    f"sent ({waiting}); retry once it has answered" if trip.kind == "trip" else
+                    f"safety.clear: refused, {trip.what()} are still being sent ({waiting}); "
+                    f"retry once they have answered"
                 )
             elif _watchdog_stuck():
                 status, reason = 503, (
@@ -2240,10 +2375,37 @@ def make_app(
                     f"safety.clear: refused, {last} (limit "
                     f"{monitor.heartbeat_staleness_s:g} s); send heartbeats, then clear"
                 )
+            elif _unconfirmed and tier == "commission" and not _safety.resent:
+                # A stop at start-up failed or did not answer, and none to that
+                # actuator has succeeded since: send it again first, and arm
+                # only once it has answered. Once per held spell, so a stop
+                # that keeps failing cannot hold the gateway forever: the next
+                # clear arms, and motion through that actuator stays refused
+                # (`stop_unconfirmed`) until a stop to it succeeds.
+                _safety.trips += 1
+                round_ = _Trip(
+                    seq=_safety.trips, state=monitor.state, kind="clear",
+                    why=("a clear by " + (caller or "a commission bearer") + " found "
+                         + "; ".join(_unconfirmed.values())),
+                    sends=[_StopSend(name=n, actuator=a, config=c, tool=t, startup="clear",
+                                     msg_id=f"safety-stop-{uuid.uuid4().hex[:12]}")
+                           for n, a, c, t in _stop_targets if id(a) in _unconfirmed],
+                )
+                _safety.trip = _safety.last_trip = round_
+                _safety.resent = True
+                records.append(("clear", None, round_))
+                _advance_locked(records)
+                status, reason = 409, (
+                    "safety.clear: refused for now, a stop sent at start has not succeeded: "
+                    + ", ".join(f"{s.tool} to {s.name}" for s in round_.sends)
+                    + " sent again; clear again once they have answered. An actuator whose "
+                    "stop still does not succeed stays refused until one does"
+                )
             else:
                 cleared, reason = monitor.clear(tier=tier, msg_id=msg_id, caller=caller)
                 if cleared:
                     _safety.seen = monitor.state
+                    _safety.resent = False
                     _safety.trip = None
                 else:
                     status = 403
@@ -2260,5 +2422,37 @@ def make_app(
         response = {"state": monitor.state.value, "reason": reason}
         _attach_signature(response, signed, marker)
         return response
+
+    # STOPS AT START (#37). A process that ended any way but the normal exit
+    # path (systemd's watchdog kill, an out-of-memory kill, a crash) may have
+    # left hardware that keeps its last goal moving, and booting held is not
+    # a trip: it sends nothing. So unless the previous process left a
+    # clean-shutdown marker (`serve`, clean_shutdown.py), every declared stop
+    # goes out now, as a trip would send it, on threads of their own, before
+    # the gateway serves anything. A stop that fails or does not answer
+    # leaves its actuator refused (`stop_unconfirmed`) until a stop to it
+    # succeeds; the clear waits for these as for a trip's own.
+    if stops_at_start is not None:
+        start_records: list = []
+        with _safety_lock:
+            _safety.trips += 1
+            _start = _Trip(
+                seq=_safety.trips, kind="start", why=stops_at_start,
+                state=safety_monitor.state if safety_monitor is not None
+                else GatewayState.SAFE_STOP,
+                sends=[_StopSend(name=n, actuator=a, config=c, tool=t, startup="start",
+                                 msg_id=f"safety-stop-{uuid.uuid4().hex[:12]}")
+                       for n, a, c, t in _stop_targets],
+            )
+            _safety.trip = _safety.last_trip = _start
+            for _send in _start.sends:
+                # Refused from now, not only once a stop has failed: an app
+                # built READY must not move an actuator while its stop at
+                # start is still on its way. Lifted when a stop succeeds.
+                _unconfirmed[id(_send.actuator)] = _unconfirmed_reason(
+                    _send, "has not answered yet")
+            start_records.append(("start", None, _start))
+            _advance_locked(start_records)
+        _write_safety_records(start_records)
 
     return app
