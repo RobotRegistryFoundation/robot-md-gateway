@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0a10] - 2026-11-14
+
 ### Security
 
 - **systemd restarts a gateway whose safety watchdog stops ticking.** A dead
@@ -212,10 +214,9 @@
   unknown one, is now refused, signed and recorded.
 - **so-arm101-actuator 0.2.2 can no longer be armed, and neither can a gateway
   with oak-d-actuator up to 0.2.1.** Neither declares a stop or an empty
-  `motion_capabilities`, so the clear answers 409. Run so-arm101-actuator main,
-  or 0.3.0 or later once released, and an oak-d-actuator release with
-  RobotRegistryFoundation/oak-d-actuator#13 (README, "The arm's driver, and
-  every other actuator").
+  `motion_capabilities`, so the clear answers 409. Run so-arm101-actuator
+  0.3.0 or later and oak-d-actuator 0.2.2 or later (README, "The arm's driver,
+  and every other actuator").
 - **A supervisor or commission token needs at least 32 characters**, or the
   gateway refuses to start.
 - **The systemd unit needs its bearer file.** A fresh `install.sh` creates

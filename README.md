@@ -427,11 +427,11 @@ included, is a trip:
 
 - The gateway sends each actuator that declares a stop (`stop_capabilities`)
   that stop, as itself: no bearer and no gate, at tier `read`, with the pinned
-  manifest or none. For so-arm101-actuator main (0.3.0 and later, once
-  released) that is `arm.estop`: it latches, ends a paced move at its next
-  setpoint and holds the pose. The hold is done in software; it is not a
-  hardware e-stop. so-arm101-actuator 0.2.2, the latest on PyPI, declares no
-  stop at all (see "the arm's driver" below).
+  manifest or none. For so-arm101-actuator 0.3.0 and later that is
+  `arm.estop`: it latches, ends a paced move at its next setpoint and holds
+  the pose. The hold is done in software; it is not a hardware e-stop.
+  so-arm101-actuator 0.2.2 and earlier declare no stop at all (see "the arm's
+  driver" below).
 - Each stop runs on a thread of its own, so a stop that hangs on its bus delays
   no other actuator's stop and does not stop the watchdog. After 10 s without an
   answer the gateway records it as failed and stops waiting for it, and from
@@ -567,13 +567,12 @@ gateway while any configured actuator may move and declares no stop. So every
 actuator in `bearers.yaml` must declare a stop, or declare an empty
 `motion_capabilities`, before the gateway can be armed. On bob that is two
 packages:
-- so-arm101-actuator 0.2.2, the latest on PyPI, declares no stop and nothing
-  about motion. Bob must run so-arm101-actuator main, or 0.3.0 or later once it
-  is released.
-- oak-d-actuator, bob's camera, declares neither attribute on main or in 0.2.1
-  on PyPI, so a gateway that loads it beside the arm answers every clear with
-  409, naming `oak-d`. RobotRegistryFoundation/oak-d-actuator#13 declares both
-  empty; bob needs a release with it.
+- so-arm101-actuator 0.2.2 and earlier declare no stop and nothing about
+  motion. Bob needs so-arm101-actuator 0.3.0 or later.
+- oak-d-actuator, bob's camera, declares neither attribute up to 0.2.1, so a
+  gateway that loads it beside the arm answers every clear with 409, naming
+  `oak-d`. oak-d-actuator 0.2.2 declares both empty
+  (RobotRegistryFoundation/oak-d-actuator#13); bob needs 0.2.2 or later.
 
 To check what is installed, look for `no_declared_stop` in the gateway's
 startup log (`... so the gateway refuses to be cleared (armed) while it is
