@@ -39,7 +39,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -136,10 +136,11 @@ class _StopSend:
     msg_id: str
     status: str = "pending"        # pending -> running -> done, or running -> timed_out
     started: float | None = None   # the app's clock() when its thread started
-    #: time.monotonic() the moment the actuator's execute returned (or
-    #: raised), taken on the stop's own thread before anything else: which
-    #: came first, this answer or a dispatch's (`_stop_again_if_tripped`).
-    answered_at: float | None = None
+    #: Set once the actuator's execute has returned (or raised), or once the
+    #: gateway has stopped waiting for it (STOP_TIMEOUT_S). A dispatch that the
+    #: trip overlapped waits on it before it sends the stop again
+    #: (`_stop_again_if_tripped`), so the two never queue on one bus.
+    settled: threading.Event = field(default_factory=threading.Event)
     #: Set on a stop sent AGAIN after a dispatch that the trip overlapped (see
     #: `_stop_again_if_tripped`): which dispatch, for the record. None on a
     #: trip's own stop.
@@ -976,6 +977,7 @@ def make_app(
                     )
             elif send.status == "running" and clock() - send.started > STOP_TIMEOUT_S:
                 send.status = "timed_out"
+                send.settled.set()          # a dispatch waiting on it goes on
                 if send.again is None:
                     # A trip's own stop that does not answer is a stop the
                     # gateway cannot count on, as one that fails is (round 2's
@@ -1010,7 +1012,9 @@ def make_app(
                     tier=SAFETY_STOP_TIER, config=send.config,
                 )
             finally:
-                send.answered_at = time.monotonic()
+                # It has answered: a dispatch that the trip overlapped may now
+                # send this actuator its stop again (`_stop_again_if_tripped`).
+                send.settled.set()
             if not isinstance(outcome, ActuatorOutcome):
                 raise TypeError(f"execute returned {type(outcome).__name__}, not an outcome")
         except Exception as exc:
@@ -1047,8 +1051,8 @@ def make_app(
             if not outcome.success:
                 reason += f"; it did not succeed: {outcome.error_message}"
                 reason += ("; motion through it is refused from now on" if counted else
-                           "; a stop sent again is not held against the actuator, whose "
-                           "own trip stop answered")
+                           "; a stop sent again is not held against the actuator: the "
+                           "trip's own stop decides that")
             (log.warning if outcome.success else log.error)(
                 "%s (outcome: %s)", reason, outcome.outcome_kind,
             )
@@ -1150,35 +1154,33 @@ def make_app(
         _write_safety_records(records)
         return state, trips
 
-    def _stop_again_if_tripped(trips: int, act: object, *, tool_name: str, msg_id: str,
-                               returned_at: float) -> str | None:
-        """After a gated dispatch returns: should this actuator get its stop
-        again? (Blocking 1 of the second review; note N1 of the third.)
+    def _stop_again_if_tripped(trips: int, act: object, *, tool_name: str,
+                               msg_id: str) -> str | None:
+        """After a gated dispatch returns: send this actuator its stop again
+        if the gateway tripped while the dispatch ran. (Blocking 1 of the
+        second review, note N1 of the third, blocking 1 of the fourth.)
 
         A trip that began after the dispatch's last state check sends this
-        actuator its own stop on a thread of its own, at the same time as the
-        dispatch runs. Two orders are possible, told apart by when each call
-        into the actuator returned (`returned_at`, and the stop's
-        `answered_at`), each read on its own thread as the call returned:
-        - That stop had already answered when the dispatch returned. The
-          motion's goal can then have reached the actuator AFTER the stop, and
-          an actuator whose stop does not latch (castor-hal's `Transport.estop`
-          is a best-effort stop or hold) keeps that goal. The gateway sends the
-          stop again, now that the dispatch has returned.
-        - That stop had not answered yet. It is then still on its way, and it
-          lands after the dispatch: nothing to send again. so-arm101-actuator
-          is this case: its stop latches at once and then waits for the bus,
-          which a paced move gives up at its next setpoint. Sending another
-          stop then queued behind the trip's own, and the driver refused it as
-          `busy` (note N1), so the gateway now waits for the trip's own stop to
-          answer first. A paced driver whose stop does not latch would leave a
-          pre-trip move running; a paced driver must latch.
+        actuator its own stop on a thread of its own, while the dispatch runs.
+        Which of the two reached the actuator first cannot be told from here.
+        A stop that lands and then reads back, or waits for an
+        acknowledgement, returns after a motion that landed after it (the
+        fourth review's R4-01), and an actuator whose stop does not latch
+        (castor-hal's `Transport.estop` is a best-effort stop or hold) keeps
+        that motion's goal. So after every motion the trip overlapped:
+        - first the trip's own stop to this actuator must answer, or the
+          gateway must stop waiting for it (STOP_TIMEOUT_S). Sent while that
+          stop still waited for its bus, the second queued behind it and
+          so-arm101-actuator refused it as `busy` (note N1);
+        - then the stop goes again, on this thread. A latching actuator
+          answers it as a stop repeated while latched.
 
         Only after a motion tool: a read leaves no goal behind. A stop sent
         again joins the current trip, so a clear waits for its answer as for
         the trip's own; if that trip has been cleared already, it is sent all
         the same, since the clear was for the trip, not for a dispatch admitted
-        before it. Its failure is recorded and not held against the actuator.
+        before it. Its failure is recorded and not held against the actuator:
+        the trip's own stop decides that.
 
         Returns what was done, for the response and the record; None when
         nothing was sent."""
@@ -1190,46 +1192,43 @@ def make_app(
             trip = _safety.trip or _safety.last_trip
             own = next((s for s in trip.sends if s.actuator is act and s.again is None), None)
             target = next((t for t in _stop_targets if t[1] is act), None)
-            if target is None:
-                done = (f"the gateway tripped (trip {trip.seq}) while {tool_name} was being "
-                        f"dispatched, and this actuator declares no stop to send it again")
-            elif own is None or own.answered_at is None or own.answered_at > returned_at:
-                # The trip's own stop answered after this returned, or has not
-                # answered yet: it lands after this dispatch.
-                return None
-            else:
-                name, _act, config, tool = target
-                send = _StopSend(
-                    name=name, actuator=act, config=config, tool=tool,
-                    msg_id=f"safety-stop-{uuid.uuid4().hex[:12]}",
-                    status="running", started=clock(),
-                    again=f"{tool_name} ({msg_id}) was being dispatched when the trip began",
-                )
-                if _safety.trip is not None:
-                    _safety.trip.sends.append(send)
-                done = (f"the gateway tripped (trip {trip.seq}) while {tool_name} was being "
-                        f"dispatched, and its stop to {name} answered first, so {tool} was "
-                        f"sent to {name} again after it returned")
-        logging.getLogger(__name__).warning("safety_stop_again: %s", done)
-        if target is not None:
-            _send_stop(trip, send)
+        log = logging.getLogger(__name__)
+        if target is None:
+            done = (f"the gateway tripped (trip {trip.seq}) while {tool_name} was being "
+                    f"dispatched, and this actuator declares no stop to send it again")
+            log.warning("safety_stop_again: %s", done)
+            return done
+        name, _act, config, tool = target
+        # Not under the lock: the trip's own stop takes it when it answers.
+        answered = own is None or own.settled.wait(STOP_TIMEOUT_S)
+        with _safety_lock:
+            send = _StopSend(
+                name=name, actuator=act, config=config, tool=tool,
+                msg_id=f"safety-stop-{uuid.uuid4().hex[:12]}",
+                status="running", started=clock(),
+                again=f"{tool_name} ({msg_id}) was being dispatched when the trip began",
+            )
+            if _safety.trip is not None:
+                _safety.trip.sends.append(send)
+        done = (f"the gateway tripped (trip {trip.seq}) while {tool_name} was being "
+                f"dispatched, so {tool} was sent to {name} again after it returned, "
+                + ("once the trip's own stop had answered" if answered else
+                   f"though the trip's own stop had not answered in {STOP_TIMEOUT_S:g} s"))
+        log.warning("safety_stop_again: %s", done)
+        _send_stop(trip, send)
         return done
 
     def _execute(target_actuator: Actuator, envelope_dict: dict, manifest_path: Path | None,
-                 tier: str, target_config: dict) -> tuple[ActuatorOutcome, str | None, str, float]:
-        """Call the actuator: (outcome, error kind, ended_at, the time.monotonic()
-        the call returned). The outcome is captured whatever happens, so the
-        record says what did."""
+                 tier: str, target_config: dict) -> tuple[ActuatorOutcome, str | None, str]:
+        """Call the actuator: (outcome, error kind, ended_at). The outcome is
+        captured whatever happens, so the record says what did."""
         try:
-            try:
-                outcome = target_actuator.execute(
-                    envelope=envelope_dict,
-                    manifest_path=manifest_path,
-                    tier=tier,
-                    config=target_config,
-                )
-            finally:
-                returned_at = time.monotonic()
+            outcome = target_actuator.execute(
+                envelope=envelope_dict,
+                manifest_path=manifest_path,
+                tier=tier,
+                config=target_config,
+            )
             error_kind: str | None = None
         except Exception as exc:
             outcome = ActuatorOutcome(
@@ -1237,7 +1236,7 @@ def make_app(
                 error_message=str(exc),
             )
             error_kind = type(exc).__name__
-        return outcome, error_kind, datetime.now(tz=timezone.utc).isoformat(), returned_at
+        return outcome, error_kind, datetime.now(tz=timezone.utc).isoformat()
 
     def _dispatch(
         *,
@@ -1302,13 +1301,13 @@ def make_app(
                 detail = {"deny": "safety_state", "reason": reason}
                 _attach_signature(detail, signed, marker)
                 raise HTTPException(status_code=403, detail=detail)
-        outcome, error_kind, ended_at, returned_at = _execute(
+        outcome, error_kind, ended_at = _execute(
             target_actuator, envelope_dict, manifest_path, tier, target_config)
         again = None
         if trips is not None:
             # Before the outcome record, so the stop waits for no record.
             again = _stop_again_if_tripped(trips, target_actuator, tool_name=tool_name,
-                                           msg_id=msg_id, returned_at=returned_at)
+                                           msg_id=msg_id)
         return _answer(
             envelope_dict=envelope_dict, msg_id=msg_id, ruri=ruri, scope=scope,
             tool_name=tool_name, target_actuator=target_actuator, kid=kid, rrn=rrn,
@@ -1539,7 +1538,7 @@ def make_app(
         # the actuator. Both records are still written, in the same order and
         # linked the same way; the intent says it was written after the stop
         # was sent. The cost: a process killed during a stop leaves no intent.
-        sent.outcome, sent.error_kind, sent.ended_at, _ = _execute(
+        sent.outcome, sent.error_kind, sent.ended_at = _execute(
             target, envelope_dict, pinned_manifest_path, tier, config)
         return sent
 

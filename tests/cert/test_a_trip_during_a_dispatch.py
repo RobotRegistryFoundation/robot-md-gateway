@@ -10,10 +10,19 @@ Now:
 - the gateway checks its state once more after the intent record, as the last
   statement before the actuator is called; a trip by then is a signed refusal
   whose record carries the intent's chain hash;
-- a trip that begins after that check, while the actuator runs, is answered
-  with that actuator's stop again once it returns, so the last word the
-  actuator hears is a stop. A clear waits for that stop as for the trip's own.
+- a trip that begins after that check, while a motion runs, is answered with
+  that actuator's stop again once the motion returns and the trip's own stop
+  has answered, so the last word the actuator hears is a stop. A clear waits
+  for that stop as for the trip's own.
 The trip's own stop never waits for the motion: it runs on its own thread.
+
+Which of the two reached the actuator first is not known to the gateway, and
+the order in which they return does not tell it: a stop that lands and then
+waits for an acknowledgement returns after a goal that landed after it (the
+fourth review's blocking item). So the stop goes again after every motion the
+trip overlapped. It waits for the trip's own stop first, so that the two never
+queue on one bus (the third review's N1: so-arm101-actuator refused the second
+as busy).
 """
 
 from __future__ import annotations
@@ -150,8 +159,8 @@ def test_a_trip_while_the_actuator_runs_is_followed_by_its_stop_again():
     assert drive.goal == "stopped"
     assert box["r"].status_code == 200               # the drive did set the goal
     assert box["r"].json()["stopped_again"] == (
-        "the gateway tripped (trip 1) while drive.go was being dispatched, and its stop to "
-        "drive answered first, so drive.stop was sent to drive again after it returned")
+        "the gateway tripped (trip 1) while drive.go was being dispatched, so drive.stop was "
+        "sent to drive again after it returned, once the trip's own stop had answered")
     chain = app.state.audit_chain
     again = [e for e in chain.entries if e.decision_reason.startswith("safety_stop:")
              and " again, because drive.go (" in e.decision_reason]
@@ -273,8 +282,64 @@ def test_a_dispatch_with_no_trip_sends_no_extra_stop():
 
 # --------------------------------------------------------------------------- #
 # Note N1 of the third review: a stop sent again must not queue behind the
-# trip's own stop, and a read gets none
+# trip's own stop, and a read gets none. Blocking 1 of the fourth: the order
+# in which the two calls return is not the order in which they landed.
 # --------------------------------------------------------------------------- #
+
+
+class AckDrive:
+    """Holds its last goal; its stop does not latch. The stop lands at once
+    and then waits `ack_s` for an acknowledgement before it returns, so it
+    returns after a goal that landed after it. `trip`, when set, is called
+    while the goal is on its way, and the goal lands once the trip's stop has.
+    The fourth review's R4-01, castor-hal's `TransportActuator` over a base
+    that holds its last velocity, in the gateway's own terms."""
+
+    name, description, config_schema = "drive", "drive", {}
+    motion_capabilities = frozenset({"drive.go"})
+    stop_capabilities = frozenset({"drive.stop"})
+
+    def __init__(self, ack_s):
+        self.ack_s = ack_s
+        self.goal, self.log, self.trip = "stopped", [], None
+
+    def execute(self, *, envelope, manifest_path, tier, config):
+        if envelope["tool_name"] == "drive.stop":
+            self.goal = "stopped"
+            self.log.append("drive.stop")
+            time.sleep(self.ack_s)                   # the acknowledgement, after it landed
+        else:
+            if self.trip is not None:
+                trip, self.trip = self.trip, None
+                trip()
+                assert _wait_for(lambda: "drive.stop" in self.log)
+            self.goal = "going"
+            self.log.append("drive.go")
+        return ActuatorOutcome(success=True, outcome_kind="executed", telemetry={})
+
+
+@pytest.mark.parametrize("ack_ms", [0, 20])
+def test_a_goal_that_lands_after_the_trip_stop_is_stopped_again(ack_ms):
+    """The fourth review's blocking item, R4-01. The trip's stop lands, then
+    the goal does. With a stop that returns at once, round 3 sent the stop
+    again; with one that returns 20 ms after it lands, the motion returned
+    first, nothing was sent again, and the drive kept going with the gateway
+    in safe_stop. Now the stop goes again either way."""
+    drive = AckDrive(ack_ms / 1000)
+    app, monitor, clock = _app(drive, AuditChain(), tool_allowlist=DRIVE_TOOLS)
+    drive.trip = lambda: (clock.advance(STALE_S + 1), app.state.safety_tick())
+    with TestClient(app) as client:
+        _heartbeat(client)
+        _clear(client)
+        response = _invoke(client, "drive.go")
+        assert _stopped(app, 2)
+    assert monitor.state is GatewayState.SAFE_STOP
+    assert drive.log == ["drive.stop", "drive.go", "drive.stop"]
+    assert drive.goal == "stopped"
+    assert response.status_code == 200
+    assert response.json()["stopped_again"].endswith(
+        "drive.stop was sent to drive again after it returned, once the trip's own stop had "
+        "answered")
 
 
 class BusArm:
@@ -372,20 +437,22 @@ def _resume_and_move(client, arm):
     return cleared, unlatched, _invoke(client, "arm.move_to")
 
 
-@pytest.mark.parametrize("in_flight, scope, started", [
-    ("arm.move_to", "MANIPULATE", "moving"),
-    ("arm.state", "OBSERVE", "reading"),
+@pytest.mark.parametrize("in_flight, scope, started, sent", [
+    ("arm.move_to", "MANIPULATE", "moving", 2),
+    ("arm.state", "OBSERVE", "reading", 1),
 ])
-def test_a_trip_during_a_move_or_a_read_on_a_bus_arm_sends_one_stop(in_flight, scope, started):
+def test_a_trip_during_a_move_or_a_read_on_a_bus_arm_never_queues_two_stops(
+        in_flight, scope, started, sent):
     """The third review's R3-10 (a paced move) and R3-12 (a read) on
     so-arm101-actuator. The trip's stop latched and waited for the bus; the
     request returned while it waited; the gateway sent the stop again at once,
     the driver refused it as busy, departure (e) counted that as a failed stop,
     and every move after the documented resume was 403 `stop_unreachable`.
 
-    Now the move returns before the trip's own stop has answered, so that stop
-    lands after it and nothing is sent again; and a read never gets a second
-    stop. One stop, and the resume works."""
+    Now the stop sent again after the move waits for the trip's own stop to
+    answer, so it finds no stop waiting for the bus: both stops write the
+    hold, and neither is refused. A read gets no second stop. The resume
+    works either way."""
     arm, chain = BusArm(), AuditChain()
     app, _monitor, clock = _app(arm, chain, tool_allowlist=BUS_TOOLS)
     box: dict = {}
@@ -399,21 +466,22 @@ def test_a_trip_during_a_move_or_a_read_on_a_bus_arm_sends_one_stop(in_flight, s
         clock.advance(STALE_S + 1)
         app.state.safety_tick()
         request.join(10)
-        assert _stopped(app)
+        assert _stopped(app, sent)
         cleared, unlatched, moved = _resume_and_move(client, arm)
-    assert box["r"].status_code == 200 and "stopped_again" not in box["r"].json()
+    assert box["r"].status_code == 200
+    assert ("stopped_again" in box["r"].json()) == (sent == 2)
     stops = _reasons(chain, "safety_stop:")
-    assert len(stops) == 1 and "did not succeed" not in stops[0]
-    assert arm.holds == 1 and arm.busy == []
+    assert len(stops) == sent
+    assert not [s for s in stops if "did not succeed" in s]
+    assert arm.holds == sent and arm.busy == []
     assert (cleared.status_code, unlatched.status_code) == (200, 200)
     assert moved.status_code == 200, moved.text
 
 
 def test_a_stop_sent_again_that_fails_is_not_held_against_the_actuator():
-    """The trip's own stop answered first, so the drive gets its stop again
-    after the motion; that second stop fails. The failure is recorded, and
-    motion through the drive is not refused for it: the trip's own stop
-    worked."""
+    """The drive gets its stop again after the motion, and that second stop
+    fails. The failure is recorded, and motion through the drive is not
+    refused for it: the trip's own stop worked."""
 
     class _SecondStopFails(Drive):
         def execute(self, *, envelope, manifest_path, tier, config):
@@ -443,8 +511,9 @@ def test_a_stop_sent_again_that_fails_is_not_held_against_the_actuator():
         assert _clear(client).status_code == 200
         drive.hold = None
         moved = _invoke(client, "drive.go")
-    assert box["r"].json()["stopped_again"].endswith("sent to drive again after it returned")
+    assert "drive.stop was sent to drive again after it returned" in (
+        box["r"].json()["stopped_again"])
     [again] = [r for r in _reasons(chain, "safety_stop:") if " again, because " in r]
     assert again.endswith("it did not succeed: IO_ERROR; a stop sent again is not held "
-                          "against the actuator, whose own trip stop answered")
+                          "against the actuator: the trip's own stop decides that")
     assert moved.status_code == 200, moved.text

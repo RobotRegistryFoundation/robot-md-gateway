@@ -254,7 +254,8 @@ def test_a_motion_in_flight_is_stopped_and_the_machine_holds():
         # its stop again once the move returns (blocking 1 of the second review).
         assert not again["while_moving"]
         assert box["r"].json()["stopped_again"].endswith(
-            "so arm.estop was sent to arm again after it returned")
+            "so arm.estop was sent to arm again after it returned, once the trip's own stop "
+            "had answered")
 
         # ... and it HOLDS: nothing moves it afterwards, and a new motion is
         # refused by the gateway and recorded as a refusal.
