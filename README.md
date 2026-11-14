@@ -360,20 +360,51 @@ an operator arms it. A restart is never a resume. To arm it, in this order:
    127.0.0.1 on the robot, so publish it on your tailnet with `tailscale serve`
    (see [Ingress](#ingress--do-not-port-forward)).
 2. From the supervisor's device, never from the robot, send heartbeats at least
-   every 3 seconds (send one every second). `GATEWAY` is the robot's gateway as
-   that device reaches it, for example `https://bob.<your-tailnet>.ts.net`:
+   every 3 seconds. `robot-md-gateway heartbeat` sends one a second until
+   Ctrl-C, and prints each change in what the gateway answers. `--gateway` is
+   the robot's gateway as that device reaches it; the token comes from a file
+   or `ROBOT_MD_GATEWAY_TOKEN`, never from the command line:
 
    ```bash
-   while true; do
-     curl -fsS -X POST -H "Authorization: Bearer $SUPERVISOR_TOKEN" \
-       "$GATEWAY/v1/safety/heartbeat" >/dev/null || echo "heartbeat refused or unreachable"
-     sleep 1
-   done
+   robot-md-gateway heartbeat --gateway https://bob.<your-tailnet>.ts.net \
+     --token-file ~/.config/robot-md-gateway/supervisor.token
    ```
 
-3. As the operator, `POST /v1/safety/clear` with the `commission` bearer. Where
-   `ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE` is on, as on bob, the body must be a
-   signed `ESTOP_CLEAR` envelope (see "Resuming" below).
+   It refuses a gateway whose address is the machine it runs on (a loopback
+   address, or one bound to an interface there, such as the robot's own
+   tailnet name) unless `--i-am-on-the-robot` is given. An SSH tunnel to the
+   robot (`ssh -L`) is refused too, since from here it is a loopback address
+   like the robot's own gateway; use the tailnet address. The guard catches a
+   mistake, and keeping the supervisor token off the robot is the control: it
+   cannot see a process in its own network namespace on the robot (a
+   container), nor a name that resolves to a public relay (Funnel without
+   MagicDNS). It stops at once on a 401 or 403: only a supervisor credential
+   can send heartbeats. Stopping it stops the heartbeat, and the gateway trips
+   3 s later.
+
+   Neither command follows a redirect or uses a proxy: a 3xx from the
+   gateway's URL is a refusal, and `HTTP_PROXY` and `HTTPS_PROXY` are
+   ignored, so the token goes nowhere but the address given. Neither repeats
+   anything typed on its command line in an error, so a mistyped flag such as
+   `--tok` does not print the token that follows it. Neither refuses
+   plain `http://`, and over the tailnet address that is fine, since WireGuard
+   encrypts it; over an ordinary LAN, plain `http://` sends the token in clear.
+
+3. As the operator, clear it with the `commission` credential. Where
+   `ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE` is on, as on bob, the clear must be a
+   signed `ESTOP_CLEAR` envelope (see "Resuming" below); `--key` signs one
+   with a new `msg_id` and the current time, with robot-md's keystore file
+   (the key `robot-md invoke` signs with, and its `pq_kid`) or with an Ed25519
+   PEM and `--kid`:
+
+   ```bash
+   robot-md-gateway clear --gateway https://bob.<your-tailnet>.ts.net \
+     --token-file ~/.config/robot-md-gateway/commission.token \
+     --key ~/.robot-md/keys/RRN-000000000011.signing.json
+   ```
+
+   A refused clear has spent its `msg_id`; running the command again signs a
+   new one.
 
 **Who may send the heartbeat.** Only a credential with `role: supervisor` in
 `bearers.yaml` (see [Bearer tokens](#bearer-tokens)). Every other credential is

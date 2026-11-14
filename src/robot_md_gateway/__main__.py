@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -212,6 +213,62 @@ def _claim_devices(pairs) -> None:
             log.info("device_claimed actuator=%s", name)
 
 
+class _NoTokenOnTheCommandLine(argparse.Action):
+    """`--token` is refused without echoing its value: a token on the command
+    line stays in the process list and the shell history."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error("no --token: give it in --token-file, or in ROBOT_MD_GATEWAY_TOKEN")
+
+
+def _without_values(operator_parser: argparse.ArgumentParser) -> None:
+    """The operator's two commands never repeat a value in an error. A
+    near-miss such as `--tok X` or `--token-fil X` is followed by the token
+    itself, and argparse quotes a value it cannot use ("invalid float value:
+    'X'"). Their `error()` blanks every quoted value; unrecognized arguments
+    are reported by `_unrecognized`, since argparse reports those from the
+    top-level parser, not from the subcommand's (the fourth review's N2)."""
+    original = operator_parser.error
+
+    def error(message: str):
+        original(re.sub(r"'[^']*'", "'(not shown)'", message))
+
+    operator_parser.error = error
+
+
+def _unrecognized(parser: argparse.ArgumentParser) -> None:
+    """Report unrecognized arguments without repeating any of them, not even
+    one that looks like a flag: argparse files a value that starts with "-"
+    among them, so `--tok -SECRET` repeated the token (the fifth review's N1;
+    `secrets.token_urlsafe` starts one token in 64 with "-"). The usage line
+    that `error()` prints first names the flags the command takes."""
+    parser.error("unrecognized arguments, not shown since one may be a token; "
+                 "the usage line above lists what this command takes")
+
+
+def _operator(args: argparse.Namespace) -> int:
+    """`heartbeat` and `clear`: see operator.py."""
+    from .operator import OperatorError, build_clear, clear, heartbeat, load_signing_key, read_token
+
+    try:
+        token = read_token(args.token_file)
+        if args.cmd == "heartbeat":
+            try:
+                return heartbeat(args.gateway, token, interval=args.interval,
+                                 i_am_on_the_robot=args.i_am_on_the_robot)
+            except KeyboardInterrupt:
+                print("stopped: the gateway trips 3 s after the last heartbeat it accepted")
+                return 0
+        envelope = None
+        if args.key:
+            priv, kid = load_signing_key(args.key, args.kid)
+            envelope = build_clear(priv, kid, ruri=args.ruri)
+        return clear(args.gateway, token, envelope=envelope)
+    except (OperatorError, OSError) as exc:
+        print(f"robot-md-gateway {args.cmd}: {exc}", file=sys.stderr)
+        return 2
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="robot-md-gateway")
     parser.add_argument(
@@ -273,7 +330,66 @@ def main() -> None:
         default=None,
     )
 
-    args = parser.parse_args()
+    # The operator's two acts on a served gateway (operator.py). The token is
+    # read from a file or ROBOT_MD_GATEWAY_TOKEN, never from the command line.
+    beat = sub.add_parser(
+        "heartbeat",
+        help="Send a supervisor's heartbeats to a gateway, every second until Ctrl-C. "
+        "Run it on the supervising person's device, never on the robot.",
+        allow_abbrev=False,
+    )
+    beat.add_argument(
+        "--gateway", required=True,
+        help="The gateway's URL as this device reaches it, e.g. https://bob.<tailnet>.ts.net",
+    )
+    beat.add_argument(
+        "--token-file", default=None,
+        help="File holding the supervisor token (default: $ROBOT_MD_GATEWAY_TOKEN)",
+    )
+    beat.add_argument(
+        "--interval", type=float, default=1.0,
+        help="Seconds between heartbeats (default 1; the gateway trips after 3 s without one)",
+    )
+    beat.add_argument(
+        "--i-am-on-the-robot", action="store_true",
+        help="Send heartbeats even though the gateway's address is this machine's",
+    )
+
+    clear_p = sub.add_parser(
+        "clear",
+        help="Clear (arm) a held or tripped gateway: POST /v1/safety/clear with the "
+        "commission credential, signed with --key where the gateway requires it.",
+        allow_abbrev=False,
+    )
+    clear_p.add_argument(
+        "--gateway", required=True,
+        help="The gateway's URL as this device reaches it, e.g. https://bob.<tailnet>.ts.net",
+    )
+    clear_p.add_argument(
+        "--token-file", default=None,
+        help="File holding the commission token (default: $ROBOT_MD_GATEWAY_TOKEN)",
+    )
+    clear_p.add_argument(
+        "--key", default=None,
+        help="Sign an ESTOP_CLEAR envelope with this key: robot-md's keystore file "
+        "(~/.robot-md/keys/<rrn>.signing.json) or an Ed25519 PKCS8 PEM",
+    )
+    clear_p.add_argument(
+        "--kid", default=None,
+        help="Key id the gateway's resolver knows (default: the keystore's pq_kid, "
+        "the one robot-md invoke sends)",
+    )
+    clear_p.add_argument("--ruri", default=None, help="The robot's RURI, for the envelope")
+    for operator_parser in (beat, clear_p):
+        operator_parser.add_argument("--token", nargs="?", action=_NoTokenOnTheCommandLine,
+                                     help=argparse.SUPPRESS)
+        _without_values(operator_parser)
+
+    args, extras = parser.parse_known_args()
+    if extras:
+        if args.cmd in ("heartbeat", "clear"):
+            _unrecognized(beat if args.cmd == "heartbeat" else clear_p)
+        parser.error("unrecognized arguments: " + " ".join(extras))
 
     if args.cmd == "serve":
         if args.robot_md:
@@ -444,6 +560,9 @@ def main() -> None:
             no_token_stdout=args.no_token_stdout,
         )
         sys.exit(rc)
+
+    if args.cmd in ("heartbeat", "clear"):
+        sys.exit(_operator(args))
 
     if args.cmd == "list-actuators":
         from .actuator import discover_actuators
