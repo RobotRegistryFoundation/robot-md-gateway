@@ -236,11 +236,14 @@ def _without_values(operator_parser: argparse.ArgumentParser) -> None:
     operator_parser.error = error
 
 
-def _unrecognized(parser: argparse.ArgumentParser, extras: list[str]) -> None:
-    """Name what was not recognized by its flags alone, never a value."""
-    flags = [arg.split("=", 1)[0] for arg in extras if arg.startswith("-")]
-    parser.error("unrecognized arguments: " + (" ".join(flags) or "(values only)")
-                 + "; what was typed with them is not shown")
+def _unrecognized(parser: argparse.ArgumentParser) -> None:
+    """Report unrecognized arguments without repeating any of them, not even
+    one that looks like a flag: argparse files a value that starts with "-"
+    among them, so `--tok -SECRET` repeated the token (the fifth review's N1;
+    `secrets.token_urlsafe` starts one token in 64 with "-"). The usage line
+    that `error()` prints first names the flags the command takes."""
+    parser.error("unrecognized arguments, not shown since one may be a token; "
+                 "the usage line above lists what this command takes")
 
 
 def _operator(args: argparse.Namespace) -> int:
@@ -385,7 +388,7 @@ def main() -> None:
     args, extras = parser.parse_known_args()
     if extras:
         if args.cmd in ("heartbeat", "clear"):
-            _unrecognized(beat if args.cmd == "heartbeat" else clear_p, extras)
+            _unrecognized(beat if args.cmd == "heartbeat" else clear_p)
         parser.error("unrecognized arguments: " + " ".join(extras))
 
     if args.cmd == "serve":

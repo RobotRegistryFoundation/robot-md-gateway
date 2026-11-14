@@ -12,7 +12,9 @@ import base64
 import http.server
 import importlib
 import json
+import os
 import socket
+import subprocess
 import sys
 import threading
 import urllib.parse
@@ -583,17 +585,25 @@ def test_a_redirect_stops_the_heartbeat_and_refuses_the_clear(redirect_elsewhere
     ("heartbeat", ["--tok=SECRET-VALUE"]),
     ("clear", ["--token-fil", "SECRET-VALUE"]),
     ("heartbeat", ["SECRET-VALUE"]),
+    # The fifth review's N1: a value that starts with "-" is filed among the
+    # unrecognized arguments along with its flag, and was repeated.
+    ("heartbeat", ["--tok", "-SECRET-VALUE"]),
+    ("clear", ["--token-fil", "-SECRET-VALUE"]),
+    ("heartbeat", ["-t", "-SECRET-VALUE"]),
+    ("clear", ["--tok=-SECRET-VALUE"]),
 ])
-def test_an_unrecognized_argument_is_named_without_its_value(monkeypatch, capsys, command, argv):
-    """The review's N2: argparse printed "unrecognized arguments: --tok
-    SECRET-VALUE", and a near-miss flag is followed by the token itself."""
+def test_an_unrecognized_argument_is_never_repeated(monkeypatch, capsys, command, argv):
+    """The fourth review's N2: argparse printed "unrecognized arguments: --tok
+    SECRET-VALUE", and a near-miss flag is followed by the token itself. Not
+    even what looks like a flag is repeated now: the usage line above the
+    error names the flags the command takes."""
     assert _run(monkeypatch, command, "--gateway", GATEWAY, *argv) == 2
     err = capsys.readouterr().err
     assert "SECRET-VALUE" not in err
-    assert "unrecognized arguments: " in err
-    assert "what was typed with them is not shown" in err
-    if argv[0].startswith("-"):
-        assert f"unrecognized arguments: {argv[0].split('=')[0]};" in err
+    assert err.splitlines()[-1] == (
+        f"robot-md-gateway {command}: error: unrecognized arguments, not shown since one may "
+        f"be a token; the usage line above lists what this command takes")
+    assert err.startswith(f"usage: robot-md-gateway {command} [-h] --gateway GATEWAY")
 
 
 def test_a_value_argparse_cannot_use_is_not_repeated(monkeypatch, capsys):
@@ -609,3 +619,65 @@ def test_the_guard_says_that_an_ssh_tunnel_looks_like_the_robot():
                                             r"same from here"):
         heartbeat("http://127.0.0.1:8080", SUPERVISOR_TOKEN, sleep=lambda s: None,
                   keep_going=_times(1))
+
+
+# --------------------------------------------------------------------------- #
+# The fifth review's N2: no proxy
+# --------------------------------------------------------------------------- #
+
+
+def _refusing(seen: list):
+    """A listener that records each POST and refuses it with 403, so either
+    command stops after one."""
+
+    class _Refuses(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            seen.append((self.path, self.headers.get("Authorization")))
+            body = json.dumps({"detail": {"deny": "test", "reason": "refused"}}).encode()
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    return _Refuses
+
+
+@pytest.mark.parametrize("command, token", [("heartbeat", SUPERVISOR_TOKEN),
+                                            ("clear", COMMISSION_TOKEN)])
+def test_neither_command_sends_the_token_through_a_proxy(tmp_path, command, token):
+    """The fifth review's R5-36-03: with HTTP_PROXY set on the supervisor's
+    device, urllib's default ProxyHandler sent each command's POST, bearer
+    included, to the proxy. The command line runs in a process of its own
+    here: the opener is built, and reads the proxy settings, at import."""
+    at_gateway: list = []
+    at_proxy: list = []
+    gateway = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _refusing(at_gateway))
+    proxy = http.server.ThreadingHTTPServer(("127.0.0.2", 0), _refusing(at_proxy))
+    for server in (gateway, proxy):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    token_file = tmp_path / "token"
+    token_file.write_text(token + "\n")
+    proxy_url = f"http://127.0.0.2:{proxy.server_port}"
+    env = {k: v for k, v in os.environ.items()
+           if k.lower() not in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")}
+    env.update(HTTP_PROXY=proxy_url, http_proxy=proxy_url,
+               HTTPS_PROXY=proxy_url, https_proxy=proxy_url)
+    argv = [sys.executable, "-m", "robot_md_gateway", command,
+            "--gateway", f"http://127.0.0.1:{gateway.server_port}", "--token-file", str(token_file)]
+    if command == "heartbeat":
+        argv.append("--i-am-on-the-robot")
+    try:
+        done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60)
+    finally:
+        for server in (gateway, proxy):
+            server.shutdown()
+            server.server_close()
+    assert at_proxy == []                              # nothing, and no token, reached it
+    assert at_gateway == [(f"/v1/safety/{command}", f"Bearer {token}")]
+    assert done.returncode in (1, 2), done.stderr       # refused, and stopped
+    assert token not in done.stdout + done.stderr

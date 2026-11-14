@@ -382,8 +382,11 @@ an operator arms it. A restart is never a resume. To arm it, in this order:
    can send heartbeats. Stopping it stops the heartbeat, and the gateway trips
    3 s later.
 
-   Neither command follows a redirect: a 3xx from the gateway's URL is a
-   refusal, so the token goes nowhere but the address given. Neither refuses
+   Neither command follows a redirect or uses a proxy: a 3xx from the
+   gateway's URL is a refusal, and `HTTP_PROXY` and `HTTPS_PROXY` are
+   ignored, so the token goes nowhere but the address given. Neither repeats
+   anything typed on its command line in an error, so a mistyped flag such as
+   `--tok` does not print the token that follows it. Neither refuses
    plain `http://`, and over the tailnet address that is fine, since WireGuard
    encrypts it; over an ordinary LAN, plain `http://` sends the token in clear.
 

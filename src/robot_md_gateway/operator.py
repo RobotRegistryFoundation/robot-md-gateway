@@ -94,7 +94,12 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
         return None                     # urllib then raises HTTPError with the 3xx
 
 
-_OPENER = urllib.request.build_opener(_NoRedirects)
+#: Follows no redirect and uses no proxy. urllib's default ProxyHandler reads
+#: HTTP_PROXY and HTTPS_PROXY: with one set on the supervisor's device, each
+#: command's POST, the bearer included, went to the proxy (the fifth review's
+#: N2), and a proxy that inspects TLS can read an https:// one as well. The
+#: gateway's tailnet address never needs a proxy.
+_OPENER = urllib.request.build_opener(_NoRedirects, urllib.request.ProxyHandler({}))
 
 
 def post(url: str, token: str, body: dict | None = None, *,
