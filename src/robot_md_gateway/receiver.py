@@ -120,8 +120,10 @@ WATCHDOG_STALE_S = 1.0
 #: How long the gateway waits for one actuator's stop to answer before it
 #: records that stop as failed and stops waiting for it. Each stop runs on a
 #: thread of its own, so a slow or hung stop delays nothing else; this bounds
-#: only how long a clear is refused on its account. so-arm101-actuator can wait
-#: STOP_BUS_WAIT_S (5 s) for its bus before it answers.
+#: how long a clear is refused on its account, and how long a motion's request
+#: waits for the stops sent after it (`_stop_again_if_tripped`).
+#: so-arm101-actuator can wait STOP_BUS_WAIT_S (5 s) for its bus before it
+#: answers.
 STOP_TIMEOUT_S = 10.0
 
 
@@ -959,9 +961,10 @@ def make_app(
 
     def _advance_locked(records: list) -> None:
         """Start the current trip's stops that have not started, and stop
-        waiting for any that has not answered in STOP_TIMEOUT_S. Caller holds
-        the lock."""
-        trip = _safety.trip
+        waiting for any that has not answered in STOP_TIMEOUT_S. With no
+        current trip, the last one: a stop sent again after its trip was
+        cleared joins it (`_stop_again_if_tripped`). Caller holds the lock."""
+        trip = _safety.trip or _safety.last_trip
         if trip is None:
             return
         for send in trip.sends:
@@ -984,18 +987,20 @@ def make_app(
             elif send.status == "running" and clock() - send.started > STOP_TIMEOUT_S:
                 send.status = "timed_out"
                 send.settled.set()          # a dispatch waiting on it goes on
-                if send.again is None:
-                    # A trip's own stop that does not answer is a stop the
-                    # gateway cannot count on, as one that fails is (round 2's
-                    # departure (e)): no motion through that actuator until the
-                    # gateway restarts. Fail closed. A stop sent again is not
-                    # held against the actuator: the trip's own stop answered.
-                    _stop_unaccepted.setdefault(id(send.actuator), (
-                        f"actuator {send.name!r} did not answer the gateway's own stop "
-                        f"({send.tool} at tier {SAFETY_STOP_TIER!r}) within "
-                        f"{STOP_TIMEOUT_S:g} s, so the gateway cannot count on stopping it "
-                        f"on a trip; motion through it is refused until the gateway restarts"
-                    ))
+                # A stop that does not answer is a stop the gateway cannot
+                # count on, as one that fails is (round 2's departure (e)): no
+                # motion through that actuator until the gateway restarts.
+                # Fail closed. That holds for a stop sent again as well (the
+                # fifth review's N2): its refusal is not counted, since
+                # so-arm101-actuator refuses a repeat while another stop waits
+                # for its bus, but no driver here takes 10 s to answer one.
+                _stop_unaccepted.setdefault(id(send.actuator), (
+                    f"actuator {send.name!r} did not answer the gateway's "
+                    f"{'stop sent again' if send.again else 'own stop'} ({send.tool} at "
+                    f"tier {SAFETY_STOP_TIER!r}) within {STOP_TIMEOUT_S:g} s, so the gateway "
+                    f"cannot count on stopping it on a trip; motion through it is refused "
+                    f"until the gateway restarts"
+                ))
                 records.append(("timeout", trip, send))
 
     def _send_stop(trip: _Trip, send: _StopSend) -> None:
@@ -1104,10 +1109,9 @@ def make_app(
                 else:  # "timeout": a fault, not a decision
                     trip, send = first, second
                     reason = (f"safety_stop_timeout: trip {trip.seq}: {send.tool} to "
-                              f"{send.name} did not answer within {STOP_TIMEOUT_S:g} s; "
-                              f"the gateway stopped waiting for it")
-                    if send.again is None:
-                        reason += "; motion through it is refused from now on"
+                              f"{send.name}{' (sent again)' if send.again else ''} did not "
+                              f"answer within {STOP_TIMEOUT_S:g} s; the gateway stopped waiting "
+                              f"for it; motion through it is refused from now on")
                     msg_id, decision = f"{send.msg_id}-timeout", "allow"
                     error_kind = "StopTimeout"
                     log.error("%s", reason)
@@ -1175,18 +1179,22 @@ def make_app(
         (castor-hal's `Transport.estop` is a best-effort stop or hold) keeps
         that motion's goal. So after every motion the trip overlapped:
         - first the trip's own stop to this actuator must answer, or the
-          gateway must stop waiting for it (STOP_TIMEOUT_S). Sent while that
-          stop still waited for its bus, the second queued behind it and
-          so-arm101-actuator refused it as `busy` (note N1);
-        - then the stop goes again, on this thread. A latching actuator
-          answers it as a stop repeated while latched.
+          gateway must stop waiting for it. Sent while that stop still waited
+          for its bus, the second queued behind it and so-arm101-actuator
+          refused it as `busy` (note N1);
+        - then the stop goes again, on a thread of its own, the way a trip
+          sends its stops: the watchdog times it out after STOP_TIMEOUT_S. A
+          latching actuator answers it as a stop repeated while latched.
+        This request waits for both, at most STOP_TIMEOUT_S in all (the fifth
+        review's N1): a stop that hangs holds neither the motion's request nor
+        a thread of the default pool for longer.
 
         Only after a motion tool: a read leaves no goal behind. A stop sent
         again joins the current trip, so a clear waits for its answer as for
-        the trip's own; if that trip has been cleared already, it is sent all
-        the same, since the clear was for the trip, not for a dispatch admitted
-        before it. Its failure is recorded and not held against the actuator:
-        the trip's own stop decides that.
+        the trip's own; if that trip has been cleared already, it joins that
+        one and is sent all the same, since the clear was for the trip, not for
+        a dispatch admitted before it. Its refusal or failure is recorded and
+        not held against the actuator; its timeout is (`_advance_locked`).
 
         Returns what was done, for the response and the record; None when
         nothing was sent."""
@@ -1205,23 +1213,27 @@ def make_app(
             log.warning("safety_stop_again: %s", done)
             return done
         name, _act, config, tool = target
+        deadline = time.monotonic() + STOP_TIMEOUT_S
         # Not under the lock: the trip's own stop takes it when it answers.
-        answered = own is None or own.settled.wait(STOP_TIMEOUT_S)
+        answered = own is None or own.settled.wait(max(0.0, deadline - time.monotonic()))
+        records: list = []
         with _safety_lock:
             send = _StopSend(
                 name=name, actuator=act, config=config, tool=tool,
                 msg_id=f"safety-stop-{uuid.uuid4().hex[:12]}",
-                status="running", started=clock(),
-                again=f"{tool_name} ({msg_id}) was being dispatched when the trip began",
+                again=f"{tool_name} ({msg_id}) was being dispatched when trip {trip.seq} began",
             )
-            if _safety.trip is not None:
-                _safety.trip.sends.append(send)
+            (_safety.trip or _safety.last_trip).sends.append(send)
+            _advance_locked(records)            # starts it, on a thread of its own
+        _write_safety_records(records)
         done = (f"the gateway tripped (trip {trip.seq}) while {tool_name} was being "
                 f"dispatched, so {tool} was sent to {name} again after it returned, "
                 + ("once the trip's own stop had answered" if answered else
                    f"though the trip's own stop had not answered in {STOP_TIMEOUT_S:g} s"))
         log.warning("safety_stop_again: %s", done)
-        _send_stop(trip, send)
+        if not send.settled.wait(max(0.0, deadline - time.monotonic())):
+            done += (f"; it had not answered within {STOP_TIMEOUT_S:g} s of the motion's "
+                     f"return, and this answer did not wait longer")
         return done
 
     def _execute(target_actuator: Actuator, envelope_dict: dict, manifest_path: Path | None,

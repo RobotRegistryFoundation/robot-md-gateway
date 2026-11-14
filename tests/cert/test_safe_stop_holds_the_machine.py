@@ -435,7 +435,10 @@ def test_a_clear_racing_an_unacted_trip_sends_the_stop_first_and_waits_for_it():
     monitor.on_estop_wire(tripped=True, msg_id="wire")
     first = _clear(client)                    # no tick has run since the trip
     mover.join(15)
-    assert _stopped(app)
+    # Both stops recorded: each is marked answered before its record is
+    # written, so a clear between the two could still find one running and
+    # rightly answer 409 (the fifth review saw it once under load).
+    assert _stopped(app, 2)
     second = _clear(client)
     assert monitor.state is GatewayState.READY
     assert first.status_code == 409

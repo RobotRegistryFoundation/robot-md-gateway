@@ -33,6 +33,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+import robot_md_gateway.receiver as receiver_mod
 from robot_md_gateway.actuator import ActuatorOutcome
 from robot_md_gateway.cert.audit import AuditChain
 from robot_md_gateway.cert.policy import ToolAllowlist
@@ -517,3 +518,107 @@ def test_a_stop_sent_again_that_fails_is_not_held_against_the_actuator():
     assert again.endswith("it did not succeed: IO_ERROR; a stop sent again is not held "
                           "against the actuator: the trip's own stop decides that")
     assert moved.status_code == 200, moved.text
+
+
+# --------------------------------------------------------------------------- #
+# The fifth review's notes: a stop sent again that hangs holds the motion's
+# request at most STOP_TIMEOUT_S (N1), and one that never answers is held
+# against the actuator, as the trip's own would be (N2).
+# --------------------------------------------------------------------------- #
+
+
+class _HungRepeatDrive(Drive):
+    """The trip's own stop answers at once; the stop that follows the goal,
+    the one sent again, hangs until `stop_hold` is set. Records the thread
+    each stop ran on."""
+
+    def __init__(self):
+        super().__init__()
+        self.hold, self.stop_hold = threading.Event(), threading.Event()
+        self.stop_threads: list[str] = []
+
+    def execute(self, *, envelope, manifest_path, tier, config):
+        if envelope["tool_name"] == "drive.stop":
+            self.stop_threads.append(threading.current_thread().name)
+        return super().execute(envelope=envelope, manifest_path=manifest_path,
+                               tier=tier, config=config)
+
+
+def _motion_whose_stop_again_hangs(app, clock, client, drive, box):
+    """Trip during a drive.go, let the goal land, and return once the stop
+    sent again is hung inside the drive."""
+    _heartbeat(client)
+    _clear(client)
+    mover = threading.Thread(target=lambda: box.update(r=_invoke(client, "drive.go")))
+    mover.start()
+    assert drive.inside.wait(5)
+    clock.advance(STALE_S + 1)
+    app.state.safety_tick()
+    assert _stopped(app)                             # the trip's own stop has answered
+    drive.hold.set()                                 # the goal lands; the stop again hangs
+    assert drive.stop_held.wait(5)
+    return mover
+
+
+def test_a_stop_sent_again_that_hangs_holds_the_motions_request_at_most_the_timeout(
+        monkeypatch):
+    """The fifth review's N1. Round 5 sent the stop again on the request's own
+    thread, with no limit, so a stop that hung held the motion's request (and
+    a thread of the default pool) for as long as it hung. Now it runs on a
+    thread of its own, and the request waits for it at most STOP_TIMEOUT_S."""
+    monkeypatch.setattr(receiver_mod, "STOP_TIMEOUT_S", 0.5)
+    drive = _HungRepeatDrive()
+    app, _monitor, clock = _app(drive, AuditChain(), tool_allowlist=DRIVE_TOOLS)
+    box: dict = {}
+    try:
+        with TestClient(app) as client:
+            mover = _motion_whose_stop_again_hangs(app, clock, client, drive, box)
+            mover.join(5)
+            answered_while_hung = not mover.is_alive() and not drive.stop_hold.is_set()
+            drive.stop_hold.set()
+            assert _stopped(app, 2)
+    finally:
+        drive.stop_hold.set()
+    assert answered_while_hung
+    assert box["r"].status_code == 200
+    assert box["r"].json()["stopped_again"] == (
+        "the gateway tripped (trip 1) while drive.go was being dispatched, so drive.stop was "
+        "sent to drive again after it returned, once the trip's own stop had answered; it "
+        "had not answered within 0.5 s of the motion's return, and this answer did not wait "
+        "longer")
+    assert drive.stop_threads == ["robot-md-gateway-stop-drive"] * 2
+
+
+def test_a_stop_sent_again_that_never_answers_is_held_against_the_actuator(monkeypatch):
+    """The fifth review's N2. The trip's own stop answered; the stop sent
+    again never did. Round 5 recorded the timeout and then allowed the clear
+    and the next drive.go. A timeout is not a refusal, so it now counts as
+    the trip's own stop's would: motion through the drive is refused until
+    the gateway restarts. A refusal still does not count (the test above)."""
+    monkeypatch.setattr(receiver_mod, "STOP_TIMEOUT_S", 0.5)
+    drive, chain = _HungRepeatDrive(), AuditChain()
+    app, _monitor, clock = _app(drive, chain, tool_allowlist=DRIVE_TOOLS)
+    box: dict = {}
+    try:
+        with TestClient(app) as client:
+            mover = _motion_whose_stop_again_hangs(app, clock, client, drive, box)
+            mover.join(5)
+            clock.advance(1.0)                       # past STOP_TIMEOUT_S on the app's clock
+            app.state.safety_tick()                  # the gateway stops waiting for it
+            _heartbeat(client)
+            cleared = _clear(client)
+            moved = _invoke(client, "drive.go")
+            heard = list(drive.log)
+    finally:
+        drive.stop_hold.set()
+    [timeout] = _reasons(chain, "safety_stop_timeout:")
+    assert timeout == ("safety_stop_timeout: trip 1: drive.stop to drive (sent again) did not "
+                       "answer within 0.5 s; the gateway stopped waiting for it; motion "
+                       "through it is refused from now on")
+    assert cleared.status_code == 200, cleared.text
+    assert moved.status_code == 403
+    detail = moved.json()["detail"]
+    assert detail["deny"] == "stop_unreachable"
+    assert detail["reason"].startswith(
+        "actuator 'drive' did not answer the gateway's stop sent again (drive.stop at tier ")
+    assert heard == ["drive.stop", "drive.go"]       # the second drive.go never arrived
