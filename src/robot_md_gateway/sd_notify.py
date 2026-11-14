@@ -42,7 +42,13 @@ def watchdog_interval_s(env: Mapping[str, str] = os.environ) -> float | None:
 def notify(message: str, env: Mapping[str, str] = os.environ) -> bool:
     """Send one notification (`READY=1`, `WATCHDOG=1`). True if it was sent.
     Never raises: a gateway that cannot reach systemd keeps running, and a
-    unit that waits for these messages then stops or restarts it."""
+    unit that waits for these messages then stops or restarts it.
+
+    Never waits either. The safety watchdog's own thread sends these, and a
+    blocking send to a socket whose queue is full (PID 1 not reading it)
+    waited with the tick inside it, so the gateway stopped tripping (the fifth
+    review's N1 on #37, R5-37-03). A send that would wait is a send that did
+    not go: False, and the caller tries again on its next tick."""
     address = env.get("NOTIFY_SOCKET")
     if not address:
         return False
@@ -50,8 +56,9 @@ def notify(message: str, env: Mapping[str, str] = os.environ) -> bool:
         address = "\0" + address[1:]           # an abstract socket
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.setblocking(False)
             sock.connect(address)
-            sock.sendall(message.encode("utf-8"))
+            sock.send(message.encode("utf-8"))
     except OSError as exc:
         (_log.debug if _warned[0] else _log.warning)(
             "sd_notify: could not send %r to systemd: %s", message, exc)

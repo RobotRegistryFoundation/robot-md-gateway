@@ -1145,7 +1145,12 @@ def make_app(
         tick stops telling it, and systemd stops and restarts the gateway,
         which starts held. Without this, a dead watchdog was noticed only by
         the next request or heartbeat, and with neither arriving nothing
-        tripped (the second review's R2-18)."""
+        tripped (the second review's R2-18).
+
+        A notification never waits (`sd_notify.notify`), so a systemd that
+        has stopped reading its socket cannot stall the tick. One that did not
+        go is sent again on the next tick that runs: READY=1 counts as sent,
+        and a ping as made, only once a send has gone."""
         ping_every = sd_notify.watchdog_interval_s()
         ping_every = ping_every / 4 if ping_every else None
         ready, last_ping = False, float("-inf")
@@ -1159,11 +1164,11 @@ def make_app(
                 )
                 continue
             if not ready:
-                ready = True
-                sd_notify.notify("READY=1")
-            if ping_every is not None and time.monotonic() - last_ping >= ping_every:
+                ready = sd_notify.notify("READY=1")
+            if (ready and ping_every is not None
+                    and time.monotonic() - last_ping >= ping_every
+                    and sd_notify.notify("WATCHDOG=1")):
                 last_ping = time.monotonic()
-                sd_notify.notify("WATCHDOG=1")
 
     # For tests and in-process integrations: one synchronous tick.
     app.state.safety_tick = _safety_check

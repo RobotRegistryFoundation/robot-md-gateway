@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import os
 import socket
+import threading
 import time
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from fastapi.testclient import TestClient
 from robot_md_gateway import sd_notify
 from robot_md_gateway.cert.safety import SafetyMonitor
 
-from .cert.test_safe_stop_holds_the_machine import STALE_S, FakeClock, _app, _SimArm
+from .cert.test_safe_stop_holds_the_machine import STALE_S, FakeClock, _app, _SimArm, _wait_for
 from .test_systemd_bearers import _directive
 
 REPO = Path(__file__).resolve().parents[1]
@@ -51,6 +52,17 @@ def _received(sock, seconds: float) -> list[str]:
         with contextlib.suppress(TimeoutError):       # socket.timeout, from 3.10
             messages.append(sock.recv(256).decode())
     return messages
+
+
+def _fill():
+    """Fill the socket's queue, as a PID 1 that has stopped reading it would
+    leave it (net.unix.max_dgram_qlen, 10 by default)."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
+        sender.setblocking(False)
+        sender.connect(os.environ["NOTIFY_SOCKET"])
+        with contextlib.suppress(BlockingIOError):
+            for _ in range(100_000):
+                sender.send(b"X=1")
 
 
 # --- the protocol ------------------------------------------------------------
@@ -82,6 +94,18 @@ def test_outside_systemd_notify_does_nothing(monkeypatch):
 def test_a_socket_that_refuses_is_reported_not_raised(tmp_path, monkeypatch):
     monkeypatch.setenv("NOTIFY_SOCKET", str(tmp_path / "nobody-listens"))
     assert sd_notify.notify("WATCHDOG=1") is False
+
+
+def test_notify_never_waits_for_a_systemd_that_has_stopped_reading(systemd_socket):
+    """The fifth review's N1 (R5-37-03): the send blocked on a full queue, and
+    the safety watchdog's thread, which sends, waited with it."""
+    _fill()
+    sent: list[bool] = []
+    sender = threading.Thread(target=lambda: sent.append(sd_notify.notify("WATCHDOG=1")),
+                              daemon=True)
+    sender.start()
+    sender.join(2)
+    assert sent == [False]
 
 
 @pytest.mark.parametrize("env, expected", [
@@ -116,6 +140,36 @@ def test_without_watchdog_sec_it_only_says_ready(systemd_socket, monkeypatch):
     with TestClient(app):
         messages = _received(systemd_socket, 0.5)
     assert messages == ["READY=1"]
+
+
+def test_ready_goes_once_there_is_room_and_only_once(systemd_socket, monkeypatch):
+    """A READY=1 that could not go is sent again on the next tick: lost, the
+    unit's start would time out."""
+    monkeypatch.delenv("WATCHDOG_USEC", raising=False)
+    _fill()
+    app, _monitor, _clock = _app(_SimArm())
+    with TestClient(app):
+        time.sleep(0.5)                                   # ticks whose READY=1 cannot go
+        everything = _received(systemd_socket, 1.0)       # the filler, then room
+    assert everything.count("READY=1") == 1
+    assert everything[-1] == "READY=1" and set(everything[:-1]) == {"X=1"}
+
+
+def test_a_systemd_that_stops_reading_does_not_stall_the_safety_tick(systemd_socket,
+                                                                       monkeypatch):
+    """R5-37-03: PID 1 stops reading, its queue fills, then the supervisor
+    goes and no request arrives. The watchdog still trips and stops the arm.
+    With a blocking send it was stuck inside a ping, and nothing tripped."""
+    monkeypatch.setenv("WATCHDOG_USEC", "400000")         # a ping every 0.1 s
+    arm = _SimArm()
+    app, _monitor, clock = _app(arm)
+    with TestClient(app):
+        assert "READY=1" in _received(systemd_socket, 0.3)
+        _fill()                                           # it stops reading
+        time.sleep(0.3)                                   # pings that cannot go
+        clock.advance(STALE_S + 1)                        # the supervisor has gone
+        stopped = _wait_for(lambda: arm.stops, 3)
+    assert stopped
 
 
 def test_a_watchdog_whose_ticks_fail_stops_pinging(systemd_socket, monkeypatch):
