@@ -448,6 +448,23 @@ enters `safe_stop` and sends the stops, and the heartbeat and the clear answer
 503 `safety_watchdog`, never 200. The heartbeat does that work on a stop lane,
 not on the event loop, so the gateway keeps answering while it records.
 
+That check runs only when a request, a heartbeat or a clear arrives. If the
+watchdog thread dies and nothing arrives, because the supervisor's device has
+gone too, nothing would notice. So under systemd the watchdog also tells
+systemd that it is ticking. The unit is `Type=notify` with `WatchdogSec=5s`:
+the watchdog sends `READY=1` after its first tick and `WATCHDOG=1` every
+quarter of `WatchdogSec` while its ticks run. When those stop, because the
+thread died, hung, or fails on every tick, systemd stops the gateway with
+SIGABRT and `Restart=on-failure` starts it again, held. Outside systemd nothing
+is sent. Two limits:
+- a restart sends no stop. The process ends, and any paced move it was
+  streaming ends with it, but hardware that keeps its last goal when its host
+  process ends keeps it until someone stops it;
+- the unit and the gateway must come from the same version: this unit waits
+  for `READY=1`, which an older gateway never sends, so its start would fail
+  after 90 s (`TimeoutStartSec`). robot-md's `install-gateway` writes its own
+  unit (`robot-md-gateway.service`), which needs the same three lines.
+
 **Resuming takes two explicit steps.** A heartbeat alone never resumes.
 
 1. `POST /v1/safety/clear`, which is refused:

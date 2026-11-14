@@ -4,6 +4,16 @@
 
 ### Security
 
+- **systemd restarts a gateway whose safety watchdog stops ticking.** A dead
+  watchdog was noticed only when a request, a heartbeat or a clear arrived,
+  so with the supervisor gone as well nothing tripped. The watchdog now sends
+  systemd `READY=1` after its first tick and `WATCHDOG=1` while its ticks run
+  (`sd_notify`, no new dependency), and `systemd/robot-md-dispatcher.service`
+  is `Type=notify` with `NotifyAccess=main` and `WatchdogSec=5s`: when the
+  pings stop, systemd stops the gateway and `Restart=on-failure` starts it
+  again, held. A restart sends no stop. The unit now needs a gateway from this
+  version, since an older one never sends `READY=1`. Outside systemd nothing
+  is sent.
 - **`serve` runs a safety monitor, always, and starts held.** `make_app` has
   taken a `SafetyMonitor` since Plan 6 Phase 4, but the `serve` path never
   passed one, so a deployed gateway had no heartbeat staleness rule (SF-002) at
