@@ -455,15 +455,49 @@ systemd that it is ticking. The unit is `Type=notify` with `WatchdogSec=5s`:
 the watchdog sends `READY=1` after its first tick and `WATCHDOG=1` every
 quarter of `WatchdogSec` while its ticks run. When those stop, because the
 thread died, hung, or fails on every tick, systemd stops the gateway with
-SIGABRT and `Restart=on-failure` starts it again, held. Outside systemd nothing
-is sent. Two limits:
-- a restart sends no stop. The process ends, and any paced move it was
-  streaming ends with it, but hardware that keeps its last goal when its host
-  process ends keeps it until someone stops it;
+SIGABRT and `Restart=on-failure` starts it again, held. A notification never
+waits: if systemd stops reading its socket, the send fails, the tick goes on,
+and the next tick that runs sends it again. Outside systemd nothing is sent.
+
+**A start after any end but a clean one sends every declared stop.** A killed
+process (the watchdog's SIGABRT, an out-of-memory kill, a crash) ends any
+paced move it was streaming, but hardware that keeps its last goal when its
+host process ends keeps it, and booting held is not a trip. So `serve` first
+reads and removes a clean-shutdown marker in `$STATE_DIRECTORY`
+(`StateDirectory=robot-md-dispatcher` in the unit). If there was none, it
+sends each actuator that declares a stop that stop as the app is built,
+before it serves anything, as a trip would (`safety_start: ...` in the audit
+chain). Everything fails toward stops: no `STATE_DIRECTORY`, no marker, or one
+that cannot be read, parsed or removed means the stops go out.
+- The marker is left only at the end of the app's shutdown (uvicorn's
+  graceful exit on SIGTERM or Ctrl-C), and only when the gateway is held, its
+  watchdog is ticking, every stop it sent has answered (it waits up to 10 s
+  for one still in flight), and no actuator's stop has failed or gone
+  unconfirmed. So after a clean stop while held, the next start leaves the
+  hardware alone: an arm someone is posing by hand does not stiffen. A stop
+  while armed leaves no marker, and the next start sends the stops.
+- A stop at start that fails, or does not answer within 10 s, leaves its
+  actuator refused (`deny: stop_unconfirmed`) until a stop to it succeeds: its
+  own late answer, a trip's stop, or a declared stop sent through
+  `/v1/invoke`. The first commission clear after that sends the stop again
+  and answers 409; a clear once it has answered arms the gateway. If it failed
+  again, the gateway still arms, and motion through that actuator stays
+  refused.
+- so-arm101-actuator latches on its stop, so after an unclean end the
+  documented resume also takes `arm.estop.clear` (commission tier). Without
+  `StateDirectory=` every start sends the stops.
+
+Two more limits:
+- from the kill until the new process listens, nothing answers on the port:
+  `RestartSec=3s` plus the gateway's start-up. A stop sent then is refused at
+  connect. Until the kill, the old process still serves stops on its stop
+  lanes;
 - the unit and the gateway must come from the same version: this unit waits
-  for `READY=1`, which an older gateway never sends, so its start would fail
-  after 90 s (`TimeoutStartSec`). robot-md's `install-gateway` writes its own
-  unit (`robot-md-gateway.service`), which needs the same three lines.
+  for `READY=1`, which an older gateway never sends, so its start fails after
+  90 s (`TimeoutStartSec`) and `Restart=on-failure` starts it again, stopping
+  an otherwise working gateway about every 93 s. robot-md's `install-gateway`
+  writes its own unit (`robot-md-gateway.service`), which needs the same four
+  lines in the release whose gateway floor includes them.
 
 **Resuming takes two explicit steps.** A heartbeat alone never resumes.
 
