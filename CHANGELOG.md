@@ -79,21 +79,25 @@
   refusal there carries the intent's hash). A trip that begins while the
   actuator runs could still deliver the trip's stop before the dispatch, and an
   actuator whose stop does not latch (castor-hal transports) kept the dispatched
-  goal. The gateway now sends that actuator its stop again once the call
-  returns, when the call was a motion and the trip's own stop to that actuator
-  had already answered; it says so in the response (`stopped_again`) and the
-  record, and a clear waits for that stop. A read gets no second stop, nor does
-  a motion whose trip stop is still on its way: sent at once, the second stop
-  queued behind the first, so-arm101-actuator refused it as busy, and the
-  failure left the arm refusing motion until a restart. A failed second stop is
-  recorded and not held against the actuator.
+  goal. After a motion that a trip overlapped, the gateway now waits for the
+  trip's own stop to that actuator to answer (at most 10 s) and then sends
+  that stop again; it says so in the response (`stopped_again`) and the
+  record, and a clear waits for that stop. Which of the two landed first
+  cannot be told from the order they return in: a stop that lands and then
+  waits for an acknowledgement returns after a goal that landed after it. The
+  wait keeps the two stops off one bus at once: sent while the first still
+  waited for the bus, the second queued behind it, so-arm101-actuator refused
+  it as busy, and the failure left the arm refusing motion until a restart. A
+  read gets no second stop. A failed second stop is recorded and not held
+  against the actuator.
 - **What actuators declare is checked at startup.** A tool declared both as a
   stop and as a motion refuses to start the gateway. An actuator whose own
   declared tiers would refuse its stop at tier `read` gets a `stop_unreachable`
   error and every motion through it is refused; so does one that refuses,
   fails or does not answer within 10 s the gateway's stop when a trip sends it
   (`denied`, `error`, an exception, a timeout), from then until a restart. An
-  actuator that declares no stop is logged as `no_declared_stop`.
+  actuator that declares no stop is logged as `no_declared_stop`: at ERROR if
+  it may move, at INFO if it declares no motion (a camera).
 - **The clear refuses to arm motion that no trip could stop.** While any
   configured actuator may move and declares no stop, `POST /v1/safety/clear`
   answers 409, so a served gateway, which starts held, never arms with it.
