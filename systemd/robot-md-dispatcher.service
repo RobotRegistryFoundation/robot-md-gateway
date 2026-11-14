@@ -7,6 +7,15 @@ Wants=network-online.target
 AssertPathExists=/etc/robot-md-dispatcher/bearers.yaml
 
 [Service]
+# The gateway's safety watchdog tells systemd it is ticking: READY=1 after its
+# first tick, then WATCHDOG=1 every quarter of WatchdogSec. If it dies or stops
+# ticking, systemd stops the gateway (SIGABRT) and Restart=on-failure starts it
+# again, held. Without this, a dead watchdog went unnoticed until the next
+# request or heartbeat. A restart sends no stop: the process and its paced
+# moves end, and hardware that keeps its last goal keeps it.
+Type=notify
+NotifyAccess=main
+WatchdogSec=5s
 # Runs the dispatcher as an unprivileged user that has access to the robot's
 # serial bus (e.g. /dev/ttyACM0 via the `dialout` group).
 User=robot

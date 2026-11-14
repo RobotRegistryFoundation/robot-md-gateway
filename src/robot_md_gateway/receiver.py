@@ -50,6 +50,7 @@ from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, ValidationError
 from rcan.audit_bundle import canonical_json
 
+from . import sd_notify
 from .actuator import Actuator, ActuatorOutcome, NoOpActuator
 from .attestation import (
     SigningIdentity,
@@ -1136,7 +1137,18 @@ def make_app(
         return state
 
     def _safety_watchdog(stopping: threading.Event) -> None:
-        """Tick the monitor while the app is served, requests or none."""
+        """Tick the monitor while the app is served, requests or none.
+
+        Under systemd (`Type=notify`, `WatchdogSec=`), each tick that runs
+        also tells systemd so: READY=1 after the first, then WATCHDOG=1 every
+        quarter of WatchdogSec. A watchdog that dies, hangs, or fails every
+        tick stops telling it, and systemd stops and restarts the gateway,
+        which starts held. Without this, a dead watchdog was noticed only by
+        the next request or heartbeat, and with neither arriving nothing
+        tripped (the second review's R2-18)."""
+        ping_every = sd_notify.watchdog_interval_s()
+        ping_every = ping_every / 4 if ping_every else None
+        ready, last_ping = False, float("-inf")
         while not stopping.wait(SAFETY_TICK_S):
             _safety.last_tick = time.monotonic()
             try:
@@ -1145,6 +1157,13 @@ def make_app(
                 logging.getLogger(__name__).exception(
                     "safety_watchdog: a tick failed; the next runs in %.1f s", SAFETY_TICK_S,
                 )
+                continue
+            if not ready:
+                ready = True
+                sd_notify.notify("READY=1")
+            if ping_every is not None and time.monotonic() - last_ping >= ping_every:
+                last_ping = time.monotonic()
+                sd_notify.notify("WATCHDOG=1")
 
     # For tests and in-process integrations: one synchronous tick.
     app.state.safety_tick = _safety_check
