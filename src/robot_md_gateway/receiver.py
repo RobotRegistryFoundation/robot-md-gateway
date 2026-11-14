@@ -384,9 +384,14 @@ def make_app(
                 f"motion_capabilities."
             )
         if not _stops:
+            # ERROR for an actuator that may move: the clear refuses to arm the
+            # gateway while it is configured. INFO for one that declares no
+            # motion (a camera): nothing to stop, and nothing held, on every start.
+            _level = logging.INFO
             if _declares_no_motion(_act):
                 _consequence = "it declares no motion, so this does not hold the gateway"
             else:
+                _level = logging.ERROR
                 _moves = sorted(as_tool_set(getattr(_act, "motion_capabilities", None)))
                 _unstoppable[_name] = (
                     f"actuator {_name!r} declares no stop (stop_capabilities) and "
@@ -397,7 +402,8 @@ def make_app(
                 _consequence = ("it may move, so the gateway refuses to be cleared (armed) "
                                 "while it is configured")
             if safety_monitor is not None:
-                logging.getLogger(__name__).error(
+                logging.getLogger(__name__).log(
+                    _level,
                     "no_declared_stop: actuator %r declares no stop_capabilities, so when "
                     "the gateway trips it sends this actuator nothing and cannot stop it; "
                     "%s", _name, _consequence,

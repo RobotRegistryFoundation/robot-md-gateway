@@ -132,15 +132,23 @@ def test_an_actuator_with_a_stop_is_cleared_as_before():
 
 
 def test_startup_names_the_actuator_and_says_whether_it_holds_the_gateway(caplog):
-    with caplog.at_level(logging.ERROR, logger="robot_md_gateway.receiver"):
+    """ERROR for an actuator that may move and has no stop; INFO for one that
+    declares no motion (the fourth review: bob's camera logged ERROR on every
+    start, for nothing to fix)."""
+    with caplog.at_level(logging.INFO, logger="robot_md_gateway.receiver"):
         make_app(resolver=_Resolver(), actuators={
             "arm": _Declares(motion_capabilities=frozenset({"arm.move_to"})),
             "tap": _Declares(name="tap", motion_capabilities=frozenset()),
+            "silent": _Declares(name="silent"),
         }, actuator_configs={}, safety_monitor=SafetyMonitor())
-    lines = [r.getMessage() for r in caplog.records]
-    [arm] = [line for line in lines if "actuator 'arm'" in line]
-    [tap] = [line for line in lines if "actuator 'tap'" in line]
-    assert arm.startswith("no_declared_stop: actuator 'arm' declares no stop_capabilities")
-    assert arm.endswith("it may move, so the gateway refuses to be cleared (armed) while it "
-                        "is configured")
-    assert tap.endswith("it declares no motion, so this does not hold the gateway")
+    records = {name: [r for r in caplog.records if f"actuator '{name}'" in r.getMessage()]
+               for name in ("arm", "tap", "silent")}
+    [arm], [tap], [silent] = records["arm"], records["tap"], records["silent"]
+    assert arm.getMessage().startswith(
+        "no_declared_stop: actuator 'arm' declares no stop_capabilities")
+    assert arm.getMessage().endswith("it may move, so the gateway refuses to be cleared "
+                                     "(armed) while it is configured")
+    assert arm.levelno == logging.ERROR
+    assert silent.levelno == logging.ERROR          # says nothing about motion: may move
+    assert tap.getMessage().endswith("it declares no motion, so this does not hold the gateway")
+    assert tap.levelno == logging.INFO

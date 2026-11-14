@@ -465,10 +465,12 @@ def test_a_telemetry_only_actuator_starts_and_is_named_as_unstoppable(caplog):
         stop_capabilities = frozenset()
         motion_capabilities = frozenset()
 
-    with caplog.at_level(logging.ERROR, logger="robot_md_gateway.receiver"):
+    with caplog.at_level(logging.INFO, logger="robot_md_gateway.receiver"):
         make_app(resolver=_Resolver(), actuator=_Tap(), actuator_config={},
                  safety_monitor=SafetyMonitor())
-    assert "no_declared_stop: actuator 'j1939'" in caplog.text
+    [named] = [r for r in caplog.records
+               if r.getMessage().startswith("no_declared_stop: actuator 'j1939'")]
+    assert named.levelno == logging.INFO           # it moves nothing: nothing to fix
     assert "stop_unreachable" not in caplog.text
 
 
