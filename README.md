@@ -446,7 +446,13 @@ declared stop (item 6 under [What it does](#what-it-does)).
 **If the watchdog itself stops ticking** for 1 s, the gateway fails closed: it
 enters `safe_stop` and sends the stops, and the heartbeat and the clear answer
 503 `safety_watchdog`, never 200. The heartbeat does that work on a stop lane,
-not on the event loop, so the gateway keeps answering while it records.
+not on the event loop, so the gateway keeps answering while it records. The
+watchdog ticks every 0.1 s (`SAFETY_TICK_S`) and counts as stale after 1.0 s
+without a tick (`WATCHDOG_STALE_S`). Run the gateway as a process of its own: a
+CPU-bound thread inside the gateway's process can hold the watchdog off for
+that long, and the next request or heartbeat then trips the gateway. Such a
+trip fails safe: the actuators are sent their stops, and the gateway stays held
+until a clear.
 
 **Resuming takes two explicit steps.** A heartbeat alone never resumes.
 
