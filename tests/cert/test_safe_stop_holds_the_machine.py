@@ -479,6 +479,41 @@ def test_a_hung_stop_neither_wedges_the_watchdog_nor_is_waited_for_forever():
         arm.stop_gate.set()
 
 
+def test_a_trip_stop_that_times_out_refuses_motion_through_that_actuator():
+    """Third review: a trip stop that never answers was waited for 10 s and
+    then forgotten, and the clear re-armed motion through that actuator as if
+    it had stopped. It now counts as a stop the gateway cannot count on, as a
+    failed one does under departure (e): no motion through that actuator until
+    the gateway restarts, and a late answer does not lift that. Fail closed."""
+    arm, chain = _SimArm(), AuditChain()
+    arm.stop_gate = threading.Event()         # the stop does not answer
+    app, _monitor, clock = _app(arm, chain)
+    try:
+        with TestClient(app) as client:
+            _trip(app, clock)
+            assert _wait_for(lambda: arm.stops)
+            clock.advance(receiver_mod.STOP_TIMEOUT_S + 0.5)
+            app.state.safety_tick()
+            [timeout] = _reasons(chain, "safety_stop_timeout:")
+            _heartbeat(client)
+            cleared = _clear(client)
+            moved = _invoke(client, "arm.move_to")
+            arm.stop_gate.set()                                   # it answers, late
+            assert _stopped(app)
+            moved_later = _invoke(client, "arm.move_to")
+    finally:
+        arm.stop_gate.set()
+    assert timeout.endswith("the gateway stopped waiting for it; motion through it is "
+                            "refused from now on")
+    assert cleared.status_code == 200          # the gateway's own state clears
+    for response in (moved, moved_later):
+        assert response.status_code == 403
+        assert response.json()["detail"]["deny"] == "stop_unreachable"
+        assert "did not answer the gateway's own stop (arm.estop at tier 'read') within " \
+               "10 s" in response.json()["detail"]["reason"]
+    assert arm.position == 0
+
+
 def test_a_stuck_watchdog_fails_closed(monkeypatch):
     """If the watchdog stops ticking, a heartbeat is no longer answered 200
     and the gateway goes to SAFE_STOP, sending its stops."""

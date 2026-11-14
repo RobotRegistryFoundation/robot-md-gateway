@@ -229,3 +229,94 @@ def test_a_stop_reaches_the_actuator_while_the_export_is_stuck(monkeypatch, tmp_
     lines = [json.loads(line) for line in export.read_text().splitlines()]
     mine = [line for line in lines if line.get("corr_id") == box["msg_id"]]
     assert [line.get("record_kind", "outcome") for line in mine] == ["intent", "outcome"]
+
+
+def _stuck_export(monkeypatch):
+    """Storage that stops answering: every export write waits for `release`."""
+    release, stuck = threading.Event(), []
+    real_append = receiver_mod.append_trace_line
+
+    def stuck_append(path, record):
+        stuck.append(record.get("record_kind") or "outcome")
+        release.wait(20)
+        return real_append(path, record)
+
+    monkeypatch.setattr(receiver_mod, "append_trace_line", stuck_append)
+    return release, stuck
+
+
+def _identity():
+    return SigningIdentity(priv=Ed25519PrivateKey.generate(), kid="gw", ran=None)
+
+
+def test_a_stop_leaves_its_lane_before_its_records(monkeypatch, tmp_path):
+    """The third review's R3-06: with storage that stopped answering, eight
+    stops reached the arm and then held all eight lanes while they recorded,
+    so a ninth, to the base, waited until the storage answered. A stop now
+    leaves its lane once the actuator has answered."""
+    release, stuck = _stuck_export(monkeypatch)
+    arm, base = _Stops("arm"), _Stops("base")
+    app = make_app(
+        resolver=_Resolver(), tool_allowlist=ToolAllowlist(allowed_tools=("drive.stop",)),
+        bearer_tiers=BEARERS, actuators={"arm": arm, "base": base}, actuator_configs={},
+        signing_identity=_identity(), attestation_export_file=tmp_path / "trace.ndjsonl",
+    )
+    read = {"Authorization": "Bearer read-token"}
+    with TestClient(app) as client:
+        first = [threading.Thread(target=lambda: client.post(
+            "/v1/invoke", json=_stop_envelope("arm"), headers=read)) for _ in range(STOP_LANES)]
+        for thread in first:
+            thread.start()
+        try:
+            assert _wait_for(lambda: len(arm.log) == STOP_LANES and len(stuck) >= STOP_LANES)
+            ninth = threading.Thread(target=lambda: client.post(
+                "/v1/invoke", json=_stop_envelope("base"), headers=read))
+            started = time.monotonic()
+            ninth.start()
+            reached = _wait_for(lambda: base.log == ["drive.stop"], timeout=5)
+            took = time.monotonic() - started
+        finally:
+            release.set()
+            for thread in [*first, ninth]:
+                thread.join(20)
+    assert reached and took < 1.0, f"the ninth stop reached the base after {took:.1f} s"
+
+
+def test_a_stuck_watchdogs_heartbeat_trips_off_the_event_loop(monkeypatch, tmp_path):
+    """Note H1: with the watchdog stuck, a heartbeat trips the gateway itself,
+    which takes the safety lock and writes records. That ran on the event
+    loop, so a record waiting on storage held every other request back, the
+    operator's stop included. It now runs on a stop lane."""
+    monkeypatch.setattr(receiver_mod, "WATCHDOG_STALE_S", 0.2)
+    monkeypatch.setattr(receiver_mod, "SAFETY_TICK_S", 60.0)     # it never ticks: stuck
+    release, stuck = _stuck_export(monkeypatch)
+    arm, clock = _Stops("arm"), FakeClock()
+    app = make_app(
+        resolver=_Resolver(), tool_allowlist=ToolAllowlist(allowed_tools=("drive.stop",)),
+        bearer_tiers=BEARERS, bearers=SUPERVISOR, actuator=arm, actuator_config={},
+        safety_monitor=SafetyMonitor(heartbeat_staleness_s=STALE_S, last_heartbeat_at=clock()),
+        clock=clock, signing_identity=_identity(),
+        attestation_export_file=tmp_path / "trace.ndjsonl",
+    )
+    box: dict = {}
+    with TestClient(app) as client:
+        time.sleep(0.3)
+        beat = threading.Thread(target=lambda: box.update(beat=client.post(
+            "/v1/safety/heartbeat", headers={"Authorization": "Bearer supervisor-token"})))
+        beat.start()
+        try:
+            assert _wait_for(lambda: arm.log == ["drive.stop"] and stuck)   # the trip, recording
+            stopper = threading.Thread(target=lambda: box.update(stop=client.post(
+                "/v1/invoke", json=_stop_envelope(),
+                headers={"Authorization": "Bearer read-token"})))
+            started = time.monotonic()
+            stopper.start()
+            reached = _wait_for(lambda: len(arm.log) == 2, timeout=5)
+            took = time.monotonic() - started
+        finally:
+            release.set()
+            beat.join(20)
+            stopper.join(20)
+    assert reached and took < 1.0, f"the operator's stop waited {took:.1f} s"
+    assert box["beat"].status_code == 503
+    assert box["stop"].status_code == 200

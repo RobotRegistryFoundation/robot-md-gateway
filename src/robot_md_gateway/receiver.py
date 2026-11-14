@@ -89,9 +89,13 @@ from .manifest_provenance import RRFResolver, verify_manifest
 
 _DEFAULT_ALLOWLIST = ToolAllowlist(allowed_tools=("mcp__robot__render", "mcp__robot__validate"))
 
-#: Worker threads reserved for stop tools (an actuator's `stop_capabilities`).
-#: Every other request shares the default pool of 40. A stop is quick and
-#: idempotent, so a handful is plenty, and a burst of stops only queues stops.
+#: Worker threads reserved for a known bearer's declared stop (a tool in the
+#: `stop_capabilities` of the actuator it goes to), for its checks and the
+#: actuator's answer only. Every other request shares the default pool of 40. A
+#: stop is quick and idempotent, so a handful is plenty, and a burst of stops
+#: only queues stops. The same number again write those stops' records and
+#: answers, so that neither a full default pool nor storage that has stopped
+#: answering holds a lane (note H1 of the reviews of #35).
 STOP_LANES = 8
 
 #: How often the safety watchdog ticks the monitor, in seconds. SF-002's bench
@@ -132,6 +136,10 @@ class _StopSend:
     msg_id: str
     status: str = "pending"        # pending -> running -> done, or running -> timed_out
     started: float | None = None   # the app's clock() when its thread started
+    #: time.monotonic() the moment the actuator's execute returned (or
+    #: raised), taken on the stop's own thread before anything else: which
+    #: came first, this answer or a dispatch's (`_stop_again_if_tripped`).
+    answered_at: float | None = None
     #: Set on a stop sent AGAIN after a dispatch that the trip overlapped (see
     #: `_stop_again_if_tripped`): which dispatch, for the record. None on a
     #: trip's own stop.
@@ -414,15 +422,20 @@ def make_app(
         _md0 = _fm0.get("metadata")
         _pinned_rrn = str((_md0.get("rrn") if isinstance(_md0, dict) else None)
                           or _fm0.get("rrn") or "")
-    _stop_lane: list = [None, None]          # (weakref to the event loop, its limiter)
+    _stop_lane: list = [None, None, None]    # (weakref to the event loop, its limiters)
 
-    def _stop_limiter() -> anyio.CapacityLimiter:
-        # One limiter per event loop: an anyio limiter belongs to the loop that
-        # first used it, and tests run one app under several loops.
+    def _stop_limiters() -> tuple[anyio.CapacityLimiter, anyio.CapacityLimiter]:
+        # (the stop lanes, the stop records' lanes). One pair per event loop:
+        # an anyio limiter belongs to the loop that first used it, and tests
+        # run one app under several loops.
         loop = asyncio.get_running_loop()
         if _stop_lane[0] is None or _stop_lane[0]() is not loop:
-            _stop_lane[:] = [weakref.ref(loop), anyio.CapacityLimiter(STOP_LANES)]
-        return _stop_lane[1]
+            _stop_lane[:] = [weakref.ref(loop), anyio.CapacityLimiter(STOP_LANES),
+                             anyio.CapacityLimiter(STOP_LANES)]
+        return _stop_lane[1], _stop_lane[2]
+
+    def _stop_limiter() -> anyio.CapacityLimiter:
+        return _stop_limiters()[0]
 
     # Startup invariant: a gateway allowlisted to MOVE a robot and not to STOP
     # it is a misconfiguration, and it is the one this whole change exists to
@@ -963,6 +976,18 @@ def make_app(
                     )
             elif send.status == "running" and clock() - send.started > STOP_TIMEOUT_S:
                 send.status = "timed_out"
+                if send.again is None:
+                    # A trip's own stop that does not answer is a stop the
+                    # gateway cannot count on, as one that fails is (round 2's
+                    # departure (e)): no motion through that actuator until the
+                    # gateway restarts. Fail closed. A stop sent again is not
+                    # held against the actuator: the trip's own stop answered.
+                    _stop_unaccepted.setdefault(id(send.actuator), (
+                        f"actuator {send.name!r} did not answer the gateway's own stop "
+                        f"({send.tool} at tier {SAFETY_STOP_TIER!r}) within "
+                        f"{STOP_TIMEOUT_S:g} s, so the gateway cannot count on stopping it "
+                        f"on a trip; motion through it is refused until the gateway restarts"
+                    ))
                 records.append(("timeout", trip, send))
 
     def _send_stop(trip: _Trip, send: _StopSend) -> None:
@@ -979,10 +1004,13 @@ def make_app(
         }
         error_kind: str | None = None
         try:
-            outcome = send.actuator.execute(
-                envelope=envelope, manifest_path=pinned_manifest_path,
-                tier=SAFETY_STOP_TIER, config=send.config,
-            )
+            try:
+                outcome = send.actuator.execute(
+                    envelope=envelope, manifest_path=pinned_manifest_path,
+                    tier=SAFETY_STOP_TIER, config=send.config,
+                )
+            finally:
+                send.answered_at = time.monotonic()
             if not isinstance(outcome, ActuatorOutcome):
                 raise TypeError(f"execute returned {type(outcome).__name__}, not an outcome")
         except Exception as exc:
@@ -990,10 +1018,11 @@ def make_app(
                                       error_message=f"{type(exc).__name__}: {exc}")
             error_kind = type(exc).__name__
         refused = not outcome.success and outcome.outcome_kind == "denied"
+        counted = not outcome.success and send.again is None
         with _safety_lock:
             late = send.status == "timed_out"
             send.status = "done"
-            if not outcome.success:
+            if counted:
                 # An actuator that refuses the gateway's own stop, or answers it
                 # with an error (an `error` outcome, an exception, a return that
                 # is not an outcome), cannot be counted on to stop on a trip,
@@ -1017,7 +1046,9 @@ def make_app(
                            f"({STOP_TIMEOUT_S:g} s)")
             if not outcome.success:
                 reason += f"; it did not succeed: {outcome.error_message}"
-                reason += "; motion through it is refused from now on"
+                reason += ("; motion through it is refused from now on" if counted else
+                           "; a stop sent again is not held against the actuator, whose "
+                           "own trip stop answered")
             (log.warning if outcome.success else log.error)(
                 "%s (outcome: %s)", reason, outcome.outcome_kind,
             )
@@ -1065,6 +1096,8 @@ def make_app(
                     reason = (f"safety_stop_timeout: trip {trip.seq}: {send.tool} to "
                               f"{send.name} did not answer within {STOP_TIMEOUT_S:g} s; "
                               f"the gateway stopped waiting for it")
+                    if send.again is None:
+                        reason += "; motion through it is refused from now on"
                     msg_id, decision = f"{send.msg_id}-timeout", "allow"
                     error_kind = "StopTimeout"
                     log.error("%s", reason)
@@ -1117,32 +1150,53 @@ def make_app(
         _write_safety_records(records)
         return state, trips
 
-    def _stop_again_if_tripped(trips: int, act: object, *, tool_name: str,
-                               msg_id: str) -> str | None:
-        """After a gated dispatch returns: when a trip began after its last
-        state check, the trip's stop can have reached this actuator BEFORE the
-        dispatch did. An actuator whose stop does not latch (castor-hal's
-        `Transport.estop` is a best-effort stop or hold) would then keep the
-        goal it was given last. So the gateway sends it its stop again, now
-        that the dispatch has returned (blocking 1 of the second review). A
-        driver that sets a goal returns as soon as it is set, so this stop
-        follows within milliseconds; a paced one that latches has already
-        ended its move at the trip's stop, and a second stop is harmless.
+    def _stop_again_if_tripped(trips: int, act: object, *, tool_name: str, msg_id: str,
+                               returned_at: float) -> str | None:
+        """After a gated dispatch returns: should this actuator get its stop
+        again? (Blocking 1 of the second review; note N1 of the third.)
 
-        It is sent on this thread, so the trip's own stop never waits for it,
-        nor for the motion. It joins the current trip, so a clear waits for its
-        answer as for the trip's own. If that trip has been cleared already, it
-        is sent all the same: the clear was for the trip, not for a dispatch
-        the gateway admitted before it. Returns what was done, for the response
-        and the record; None when no trip began."""
+        A trip that began after the dispatch's last state check sends this
+        actuator its own stop on a thread of its own, at the same time as the
+        dispatch runs. Two orders are possible, told apart by when each call
+        into the actuator returned (`returned_at`, and the stop's
+        `answered_at`), each read on its own thread as the call returned:
+        - That stop had already answered when the dispatch returned. The
+          motion's goal can then have reached the actuator AFTER the stop, and
+          an actuator whose stop does not latch (castor-hal's `Transport.estop`
+          is a best-effort stop or hold) keeps that goal. The gateway sends the
+          stop again, now that the dispatch has returned.
+        - That stop had not answered yet. It is then still on its way, and it
+          lands after the dispatch: nothing to send again. so-arm101-actuator
+          is this case: its stop latches at once and then waits for the bus,
+          which a paced move gives up at its next setpoint. Sending another
+          stop then queued behind the trip's own, and the driver refused it as
+          `busy` (note N1), so the gateway now waits for the trip's own stop to
+          answer first. A paced driver whose stop does not latch would leave a
+          pre-trip move running; a paced driver must latch.
+
+        Only after a motion tool: a read leaves no goal behind. A stop sent
+        again joins the current trip, so a clear waits for its answer as for
+        the trip's own; if that trip has been cleared already, it is sent all
+        the same, since the clear was for the trip, not for a dispatch admitted
+        before it. Its failure is recorded and not held against the actuator.
+
+        Returns what was done, for the response and the record; None when
+        nothing was sent."""
+        if tool_name not in as_tool_set(getattr(act, "motion_capabilities", None)):
+            return None
         with _safety_lock:
             if _safety.trips == trips:
                 return None
-            target = next((t for t in _stop_targets if t[1] is act), None)
             trip = _safety.trip or _safety.last_trip
+            own = next((s for s in trip.sends if s.actuator is act and s.again is None), None)
+            target = next((t for t in _stop_targets if t[1] is act), None)
             if target is None:
                 done = (f"the gateway tripped (trip {trip.seq}) while {tool_name} was being "
                         f"dispatched, and this actuator declares no stop to send it again")
+            elif own is None or own.answered_at is None or own.answered_at > returned_at:
+                # The trip's own stop answered after this returned, or has not
+                # answered yet: it lands after this dispatch.
+                return None
             else:
                 name, _act, config, tool = target
                 send = _StopSend(
@@ -1154,11 +1208,36 @@ def make_app(
                 if _safety.trip is not None:
                     _safety.trip.sends.append(send)
                 done = (f"the gateway tripped (trip {trip.seq}) while {tool_name} was being "
-                        f"dispatched, so {tool} was sent to {name} again after it returned")
+                        f"dispatched, and its stop to {name} answered first, so {tool} was "
+                        f"sent to {name} again after it returned")
         logging.getLogger(__name__).warning("safety_stop_again: %s", done)
         if target is not None:
             _send_stop(trip, send)
         return done
+
+    def _execute(target_actuator: Actuator, envelope_dict: dict, manifest_path: Path | None,
+                 tier: str, target_config: dict) -> tuple[ActuatorOutcome, str | None, str, float]:
+        """Call the actuator: (outcome, error kind, ended_at, the time.monotonic()
+        the call returned). The outcome is captured whatever happens, so the
+        record says what did."""
+        try:
+            try:
+                outcome = target_actuator.execute(
+                    envelope=envelope_dict,
+                    manifest_path=manifest_path,
+                    tier=tier,
+                    config=target_config,
+                )
+            finally:
+                returned_at = time.monotonic()
+            error_kind: str | None = None
+        except Exception as exc:
+            outcome = ActuatorOutcome(
+                success=False, outcome_kind="error",
+                error_message=str(exc),
+            )
+            error_kind = type(exc).__name__
+        return outcome, error_kind, datetime.now(tz=timezone.utc).isoformat(), returned_at
 
     def _dispatch(
         *,
@@ -1175,100 +1254,91 @@ def make_app(
         tier: str,
         caller: str | None,
         started_at: str,
-        note: str | None = None,
-        stop: bool = False,
     ) -> dict:
-        """Record, dispatch to the actuator, record again, and answer.
-
-        Everything after the gates: the intent written before dispatch, the
-        call into the actuator, the outcome record, and the 200, 403 or 500
-        that goes back. Shared by the gated path and the stop path, so the
-        records and the response cannot drift apart between them. `note`
-        replaces "all gates passed" in the intent record (the stop path says
-        which gates a stop skips).
-
-        `stop` is the stop path: the stop is sent first, and both records are
-        written after it. Otherwise the gateway's state is checked once more
-        between the intent record and the actuator, and a trip that begins
-        while the actuator runs is answered with that actuator's stop again.
+        """Record, dispatch to the actuator, record again, and answer: the
+        gated path, after every gate. The intent is written before dispatch;
+        the gateway's state is checked once more between it and the actuator;
+        a trip that begins while the actuator runs can mean that actuator's
+        stop goes out again (`_stop_again_if_tripped`); `_answer` writes the
+        outcome and the 200, 403 or 500. A declared stop takes `_stop_now`
+        and `_stop_answer` instead, and shares `_execute` and `_answer`.
         """
-
-        def execute() -> tuple[ActuatorOutcome, str | None]:
-            # Capture the outcome whatever happens, so the record says what did.
-            try:
-                return target_actuator.execute(
-                    envelope=envelope_dict,
-                    manifest_path=manifest_path,
-                    tier=tier,
-                    config=target_config,
-                ), None
-            except Exception as exc:
-                return ActuatorOutcome(
-                    success=False, outcome_kind="error",
-                    error_message=str(exc),
-                ), type(exc).__name__
-
-        intent = dict(
+        # RECORD BEFORE DISPATCH (RCAN 6.3). Every gate above has passed and
+        # the actuator has been chosen; the next statement is the one that
+        # can move the robot. This is the last moment at which a record can
+        # be written that does not depend on the dispatch coming back, and
+        # that is exactly why the spec puts it here: a driver that hangs, a
+        # process that is killed mid-motion, or a robot that is unplugged all
+        # used to leave no trace that anything had been attempted at all.
+        #
+        # THE LATE RECORD STAYS. The outcome entry below is not replaced by
+        # this one, because the reason the late record existed is still
+        # true: only a record written after the dispatch can say what
+        # happened. The pair is the answer. The intent says what was about
+        # to be attempted, the outcome says how it went, and the outcome
+        # carries the intent's chain hash so the two are one hop apart.
+        intent_chain_hash = _record_intent(
             msg_id=msg_id, envelope_dict=envelope_dict,
             ruri=ruri, rrn=rrn,
             tool_name=tool_name, actuator_name=target_actuator.name,
-            kid=kid, caller=caller, tier=tier, note=note,
+            kid=kid, caller=caller, tier=tier,
         )
-        again: str | None = None
-        if stop:
-            # A STOP IS SENT FIRST AND RECORDED AFTER (note H1 of the second
-            # review), as the gateway's own trip stop always was. With the
-            # export on, the intent record takes a process-wide lock and an
-            # fsync, and a stop that waited behind them on storage that stopped
-            # answering never reached the actuator. Both records are still
-            # written, in the same order and linked the same way; the intent
-            # says it was written after the stop was sent. The cost: a process
-            # killed during a stop leaves no intent for it.
-            outcome, error_kind = execute()
-            ended_at = datetime.now(tz=timezone.utc).isoformat()
-            intent_chain_hash = _record_intent(**intent, sent_first=True)
-        else:
-            # RECORD BEFORE DISPATCH (RCAN 6.3). Every gate above has passed and
-            # the actuator has been chosen; the next statement is the one that
-            # can move the robot. This is the last moment at which a record can
-            # be written that does not depend on the dispatch coming back, and
-            # that is exactly why the spec puts it here: a driver that hangs, a
-            # process that is killed mid-motion, or a robot that is unplugged all
-            # used to leave no trace that anything had been attempted at all.
-            #
-            # THE LATE RECORD STAYS. The outcome entry below is not replaced by
-            # this one, because the reason the late record existed is still
-            # true: only a record written after the dispatch can say what
-            # happened. The pair is the answer. The intent says what was about
-            # to be attempted, the outcome says how it went, and the outcome
-            # carries the intent's chain hash so the two are one hop apart.
-            intent_chain_hash = _record_intent(**intent)
-            trips = None
-            if safety_monitor is not None:
-                # THE LAST STATE CHECK, the last statement before execute
-                # (blocking 1 of the second review). Its refusal is the
-                # outcome of the intent just written, and carries its hash.
-                state, trips = _last_state_check()
-                if state is not GatewayState.READY:
-                    reason = (f"gateway state={state.value} (it changed while this request "
-                              f"was being dispatched)")
-                    signed, marker = _record_with_outcome(
-                        decision="deny", reason=f"safety_state: {reason}", kid=kid,
-                        msg_id=msg_id, actuator_name=target_actuator.name,
-                        envelope_dict=envelope_dict, ruri=ruri, rrn=rrn,
-                        started_at=started_at, caller=caller, tier=tier,
-                        intent_chain_hash=intent_chain_hash,
-                    )
-                    detail = {"deny": "safety_state", "reason": reason}
-                    _attach_signature(detail, signed, marker)
-                    raise HTTPException(status_code=403, detail=detail)
-            outcome, error_kind = execute()
-            ended_at = datetime.now(tz=timezone.utc).isoformat()
-            if trips is not None:
-                # Before the outcome record, so the stop waits for no record.
-                again = _stop_again_if_tripped(trips, target_actuator,
-                                               tool_name=tool_name, msg_id=msg_id)
+        trips = None
+        if safety_monitor is not None:
+            # THE LAST STATE CHECK, the last statement before execute
+            # (blocking 1 of the second review). Its refusal is the outcome
+            # of the intent just written, and carries its hash.
+            state, trips = _last_state_check()
+            if state is not GatewayState.READY:
+                reason = (f"gateway state={state.value} (it changed while this request "
+                          f"was being dispatched)")
+                signed, marker = _record_with_outcome(
+                    decision="deny", reason=f"safety_state: {reason}", kid=kid,
+                    msg_id=msg_id, actuator_name=target_actuator.name,
+                    envelope_dict=envelope_dict, ruri=ruri, rrn=rrn,
+                    started_at=started_at, caller=caller, tier=tier,
+                    intent_chain_hash=intent_chain_hash,
+                )
+                detail = {"deny": "safety_state", "reason": reason}
+                _attach_signature(detail, signed, marker)
+                raise HTTPException(status_code=403, detail=detail)
+        outcome, error_kind, ended_at, returned_at = _execute(
+            target_actuator, envelope_dict, manifest_path, tier, target_config)
+        again = None
+        if trips is not None:
+            # Before the outcome record, so the stop waits for no record.
+            again = _stop_again_if_tripped(trips, target_actuator, tool_name=tool_name,
+                                           msg_id=msg_id, returned_at=returned_at)
+        return _answer(
+            envelope_dict=envelope_dict, msg_id=msg_id, ruri=ruri, scope=scope,
+            tool_name=tool_name, target_actuator=target_actuator, kid=kid, rrn=rrn,
+            tier=tier, caller=caller, started_at=started_at, ended_at=ended_at,
+            outcome=outcome, error_kind=error_kind, intent_chain_hash=intent_chain_hash,
+            again=again,
+        )
 
+    def _answer(
+        *,
+        envelope_dict: dict,
+        msg_id: str,
+        ruri: str | None,
+        scope: str,
+        tool_name: str,
+        target_actuator: Actuator,
+        kid: str | None,
+        rrn: str,
+        tier: str,
+        caller: str | None,
+        started_at: str,
+        ended_at: str,
+        outcome: ActuatorOutcome,
+        error_kind: str | None,
+        intent_chain_hash: str | None,
+        again: str | None = None,
+    ) -> dict:
+        """Record what the actuator answered, and answer the caller. Shared by
+        the gated path and the stop path, so the records and the response
+        cannot drift apart between them."""
         # A DRIVER'S REFUSAL IS RECORDED AS A DENY. outcome_kind == "denied" is
         # the actuator's own policy gate saying no, and the caller is told so
         # with a signed 403 just below. This record used to say
@@ -1395,15 +1465,20 @@ def make_app(
         name, act = declaring[0]
         return name, act, actuator_configs.get(name, {})
 
-    def _invoke_stop(envelope_dict: dict, stop: tuple[str, Actuator, dict], *,
-                     tier: str, caller: str | None, started_at: str) -> dict:
-        """A caller's DECLARED STOP (review of #35, finding 4).
+    def _stop_now(envelope_dict: dict, stop: tuple[str, Actuator, dict], tier: str,
+                  caller: str | None) -> SimpleNamespace:
+        """A caller's DECLARED STOP (review of #35, finding 4), first half: its
+        checks and the stop itself. Nothing is recorded here. On a stop lane
+        this half is all that holds the lane; `_stop_answer` writes the records
+        and the answer on the shared pool (note H1 of the second and third
+        reviews), so storage that stops answering holds back no other stop.
 
         A stop is judged as SAFETY, whatever scope the envelope carries, and it
         passes whatever state the gateway is in. Of the gates, it meets only
         those that cannot refuse it by accident: the schema, a bearer this
         gateway knows (any tier), the operator's tool allowlist and per-tool
-        tiers. It skips the rest, each for a stated reason:
+        tiers. A refusal is decided here and recorded by `_stop_answer`. It
+        skips the rest, each for a stated reason:
         - signature, freshness, revocation: a halt must never need the key
           registry (an offline lookup after a restart refused every signed
           stop), and a stop from a revoked key is still a stop (rcan-spec
@@ -1416,29 +1491,33 @@ def make_app(
           gated on a model's confidence or on a person's approval.
         What it skipped is written into the intent record.
         """
+        started_at = datetime.now(tz=timezone.utc).isoformat()
         name, target, config = stop
         try:
             envelope = InvokeEnvelope(**envelope_dict)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.errors()) from exc
-        common = dict(kid=None, msg_id=envelope.msg_id, envelope_dict=envelope_dict,
-                      ruri=envelope.ruri, rrn=_pinned_rrn, started_at=started_at,
-                      caller=caller, tier=tier)
+        sent = SimpleNamespace(
+            name=name, target=target, envelope=envelope, refusal=None,
+            common=dict(kid=None, msg_id=envelope.msg_id, envelope_dict=envelope_dict,
+                        ruri=envelope.ruri, rrn=_pinned_rrn, started_at=started_at,
+                        caller=caller, tier=tier),
+        )
         if tier == "anon":
             # Over Tailscale Funnel an unknown caller is anyone on the internet.
-            _deny("tier_policy", "a stop needs a bearer this gateway knows (any tier); "
-                  "this request carried none, or one it does not know", **common)
-        ok, reason = check_tier(tier, "SAFETY", msg_id=envelope.msg_id)
-        if not ok:
-            _deny("tier_policy", reason, **common)
-        allowed, reason = check_tool(envelope.tool_name, tool_allowlist, msg_id=envelope.msg_id)
-        if not allowed:
-            _deny("tool_allowlist", reason, **common)
-        allowed, reason = check_tool_tier(
-            envelope.tool_name, tier, tool_tier_requirements, msg_id=envelope.msg_id
-        )
-        if not allowed:
-            _deny("tool_tier", reason, **common)
+            sent.refusal = ("tier_policy", "a stop needs a bearer this gateway knows (any "
+                            "tier); this request carried none, or one it does not know")
+            return sent
+        for gate, (ok, reason) in (
+            ("tier_policy", check_tier(tier, "SAFETY", msg_id=envelope.msg_id)),
+            ("tool_allowlist", check_tool(envelope.tool_name, tool_allowlist,
+                                          msg_id=envelope.msg_id)),
+            ("tool_tier", check_tool_tier(envelope.tool_name, tier, tool_tier_requirements,
+                                          msg_id=envelope.msg_id)),
+        ):
+            if not ok:
+                sent.refusal = (gate, reason)
+                return sent
 
         notes = [f"a declared stop of actuator {name!r}, judged as SAFETY"]
         if envelope.scope.upper() != "SAFETY":
@@ -1452,13 +1531,36 @@ def make_app(
                 replay_cache.record(envelope.msg_id)
         if safety_monitor is not None and safety_monitor.state is not GatewayState.READY:
             notes.append(f"gateway state={safety_monitor.state.value}")
-        return _dispatch(
-            envelope_dict=envelope_dict, msg_id=envelope.msg_id, ruri=envelope.ruri,
-            scope="SAFETY", tool_name=envelope.tool_name,
-            target_actuator=target, target_config=config,
-            manifest_path=pinned_manifest_path, kid=None, rrn=_pinned_rrn,
-            tier=tier, caller=caller, started_at=started_at, note="; ".join(notes),
-            stop=True,
+        sent.note = "; ".join(notes)
+        # A STOP IS SENT FIRST AND RECORDED AFTER (note H1 of the second
+        # review), as the gateway's own trip stop always was. With the export
+        # on, a record takes a process-wide lock and an fsync, and a stop that
+        # waited behind them on storage that stopped answering never reached
+        # the actuator. Both records are still written, in the same order and
+        # linked the same way; the intent says it was written after the stop
+        # was sent. The cost: a process killed during a stop leaves no intent.
+        sent.outcome, sent.error_kind, sent.ended_at, _ = _execute(
+            target, envelope_dict, pinned_manifest_path, tier, config)
+        return sent
+
+    def _stop_answer(sent: SimpleNamespace) -> dict:
+        """A caller's declared stop, second half: its records and its answer,
+        or its refusal recorded and answered with a signed 403."""
+        if sent.refusal is not None:
+            _deny(*sent.refusal, **sent.common)
+        envelope, common = sent.envelope, sent.common
+        intent_chain_hash = _record_intent(
+            msg_id=envelope.msg_id, envelope_dict=common["envelope_dict"],
+            ruri=envelope.ruri, rrn=_pinned_rrn, tool_name=envelope.tool_name,
+            actuator_name=sent.target.name, kid=None, caller=common["caller"],
+            tier=common["tier"], note=sent.note, sent_first=True,
+        )
+        return _answer(
+            envelope_dict=common["envelope_dict"], msg_id=envelope.msg_id, ruri=envelope.ruri,
+            scope="SAFETY", tool_name=envelope.tool_name, target_actuator=sent.target,
+            kid=None, rrn=_pinned_rrn, tier=common["tier"], caller=common["caller"],
+            started_at=common["started_at"], ended_at=sent.ended_at, outcome=sent.outcome,
+            error_kind=sent.error_kind, intent_chain_hash=intent_chain_hash,
         )
 
     def _invoke(envelope_dict: dict, authorization: str | None,
@@ -1473,11 +1575,11 @@ def make_app(
         started_at = datetime.now(tz=timezone.utc).isoformat()
 
         # A DECLARED STOP TAKES ITS OWN PATH, before the safety state and the
-        # gates below: see _invoke_stop for what it does and does not check.
-        # `stop` is _declared_stop's answer, found once, in invoke().
+        # gates below: see _stop_now for what it does and does not check.
+        # `stop` is _declared_stop's answer, found once, in invoke(). A known
+        # bearer's stop does not come here: invoke() runs its two halves.
         if stop is not None:
-            return _invoke_stop(envelope_dict, stop, tier=tier, caller=caller,
-                                started_at=started_at)
+            return _stop_answer(_stop_now(envelope_dict, stop, tier, caller))
 
         # SF-001/SF-002: safety state preempts all other gates. The request
         # ticks the monitor too, so it never acts on a state older than itself;
@@ -1892,10 +1994,20 @@ def make_app(
         # waited. Everything else, an anonymous stop included (refused at once
         # on the stop path), shares the default pool. Deciding needs nothing
         # but the request and the declarations, so it runs here.
+        #
+        # On the lane, a stop holds it only for its checks and the actuator's
+        # answer. Its records and its answer to the caller go to lanes of their
+        # own: a record waits on the export lock and an fsync, and storage that
+        # stopped answering held every stop lane until it did (note H1), while
+        # the shared pool can be full of other requests.
         stop = _declared_stop(envelope_dict)
-        on_lane = stop is not None and _principal(authorization)[0] != "anon"
-        return await anyio.to_thread.run_sync(_invoke, envelope_dict, authorization, stop,
-                                              limiter=_stop_limiter() if on_lane else None)
+        tier, caller = _principal(authorization)
+        if stop is None or tier == "anon":
+            return await anyio.to_thread.run_sync(_invoke, envelope_dict, authorization, stop)
+        stop_lanes, record_lanes = _stop_limiters()
+        sent = await anyio.to_thread.run_sync(_stop_now, envelope_dict, stop, tier, caller,
+                                              limiter=stop_lanes)
+        return await anyio.to_thread.run_sync(_stop_answer, sent, limiter=record_lanes)
 
     @app.get("/v1/audit/last")
     def audit_last(authorization: str | None = Header(default=None)):
@@ -1953,7 +2065,11 @@ def make_app(
                           f"robot; this credential holds the {tier} tier",
             })
         if _watchdog_stuck():
-            state = _safety_check()        # fails closed: SAFE_STOP, and the stops go out
+            # Fails closed: SAFE_STOP, and the stops go out. On a stop lane, not
+            # on the event loop: the check takes the safety lock and writes
+            # records, with an fsync, and the loop must keep answering
+            # meanwhile (note H1 of the second review).
+            state = await anyio.to_thread.run_sync(_safety_check, limiter=_stop_limiter())
             raise HTTPException(status_code=503, detail={
                 "deny": "safety_watchdog",
                 "reason": f"the safety watchdog has not ticked for over "
