@@ -546,7 +546,7 @@ def make_app(
         finally:
             # Judged before the watchdog is stopped: whether a stopped
             # watchdog was stuck is part of the answer.
-            _app.state.clean_shutdown = _not_clean_because()
+            _app.state.clean_shutdown = _not_clean_because(wait=on_shutdown is not None)
             stopping.set()
             watchdog.join(timeout=5)
             _safety.watchdog = None
@@ -560,15 +560,16 @@ def make_app(
                     logging.getLogger(__name__).exception(
                         "clean_shutdown: the shutdown hook failed; no marker is left")
 
-    def _not_clean_because() -> str | None:
+    def _not_clean_because(*, wait: bool) -> str | None:
         """At the end of the normal exit path: why this process must not leave
         a clean-shutdown marker (clean_shutdown.py), or None. Each reason
         means the next start sends every declared stop, so each errs toward
-        stops. Waits up to STOP_TIMEOUT_S for stops still in flight, so the
-        process does not end in the middle of one."""
+        stops. When the answer is acted on (`on_shutdown`, which `serve`
+        passes), it first waits up to STOP_TIMEOUT_S for stops still in
+        flight, so the process does not end in the middle of one."""
         trip = _safety.trip or _safety.last_trip
         deadline = time.monotonic() + STOP_TIMEOUT_S
-        for send in list(trip.sends) if trip is not None else []:
+        for send in list(trip.sends) if wait and trip is not None else []:
             send.settled.wait(max(0.0, deadline - time.monotonic()))
         with _safety_lock:
             if _watchdog_stuck():

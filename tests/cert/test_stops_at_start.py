@@ -23,6 +23,7 @@ tests/test_a_restart_sends_the_stops.py.
 from __future__ import annotations
 
 import threading
+import time
 from typing import ClassVar
 
 from fastapi.testclient import TestClient
@@ -355,14 +356,45 @@ def test_a_shutdown_with_a_trip_stop_that_failed_leaves_no_marker():
 
 
 def test_a_shutdown_waits_for_a_stop_in_flight_and_then_judges(monkeypatch):
+    """`serve`'s shutdown (an `on_shutdown` hook) waits up to STOP_TIMEOUT_S
+    for a stop still on its way, then judges."""
     monkeypatch.setattr(receiver_mod, "STOP_TIMEOUT_S", 0.3)
-    base = _Base("hang")
-    app, _monitor, _clock, _chain = _held_app(base, stops_at_start=WHY)
+    base, told = _Base("hang"), []
+    app, _monitor, _clock, _chain = _held_app(base, stops_at_start=WHY, on_shutdown=told.append)
     try:
         with TestClient(app):
             pass
     finally:
         base.release.set()
+    assert told == ["the stops sent at start had not all answered"]
+    assert app.state.clean_shutdown == told[0]
+
+
+def test_a_stop_that_answers_while_the_shutdown_waits_lets_it_be_clean(monkeypatch):
+    monkeypatch.setattr(receiver_mod, "STOP_TIMEOUT_S", 5.0)
+    base, told = _Base("hang"), []
+    app, _monitor, _clock, chain = _held_app(base, stops_at_start=WHY, on_shutdown=told.append)
+    try:
+        with TestClient(app):
+            threading.Timer(0.3, base.release.set).start()
+    finally:
+        base.release.set()
+    assert told == [None]
+    assert len(_stop_records(chain)) == 1
+
+
+def test_without_a_hook_the_shutdown_does_not_wait():
+    """Tests and embedders pass no `on_shutdown`: nothing acts on the answer,
+    so a hung stop does not hold their shutdown."""
+    base = _Base("hang")
+    app, _monitor, _clock, _chain = _held_app(base, stops_at_start=WHY)
+    started = time.monotonic()
+    try:
+        with TestClient(app):
+            pass
+    finally:
+        base.release.set()
+    assert time.monotonic() - started < receiver_mod.STOP_TIMEOUT_S
     assert app.state.clean_shutdown == "the stops sent at start had not all answered"
 
 
