@@ -56,11 +56,15 @@
   allowlist and per-tool tiers. Not refusing a stale stop departs from rcan-spec's
   replay-prevention page and follows its safety and offline pages; the spec
   contradicts itself there (RobotRegistryFoundation/rcan-spec#240).
-- **A stop is sent before it is recorded.** With the attestation export on, a
-  declared stop wrote its intent (a process-wide lock and an fsync) before it
-  reached the actuator, so storage that stopped answering held it back. It is
-  now sent first, and its intent and outcome are written after it, linked as
-  before; the intent says so.
+- **A stop is sent before it is recorded, and records hold no stop lane.** With
+  the attestation export on, a declared stop wrote its intent (a process-wide
+  lock and an fsync) before it reached the actuator, so storage that stopped
+  answering held it back. It is now sent first, and its intent and outcome are
+  written after it, linked as before; the intent says so. It gives up its stop
+  lane before those records, which go to lanes of their own, so eight stops
+  waiting on storage no longer hold back a ninth. With the watchdog stuck, the
+  heartbeat's own trip, which records, runs on a stop lane instead of the event
+  loop.
 - **Only a declared stop from a known bearer gets a stop lane.** Lanes were
   chosen by tool name, so requests that only named a stop tool (for an actuator
   that does not declare it, or for none) took them, from anyone. With
@@ -76,15 +80,20 @@
   actuator runs could still deliver the trip's stop before the dispatch, and an
   actuator whose stop does not latch (castor-hal transports) kept the dispatched
   goal. The gateway now sends that actuator its stop again once the call
-  returns, says so in the response (`stopped_again`) and the record, and a clear
-  waits for that stop.
+  returns, when the call was a motion and the trip's own stop to that actuator
+  had already answered; it says so in the response (`stopped_again`) and the
+  record, and a clear waits for that stop. A read gets no second stop, nor does
+  a motion whose trip stop is still on its way: sent at once, the second stop
+  queued behind the first, so-arm101-actuator refused it as busy, and the
+  failure left the arm refusing motion until a restart. A failed second stop is
+  recorded and not held against the actuator.
 - **What actuators declare is checked at startup.** A tool declared both as a
   stop and as a motion refuses to start the gateway. An actuator whose own
   declared tiers would refuse its stop at tier `read` gets a `stop_unreachable`
-  error and every motion through it is refused; so does one that refuses or
-  fails the gateway's stop when a trip sends it (`denied`, `error`, an
-  exception), from then until a restart. An actuator that declares no stop is
-  logged as `no_declared_stop`.
+  error and every motion through it is refused; so does one that refuses,
+  fails or does not answer within 10 s the gateway's stop when a trip sends it
+  (`denied`, `error`, an exception, a timeout), from then until a restart. An
+  actuator that declares no stop is logged as `no_declared_stop`.
 - **The clear refuses to arm motion that no trip could stop.** While any
   configured actuator may move and declares no stop, `POST /v1/safety/clear`
   answers 409, so a served gateway, which starts held, never arms with it.
@@ -162,9 +171,12 @@
   running alongside it.
 - **A stop needs a bearer the gateway knows.** One with no bearer, or an
   unknown one, is now refused, signed and recorded.
-- **so-arm101-actuator 0.2.2 can no longer be armed.** It declares no stop, so
-  the clear answers 409. Run so-arm101-actuator main, or 0.3.0 or later once
-  released (README, "The arm's driver").
+- **so-arm101-actuator 0.2.2 can no longer be armed, and neither can a gateway
+  with oak-d-actuator up to 0.2.1.** Neither declares a stop or an empty
+  `motion_capabilities`, so the clear answers 409. Run so-arm101-actuator main,
+  or 0.3.0 or later once released, and an oak-d-actuator release with
+  RobotRegistryFoundation/oak-d-actuator#13 (README, "The arm's driver, and
+  every other actuator").
 - **A supervisor or commission token needs at least 32 characters**, or the
   gateway refuses to start.
 - **The systemd unit needs its bearer file.** A fresh `install.sh` creates

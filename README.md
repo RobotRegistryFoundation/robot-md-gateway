@@ -46,7 +46,7 @@ plaintext goals, never SDK sessions. Every envelope is checked for:
 3. **Tool allowlist** — the requested tool is in the operator's policy (default-deny on unknown). A tool the actuator declares as motion (`motion_capabilities`) must also be invoked under an actuation scope (`MANIPULATE`, `NAVIGATE`, `ACTUATE`, `EXECUTE`, `COMMISSION`, in any case): the same motion relabelled `OBSERVE` is refused, because the tier, confidence and HiTL gates key off that caller-written field. For a motion tool those gates also apply the strictest motion scope's rule (HiTL on any of MANIPULATE, NAVIGATE, ACTUATE, EXECUTE covers all four), so relabelling among them buys nothing.
 4. **Confidence + HiTL gates** *(Phase 4 — Plan 6)* — model-asserted confidence above threshold; human-in-the-loop approval if scope demands it.
 5. **Replay protection + freshness** *(Plan 6; freshness v0.5.0a7)*: the envelope's `msg_id` is checked against a bounded FIFO window of ids already seen (oldest evicted first), and when the envelope carries a `timestamp_ms` it must fall inside a configurable window, by default 300 seconds either side of the gateway's clock. An envelope that carries no `timestamp_ms` is not freshness-checked unless `ROBOT_MD_REQUIRE_ENVELOPE_TIMESTAMP` is on: the iOS client signs the field into its pre-image, older CLI signers do not send it at all, and refusing them all would be a silent break. The window is bounded, so this limits how long a captured envelope stays useful; it is not a permanent ledger of every id ever seen.
-6. **ESTOP precedence** *(Plan 6)* — physical or operator stop signal preempts any pending action. A declared stop sent through `/v1/invoke` by a bearer the gateway knows runs on worker threads of its own (`STOP_LANES`), so it does not wait behind other requests for a thread. Only such a request gets a lane: one that merely names a stop tool, for an actuator that does not declare it or with no known bearer, shares the default pool, so it cannot hold the lanes; whether it then preempts a motion in progress is up to the actuator (so-arm101-actuator latches first and ends a paced move at its next setpoint). A flood of requests that saturates the gateway's CPU still delays it, because CPU and the GIL are shared by every thread (the stop latched 4.7 s after it was sent under 200 looping clients on two cores, in simulation; 0.05 s with no other traffic): the software stop is not the physical e-stop. A declared stop (a tool the actuator that receives it declares in `stop_capabilities`) takes a path of its own. It passes in every gateway state, `safe_stop` and `estop_active` included, which refuse everything else. It is judged as `SAFETY` whatever scope the envelope carries. It is never refused for its signature, freshness, revocation or replay (a replayed stop is processed and recorded as `REPLAY_DETECTED`), and the key registry is never consulted for it. That departs from rcan-spec's replay-prevention page, which rejects an ESTOP more than 10 s old (`src/pages/docs/replay-prevention.astro:70`), and follows its safety and offline pages, which accept an ESTOP always (`safety.astro:351`, `offline.astro:47`). The spec contradicts itself there ([RobotRegistryFoundation/rcan-spec#240](https://github.com/RobotRegistryFoundation/rcan-spec/issues/240)). The gateway takes the side that never refuses a stop: a stale or replayed stop can only stop the robot, and replaying one needs a bearer that could send a fresh stop anyway. The actuator gets the pinned manifest, or none, never the one the request names, and confidence and HiTL do not apply. It is sent to the actuator before it is recorded (see [Record before dispatch](#record-before-dispatch-and-record-again-after)). A stop still needs a bearer the gateway knows (any tier), the operator's allowlist and the operator's per-tool tiers (see [Heartbeat and safe-stop](#heartbeat-and-safe-stop-sf-002)).
+6. **ESTOP precedence** *(Plan 6)* — physical or operator stop signal preempts any pending action. A declared stop sent through `/v1/invoke` by a bearer the gateway knows runs on worker threads of its own (`STOP_LANES`), so it does not wait behind other requests for a thread. It holds its lane only for its checks and the actuator's answer; its records and its response go to lanes of their own, so storage that stops answering holds back no other stop. Only such a request gets a lane: one that merely names a stop tool, for an actuator that does not declare it or with no known bearer, shares the default pool, so it cannot hold the lanes; whether it then preempts a motion in progress is up to the actuator (so-arm101-actuator latches first and ends a paced move at its next setpoint). A flood of requests that saturates the gateway's CPU still delays it, because CPU and the GIL are shared by every thread (the stop latched 4.7 s after it was sent under 200 looping clients on two cores, in simulation; 0.05 s with no other traffic): the software stop is not the physical e-stop. A declared stop (a tool the actuator that receives it declares in `stop_capabilities`) takes a path of its own. It passes in every gateway state, `safe_stop` and `estop_active` included, which refuse everything else. It is judged as `SAFETY` whatever scope the envelope carries. It is never refused for its signature, freshness, revocation or replay (a replayed stop is processed and recorded as `REPLAY_DETECTED`), and the key registry is never consulted for it. That departs from rcan-spec's replay-prevention page, which rejects an ESTOP more than 10 s old (`src/pages/docs/replay-prevention.astro:70`), and follows its safety and offline pages, which accept an ESTOP always (`safety.astro:351`, `offline.astro:47`). The spec contradicts itself there ([RobotRegistryFoundation/rcan-spec#240](https://github.com/RobotRegistryFoundation/rcan-spec/issues/240)). The gateway takes the side that never refuses a stop: a stale or replayed stop can only stop the robot, and replaying one needs a bearer that could send a fresh stop anyway. The actuator gets the pinned manifest, or none, never the one the request names, and confidence and HiTL do not apply. It is sent to the actuator before it is recorded (see [Record before dispatch](#record-before-dispatch-and-record-again-after)). A stop still needs a bearer the gateway knows (any tier), the operator's allowlist and the operator's per-tool tiers (see [Heartbeat and safe-stop](#heartbeat-and-safe-stop-sf-002)).
 
 **Which of those run depends on one setting, so read this before quoting the
 list.** Checks 1, 2, 3, 4 and 6 run on every request but a declared stop, which
@@ -109,18 +109,21 @@ slow; it cannot make it wrong, and unsetting
 
 Between the intent and the call to the actuator the gateway checks its safety
 state once more. A trip in that interval refuses the request (`safety_state`),
-and the refusal is the outcome of that intent, with its hash. If a trip begins
-while the actuator runs, the gateway sends that actuator its stop again once it
-returns, so that a goal set after the trip's stop does not stand; the response
-says so (`stopped_again`), and so does the outcome record.
+and the refusal is the outcome of that intent, with its hash. A trip can also
+begin while the actuator runs, and its own stop to that actuator then runs at
+the same time. If that stop has already answered when a motion tool returns,
+the motion's goal may have landed after it, so the gateway sends the stop again
+(`stopped_again` in the response, and in the outcome record). If it has not
+answered yet, it lands after the motion, and nothing is sent again. A read gets
+no second stop: it leaves no goal behind.
 
 **A declared stop is the exception: it is sent first and recorded after.** Its
 intent and outcome are still both written, in that order and linked the same
 way, but after the actuator was called, and the intent's reason says so. A stop
 never waits for the export lock or an `fsync`, which on storage that has stopped
-answering would hold it back indefinitely. The gateway's own trip stop has
-always worked that way. The cost is that a process killed during a stop leaves
-no intent for it.
+answering would hold it back indefinitely, and it gives up its stop lane before
+its records are written. The gateway's own trip stop has always worked that way.
+The cost is that a process killed during a stop leaves no intent for it.
 
 Both writes are **best effort**, unchanged from the contract the outcome record
 has always had: a signing failure, a full disk or an unwritable export is logged
@@ -395,14 +398,18 @@ included, is a trip:
   stop at all (see "the arm's driver" below).
 - Each stop runs on a thread of its own, so a stop that hangs on its bus delays
   no other actuator's stop and does not stop the watchdog. After 10 s without an
-  answer the gateway records it as failed and stops waiting for it. A stop
-  whose thread could not start is tried again on the next tick.
+  answer the gateway records it as failed and stops waiting for it, and from
+  then on refuses every motion through that actuator until it restarts
+  (`deny: stop_unreachable`): a stop that does not answer is one the gateway
+  cannot count on. A late answer does not lift that. A stop whose thread could
+  not start is tried again on the next tick.
 - Nothing on this path reads ROBOT.md: what to stop, and the robot's RRN, were
   resolved when the gateway started.
 - An actuator that refuses this stop, or answers it with an error, cannot be
   counted on to stop, so every motion through it is refused from then until
-  the gateway restarts (`deny: stop_unreachable`). The same holds from startup for one whose declared
-  tiers (`required_tiers`, or a module-level `REQUIRED_TIERS`) leave out `read`.
+  the gateway restarts (`deny: stop_unreachable`). The same holds from startup
+  for one whose declared tiers (`required_tiers`, or a module-level
+  `REQUIRED_TIERS`) leave out `read`.
   A tool declared both as a stop and as a motion stops the gateway at startup.
 - The trip, each stop and each timeout are recorded in the audit chain and the
   export (`safety_trip: ...`, `safety_stop: ...`, `safety_stop_timeout: ...`).
@@ -413,16 +420,23 @@ included, is a trip:
   gateway (below).
 - A request already past the gateway's checks when the trip begins is checked
   once more just before the actuator is called, and refused there. If the trip
-  begins while the actuator runs, the gateway sends that actuator its stop
-  again once it returns (`stopped_again` in the response). A clear waits for
-  that stop too.
+  begins while a motion runs and the trip's own stop to that actuator answers
+  before the motion returns, the gateway sends that stop again once the motion
+  returns (`stopped_again` in the response), and a clear waits for it. If the
+  trip's stop answers after, nothing is sent again: so-arm101-actuator is that
+  case, since its stop latches at once and then waits for the bus that a paced
+  move gives up at its next setpoint. A stop sent again that fails is recorded
+  and not held against the actuator. A paced driver must latch: one that does
+  not would finish a move admitted before the trip, and the gateway would not
+  know.
 
 From then on every request is refused with `deny: safety_state`, except a
 declared stop (item 6 under [What it does](#what-it-does)).
 
 **If the watchdog itself stops ticking** for 1 s, the gateway fails closed: it
 enters `safe_stop` and sends the stops, and the heartbeat and the clear answer
-503 `safety_watchdog`, never 200.
+503 `safety_watchdog`, never 200. The heartbeat does that work on a stop lane,
+not on the event loop, so the gateway keeps answering while it records.
 
 **Resuming takes two explicit steps.** A heartbeat alone never resumes.
 
@@ -450,17 +464,31 @@ enters `safe_stop` and sends the stops, and the heartbeat and the clear answer
    `ROBOT_MD_TOOL_ALLOWLIST`. Until then the arm refuses motion itself
    (`deny: actuator_policy`, `estop_latched`).
 
-**The arm's driver.** so-arm101-actuator 0.2.2, the latest on PyPI, declares no
-stop and nothing about motion, so a gateway with it never arms: the clear
-answers 409. Bob must run so-arm101-actuator main, or 0.3.0 or later once it is
-released. To check what is installed, look for `no_declared_stop` in the
-gateway's startup log, or run, in the gateway's environment:
+**The arm's driver, and every other actuator.** The clear refuses to arm a
+gateway while any configured actuator may move and declares no stop. So every
+actuator in `bearers.yaml` must declare a stop, or declare an empty
+`motion_capabilities`, before the gateway can be armed. On bob that is two
+packages:
+- so-arm101-actuator 0.2.2, the latest on PyPI, declares no stop and nothing
+  about motion. Bob must run so-arm101-actuator main, or 0.3.0 or later once it
+  is released.
+- oak-d-actuator, bob's camera, declares neither attribute on main or in 0.2.1
+  on PyPI, so a gateway that loads it beside the arm answers every clear with
+  409, naming `oak-d`. RobotRegistryFoundation/oak-d-actuator#13 declares both
+  empty; bob needs a release with it.
+
+To check what is installed, look for `no_declared_stop` in the gateway's
+startup log (`... so the gateway refuses to be cleared (armed) while it is
+configured`), or run, in the gateway's environment:
 
 ```bash
 python -c 'import so_arm101_actuator.actuator as a; print(a.STOP_CAPABILITIES)'
+python -c 'from oak_d_actuator.actuator import OakDActuator as a; print(a.motion_capabilities, a.stop_capabilities)'
 ```
 
-main prints `frozenset({'arm.estop'})`; 0.2.2 fails with `AttributeError`.
+The arm's main prints `frozenset({'arm.estop'})`, and the camera with #13 prints
+`frozenset() frozenset()`. Either fails with `AttributeError` on a version that
+declares nothing.
 
 **A restart and the arm's latch.** so-arm101-actuator keeps its latch in
 memory, inside the gateway's process, so a restart forgets it. The gateway's own
@@ -543,10 +571,11 @@ audit chain.
 **Broken — `500`.** The driver raised. A fault is never dressed up as a
 decision, so it does not arrive as a deny and carries no receipt.
 
-Any of the three can also carry `stopped_again`: the gateway tripped while the
-request was being dispatched, so it sent the actuator its stop again after the
-call returned. The text names the trip and the stop. Whatever else the response
-says, the actuator has since been told to stop.
+Any of the three can also carry `stopped_again`: the gateway tripped while a
+motion was being dispatched, and the trip's stop to that actuator answered
+first, so it sent the stop again after the call returned. The text names the
+trip and the stop. Whatever else the response says, the actuator has since been
+told to stop.
 
 ### What is inside the signed receipt
 
