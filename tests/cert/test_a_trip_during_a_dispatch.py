@@ -155,6 +155,9 @@ def test_a_trip_while_the_actuator_runs_is_followed_by_its_stop_again():
         assert drive.log == ["drive.stop"]
         drive.hold.set()
         mover.join(5)
+        # The stop sent again runs on a thread of its own, which marks it
+        # answered before it writes its record: wait for that record.
+        assert _stopped(app, 2)
     assert monitor.state is GatewayState.SAFE_STOP
     assert drive.log == ["drive.stop", "drive.go", "drive.stop"]
     assert drive.goal == "stopped"
@@ -191,6 +194,7 @@ def test_a_clear_waits_for_the_stop_sent_again():
         waiting = _clear(client)
         drive.stop_hold.set()
         mover.join(5)
+        assert _stopped(app, 2)                      # recorded, so marked done
         _heartbeat(client)
         cleared = _clear(client)
     assert waiting.status_code == 409
@@ -508,6 +512,7 @@ def test_a_stop_sent_again_that_fails_is_not_held_against_the_actuator():
         assert _stopped(app)
         drive.hold.set()
         mover.join(5)
+        assert _stopped(app, 2)                      # recorded, so marked done
         _heartbeat(client)
         assert _clear(client).status_code == 200
         drive.hold = None

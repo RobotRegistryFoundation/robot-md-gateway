@@ -359,7 +359,7 @@ def test_a_manifest_that_does_not_parse_cannot_cancel_the_trip_stop(tmp_path, co
     assert arm.stops and arm.stops[0]["while_moving"], "the gateway's stop was not sent"
     assert len(arm.stops) == 2            # and again once the move returned
     assert box["r"].json()["telemetry"]["stopped_by_estop"] is True
-    assert _reasons(chain, "safety_stop:")
+    assert _stopped(app, 2)               # both recorded
 
 
 def test_a_damaged_manifest_is_a_signed_refusal_for_a_motion_not_a_500(tmp_path):
