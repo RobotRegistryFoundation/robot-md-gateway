@@ -28,6 +28,8 @@ def _serve(monkeypatch, *argv: str):
     monkeypatch.setattr(sys, "argv", ["robot-md-gateway", "serve", *argv])
     for v in ("ROBOT_MD_TOOL_ALLOWLIST", "ROBOT_MD_REQUIRE_ENVELOPE_SIGNATURE", "ROBOT_MD_PATH"):
         monkeypatch.delenv(v, raising=False)
+    # serve reads and removes the clean-shutdown marker there: never a real one.
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
     gw_main.main()
     return captured["app"]
 

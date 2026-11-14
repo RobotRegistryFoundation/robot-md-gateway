@@ -4,6 +4,29 @@
 
 ### Security
 
+- **systemd restarts a gateway whose safety watchdog stops ticking.** A dead
+  watchdog was noticed only when a request, a heartbeat or a clear arrived,
+  so with the supervisor gone as well nothing tripped. The watchdog now sends
+  systemd `READY=1` after its first tick and `WATCHDOG=1` while its ticks run
+  (`sd_notify`, no new dependency), and `systemd/robot-md-dispatcher.service`
+  is `Type=notify` with `NotifyAccess=main` and `WatchdogSec=5s`: when the
+  pings stop, systemd stops the gateway and `Restart=on-failure` starts it
+  again, held. A notification never waits, so a systemd that stops reading
+  cannot stall the safety tick. The unit now needs a gateway from this
+  version, since an older one never sends `READY=1`. Outside systemd nothing
+  is sent.
+- **A start after any end but a clean one sends every declared stop.** A
+  killed process can leave hardware that keeps its last goal moving, and
+  booting held sends nothing. `serve` now reads and removes a clean-shutdown
+  marker in `$STATE_DIRECTORY` before anything else (the unit adds
+  `StateDirectory=robot-md-dispatcher`), and without one it sends each
+  declared stop as the app is built. The marker is left only at the end of a
+  graceful shutdown while held, with every stop answered. A stop at start
+  that fails or does not answer refuses motion through its actuator
+  (`stop_unconfirmed`) until a stop to it succeeds; the first commission
+  clear after it sends it again and answers 409, and a clear once it has
+  answered arms the gateway. Without `StateDirectory=`, every start sends the
+  stops.
 - **`serve` runs a safety monitor, always, and starts held.** `make_app` has
   taken a `SafetyMonitor` since Plan 6 Phase 4, but the `serve` path never
   passed one, so a deployed gateway had no heartbeat staleness rule (SF-002) at
