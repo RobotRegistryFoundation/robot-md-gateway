@@ -1,0 +1,629 @@
+"""A trip while a request is being dispatched (blocking 1 of the second review).
+
+The review's reproduction: a motion admitted in READY wrote its intent record
+(slow with the attestation export on: a lock and an fsync), a trip happened in
+that time, the trip's stop reached the actuator, and then the motion did. An
+actuator whose stop does not latch (castor-hal's `Transport.estop` is a
+best-effort stop or hold) kept the motion's goal, and nothing stopped it again.
+
+Now:
+- the gateway checks its state once more after the intent record, as the last
+  statement before the actuator is called; a trip by then is a signed refusal
+  whose record carries the intent's chain hash;
+- a trip that begins after that check, while a motion runs, is answered with
+  that actuator's stop again once the motion returns and the trip's own stop
+  has answered, so the last word the actuator hears is a stop. A clear waits
+  for that stop as for the trip's own.
+The trip's own stop never waits for the motion: it runs on its own thread.
+
+Which of the two reached the actuator first is not known to the gateway, and
+the order in which they return does not tell it: a stop that lands and then
+waits for an acknowledgement returns after a goal that landed after it (the
+fourth review's blocking item). So the stop goes again after every motion the
+trip overlapped. It waits for the trip's own stop first, so that the two never
+queue on one bus (the third review's N1: so-arm101-actuator refused the second
+as busy).
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+
+import pytest
+from fastapi.testclient import TestClient
+
+import robot_md_gateway.receiver as receiver_mod
+from robot_md_gateway.actuator import ActuatorOutcome
+from robot_md_gateway.cert.audit import AuditChain
+from robot_md_gateway.cert.policy import ToolAllowlist
+from robot_md_gateway.cert.safety import GatewayState
+
+from .test_safe_stop_holds_the_machine import (
+    STALE_S,
+    _app,
+    _clear,
+    _heartbeat,
+    _invoke,
+    _reasons,
+    _SimArm,
+    _stopped,
+    _wait_for,
+)
+
+DRIVE_TOOLS = ToolAllowlist(allowed_tools=("drive.go", "drive.stop"))
+
+
+class Drive:
+    """Holds the last goal it was given; its stop does not latch. A goal is set
+    when `execute` returns, as a goal-setting transport sets it, and `hold`
+    keeps `execute` from returning until the test says so."""
+
+    name, description, config_schema = "drive", "drive", {}
+    motion_capabilities = frozenset({"drive.go"})
+    stop_capabilities = frozenset({"drive.stop"})
+
+    def __init__(self):
+        self.log: list[str] = []
+        self.goal = "stopped"
+        self.inside = threading.Event()
+        self.hold: threading.Event | None = None
+        self.stop_hold: threading.Event | None = None
+        self.stop_held = threading.Event()
+
+    def execute(self, *, envelope, manifest_path, tier, config):
+        tool = envelope["tool_name"]
+        if tool == "drive.go":
+            self.inside.set()
+            if self.hold is not None:
+                self.hold.wait(10)
+            self.goal = "going"
+        else:
+            if self.stop_hold is not None and self.log[-1:] == ["drive.go"]:
+                self.stop_held.set()             # only the stop that follows the goal
+                self.stop_hold.wait(10)
+            self.goal = "stopped"
+        self.log.append(tool)
+        return ActuatorOutcome(success=True, outcome_kind="executed", telemetry={})
+
+
+class SlowIntent(AuditChain):
+    """The intent record takes a while, as with the attestation export on."""
+
+    def __init__(self):
+        super().__init__()
+        self.inside, self.go = threading.Event(), threading.Event()
+
+    def append(self, entry):
+        if entry.entry_kind == "intent" and entry.tool_name == "drive.go":
+            self.inside.set()
+            self.go.wait(5)
+        return super().append(entry)
+
+
+def test_a_trip_during_the_intent_record_refuses_the_motion_with_the_intents_hash():
+    """The review's reproduction, which now fails: the motion never reaches the
+    actuator."""
+    drive, chain = Drive(), SlowIntent()
+    app, monitor, clock = _app(drive, chain, tool_allowlist=DRIVE_TOOLS)
+    box: dict = {}
+    with TestClient(app) as client:
+        _heartbeat(client)
+        _clear(client)
+        mover = threading.Thread(target=lambda: box.update(r=_invoke(client, "drive.go")))
+        mover.start()
+        assert chain.inside.wait(5)                  # past every earlier state check
+        clock.advance(STALE_S + 1)
+        app.state.safety_tick()                      # the trip: drive.stop is sent
+        assert _wait_for(lambda: "drive.stop" in drive.log)
+        chain.go.set()
+        mover.join(5)
+    assert monitor.state is GatewayState.SAFE_STOP
+    assert drive.log == ["drive.stop"]               # the motion never arrived
+    assert drive.goal == "stopped"
+    assert box["r"].status_code == 403
+    detail = box["r"].json()["detail"]
+    assert detail["deny"] == "safety_state"
+    assert detail["reason"] == ("gateway state=safe_stop (it changed while this request was "
+                                "being dispatched)")
+    [intent] = [e for e in chain.entries if e.entry_kind == "intent"]
+    [refusal] = [e for e in chain.entries if e.entry_kind == "outcome"
+                 and e.decision_reason.startswith("safety_state:")]
+    assert refusal.decision == "deny"
+    assert refusal.intent_chain_hash == intent.chain_hash
+
+
+def test_a_trip_while_the_actuator_runs_is_followed_by_its_stop_again():
+    """The trip's stop reaches the drive while the motion is still being
+    dispatched, and the goal is set after it. The gateway sends the stop again
+    when the motion returns."""
+    drive = Drive()
+    drive.hold = threading.Event()
+    app, monitor, clock = _app(drive, AuditChain(), tool_allowlist=DRIVE_TOOLS)
+    box: dict = {}
+    with TestClient(app) as client:
+        _heartbeat(client)
+        _clear(client)
+        mover = threading.Thread(target=lambda: box.update(r=_invoke(client, "drive.go")))
+        mover.start()
+        assert drive.inside.wait(5)                  # inside execute, past the last check
+        clock.advance(STALE_S + 1)
+        app.state.safety_tick()
+        # The trip's stop does not wait for the motion, and it has answered
+        # (and been recorded) before the motion returns.
+        assert _stopped(app)
+        assert drive.log == ["drive.stop"]
+        drive.hold.set()
+        mover.join(5)
+        # The stop sent again runs on a thread of its own, which marks it
+        # answered before it writes its record: wait for that record.
+        assert _stopped(app, 2)
+    assert monitor.state is GatewayState.SAFE_STOP
+    assert drive.log == ["drive.stop", "drive.go", "drive.stop"]
+    assert drive.goal == "stopped"
+    assert box["r"].status_code == 200               # the drive did set the goal
+    assert box["r"].json()["stopped_again"] == (
+        "the gateway tripped (trip 1) while drive.go was being dispatched, so drive.stop was "
+        "sent to drive again after it returned, once the trip's own stop had answered")
+    chain = app.state.audit_chain
+    again = [e for e in chain.entries if e.decision_reason.startswith("safety_stop:")
+             and " again, because drive.go (" in e.decision_reason]
+    assert len(again) == 1 and again[0].decision == "allow"
+    [outcome] = [e for e in chain.entries if e.entry_kind == "outcome"
+                 and e.decision_reason.startswith("ok; the gateway tripped")]
+    assert outcome.decision == "allow"
+
+
+def test_a_clear_waits_for_the_stop_sent_again():
+    drive = Drive()
+    drive.hold, drive.stop_hold = threading.Event(), threading.Event()
+    app, monitor, clock = _app(drive, AuditChain(), tool_allowlist=DRIVE_TOOLS)
+    box: dict = {}
+    with TestClient(app) as client:
+        _heartbeat(client)
+        _clear(client)
+        mover = threading.Thread(target=lambda: box.update(r=_invoke(client, "drive.go")))
+        mover.start()
+        assert drive.inside.wait(5)
+        clock.advance(STALE_S + 1)
+        app.state.safety_tick()
+        assert _stopped(app)                         # the trip's own stop has answered
+        drive.hold.set()                             # the goal is set; its stop then hangs
+        assert drive.stop_held.wait(5)
+        _heartbeat(client)
+        waiting = _clear(client)
+        drive.stop_hold.set()
+        mover.join(5)
+        assert _stopped(app, 2)                      # recorded, so marked done
+        _heartbeat(client)
+        cleared = _clear(client)
+    assert waiting.status_code == 409
+    assert "drive.stop to drive" in waiting.json()["detail"]["reason"]
+    assert cleared.status_code == 200, cleared.text
+    assert monitor.state is GatewayState.READY
+    assert drive.log == ["drive.stop", "drive.go", "drive.stop"]
+
+
+def test_the_stop_is_sent_again_even_after_the_trip_was_cleared():
+    """The clear was for the trip, not for a motion admitted before it."""
+    drive = Drive()
+    drive.hold = threading.Event()
+    app, monitor, clock = _app(drive, AuditChain(), tool_allowlist=DRIVE_TOOLS)
+    box: dict = {}
+    with TestClient(app) as client:
+        _heartbeat(client)
+        _clear(client)
+        mover = threading.Thread(target=lambda: box.update(r=_invoke(client, "drive.go")))
+        mover.start()
+        assert drive.inside.wait(5)
+        clock.advance(STALE_S + 1)
+        app.state.safety_tick()
+        assert _stopped(app)                         # the trip's own stop has answered
+        _heartbeat(client)
+        assert _clear(client).status_code == 200
+        drive.hold.set()
+        mover.join(5)
+    assert monitor.state is GatewayState.READY
+    assert drive.log == ["drive.stop", "drive.go", "drive.stop"]
+    assert drive.goal == "stopped"
+    assert "drive.stop was sent to drive again" in box["r"].json()["stopped_again"]
+
+
+def test_an_arm_clear_admitted_before_a_trip_gets_no_second_stop():
+    """The second review's R2-12: an `arm.estop.clear` admitted before the
+    trip reaches the arm after the trip's stop latched it, and unlatches it.
+    Round 2 sent the stop again after any dispatch; from round 3 only a motion
+    gets a second stop (note N1), so the arm is left unlatched. Nothing moves:
+    the gateway itself is held and refuses every motion until a commission
+    clear, after which the arm's own clear is not needed again."""
+
+    class _ClearArm(_SimArm):
+        def __init__(self):
+            super().__init__()
+            self.clearing, self.hold = threading.Event(), threading.Event()
+
+        def execute(self, *, envelope, manifest_path, tier, config):
+            if envelope["tool_name"] == "arm.estop.clear":
+                self.clearing.set()
+                self.hold.wait(10)
+            return super().execute(envelope=envelope, manifest_path=manifest_path,
+                                   tier=tier, config=config)
+
+    arm = _ClearArm()
+    app, monitor, clock = _app(arm, AuditChain())
+    box: dict = {}
+    with TestClient(app) as client:
+        _heartbeat(client)
+        _clear(client)
+        clearer = threading.Thread(target=lambda: box.update(
+            r=_invoke(client, "arm.estop.clear", scope="COMMISSION", token="commission-token")))
+        clearer.start()
+        assert arm.clearing.wait(5)
+        clock.advance(STALE_S + 1)
+        app.state.safety_tick()
+        assert _stopped(app)
+        arm.hold.set()
+        clearer.join(5)
+        moved = _invoke(client, "arm.move_to")
+    assert monitor.state is GatewayState.SAFE_STOP
+    assert box["r"].status_code == 200 and "stopped_again" not in box["r"].json()
+    assert len(arm.stops) == 1
+    assert not arm.latched                       # the race R2-12 found, left as decided
+    assert moved.status_code == 403 and moved.json()["detail"]["deny"] == "safety_state"
+    assert arm.position == 0
+
+
+def test_a_dispatch_with_no_trip_sends_no_extra_stop():
+    drive = Drive()
+    app, _monitor, _clock = _app(drive, AuditChain(), tool_allowlist=DRIVE_TOOLS)
+    with TestClient(app) as client:
+        _heartbeat(client)
+        _clear(client)
+        response = _invoke(client, "drive.go")
+    assert response.status_code == 200
+    assert "stopped_again" not in response.json()
+    assert drive.log == ["drive.go"]
+
+
+# --------------------------------------------------------------------------- #
+# Note N1 of the third review: a stop sent again must not queue behind the
+# trip's own stop, and a read gets none. Blocking 1 of the fourth: the order
+# in which the two calls return is not the order in which they landed.
+# --------------------------------------------------------------------------- #
+
+
+class AckDrive:
+    """Holds its last goal; its stop does not latch. The stop lands at once
+    and then waits `ack_s` for an acknowledgement before it returns, so it
+    returns after a goal that landed after it. `trip`, when set, is called
+    while the goal is on its way, and the goal lands once the trip's stop has.
+    The fourth review's R4-01, castor-hal's `TransportActuator` over a base
+    that holds its last velocity, in the gateway's own terms."""
+
+    name, description, config_schema = "drive", "drive", {}
+    motion_capabilities = frozenset({"drive.go"})
+    stop_capabilities = frozenset({"drive.stop"})
+
+    def __init__(self, ack_s):
+        self.ack_s = ack_s
+        self.goal, self.log, self.trip = "stopped", [], None
+
+    def execute(self, *, envelope, manifest_path, tier, config):
+        if envelope["tool_name"] == "drive.stop":
+            self.goal = "stopped"
+            self.log.append("drive.stop")
+            time.sleep(self.ack_s)                   # the acknowledgement, after it landed
+        else:
+            if self.trip is not None:
+                trip, self.trip = self.trip, None
+                trip()
+                assert _wait_for(lambda: "drive.stop" in self.log)
+            self.goal = "going"
+            self.log.append("drive.go")
+        return ActuatorOutcome(success=True, outcome_kind="executed", telemetry={})
+
+
+@pytest.mark.parametrize("ack_ms", [0, 20])
+def test_a_goal_that_lands_after_the_trip_stop_is_stopped_again(ack_ms):
+    """The fourth review's blocking item, R4-01. The trip's stop lands, then
+    the goal does. With a stop that returns at once, round 3 sent the stop
+    again; with one that returns 20 ms after it lands, the motion returned
+    first, nothing was sent again, and the drive kept going with the gateway
+    in safe_stop. Now the stop goes again either way."""
+    drive = AckDrive(ack_ms / 1000)
+    app, monitor, clock = _app(drive, AuditChain(), tool_allowlist=DRIVE_TOOLS)
+    drive.trip = lambda: (clock.advance(STALE_S + 1), app.state.safety_tick())
+    with TestClient(app) as client:
+        _heartbeat(client)
+        _clear(client)
+        response = _invoke(client, "drive.go")
+        assert _stopped(app, 2)
+    assert monitor.state is GatewayState.SAFE_STOP
+    assert drive.log == ["drive.stop", "drive.go", "drive.stop"]
+    assert drive.goal == "stopped"
+    assert response.status_code == 200
+    assert response.json()["stopped_again"].endswith(
+        "drive.stop was sent to drive again after it returned, once the trip's own stop had "
+        "answered")
+
+
+class BusArm:
+    """Behaves as so-arm101-actuator does on its servo bus. One bus lock: a
+    paced move holds it for its whole stream and checks the latch before every
+    setpoint, and a read holds it while it reads. A stop latches at once, then
+    waits for the bus to write its hold. While that stop waits, any other
+    request that has not got the bus is refused as busy, a stop repeated while
+    latched included, since only the stop that latched goes first."""
+
+    name, description, config_schema = "arm", "an arm on a servo bus", {}
+    motion_capabilities = frozenset({"arm.move_to"})
+    stop_capabilities = frozenset({"arm.estop"})
+    STEP_S, READ_S, HOLD_S = 0.01, 0.03, 0.02
+
+    def __init__(self, steps=500):
+        self.steps = steps
+        self.bus = threading.Lock()
+        self.latched = False
+        self.stops_waiting = 0
+        self.holds = 0
+        self.position = 0
+        self.busy: list[str] = []
+        self.moving, self.reading = threading.Event(), threading.Event()
+        self._count = threading.Lock()
+
+    def _busy(self, tool):
+        self.busy.append(tool)
+        return ActuatorOutcome(success=False, outcome_kind="error",
+                               error_message="busy: a stop is waiting for the bus")
+
+    def execute(self, *, envelope, manifest_path, tier, config):
+        tool = envelope["tool_name"]
+        if tool == "arm.estop":
+            with self._count:
+                first = not self.latched
+                self.latched = True                  # latch first, outside the bus
+                if not first and self.stops_waiting:
+                    return self._busy(tool)
+                if first:
+                    self.stops_waiting += 1
+            try:
+                self.bus.acquire()
+            finally:
+                if first:
+                    with self._count:
+                        self.stops_waiting -= 1
+            try:
+                time.sleep(self.HOLD_S)              # the hold, one write per joint
+                self.holds += 1
+            finally:
+                self.bus.release()
+            return ActuatorOutcome(success=True, outcome_kind="executed", telemetry={})
+        if self.stops_waiting:
+            return self._busy(tool)
+        if tool == "arm.estop.clear":
+            if tier != "commission":
+                return ActuatorOutcome(success=False, outcome_kind="denied",
+                                       error_message="needs the commission tier")
+            with self.bus:
+                self.latched = False
+            return ActuatorOutcome(success=True, outcome_kind="executed", telemetry={})
+        if tool == "arm.state":
+            with self.bus:
+                self.reading.set()
+                time.sleep(self.READ_S)
+            return ActuatorOutcome(success=True, outcome_kind="executed",
+                                   telemetry={"position": self.position})
+        if self.latched:
+            return ActuatorOutcome(success=False, outcome_kind="denied",
+                                   error_message="estop_latched")
+        with self.bus:
+            self.moving.set()
+            done = 0
+            while done < self.steps and not self.latched:
+                self.position += 1
+                done += 1
+                time.sleep(self.STEP_S)
+        self.moving.clear()
+        return ActuatorOutcome(success=True, outcome_kind="executed",
+                               telemetry={"stopped_by_estop": done < self.steps})
+
+
+BUS_TOOLS = ToolAllowlist(allowed_tools=("arm.move_to", "arm.state", "arm.estop",
+                                         "arm.estop.clear"))
+
+
+def _resume_and_move(client, arm):
+    """The documented resume after a trip: heartbeats, the gateway's clear,
+    the arm's own clear, then a short move."""
+    _heartbeat(client)
+    cleared = _clear(client)
+    unlatched = _invoke(client, "arm.estop.clear", scope="COMMISSION", token="commission-token")
+    arm.steps = 3
+    return cleared, unlatched, _invoke(client, "arm.move_to")
+
+
+@pytest.mark.parametrize("in_flight, scope, started, sent", [
+    ("arm.move_to", "MANIPULATE", "moving", 2),
+    ("arm.state", "OBSERVE", "reading", 1),
+])
+def test_a_trip_during_a_move_or_a_read_on_a_bus_arm_never_queues_two_stops(
+        in_flight, scope, started, sent):
+    """The third review's R3-10 (a paced move) and R3-12 (a read) on
+    so-arm101-actuator. The trip's stop latched and waited for the bus; the
+    request returned while it waited; the gateway sent the stop again at once,
+    the driver refused it as busy, departure (e) counted that as a failed stop,
+    and every move after the documented resume was 403 `stop_unreachable`.
+
+    Now the stop sent again after the move waits for the trip's own stop to
+    answer, so it finds no stop waiting for the bus: both stops write the
+    hold, and neither is refused. A read gets no second stop. The resume
+    works either way."""
+    arm, chain = BusArm(), AuditChain()
+    app, _monitor, clock = _app(arm, chain, tool_allowlist=BUS_TOOLS)
+    box: dict = {}
+    with TestClient(app) as client:
+        _heartbeat(client)
+        _clear(client)
+        request = threading.Thread(target=lambda: box.update(
+            r=_invoke(client, in_flight, scope=scope)))
+        request.start()
+        assert getattr(arm, started).wait(5)
+        clock.advance(STALE_S + 1)
+        app.state.safety_tick()
+        request.join(10)
+        assert _stopped(app, sent)
+        cleared, unlatched, moved = _resume_and_move(client, arm)
+    assert box["r"].status_code == 200
+    assert ("stopped_again" in box["r"].json()) == (sent == 2)
+    stops = _reasons(chain, "safety_stop:")
+    assert len(stops) == sent
+    assert not [s for s in stops if "did not succeed" in s]
+    assert arm.holds == sent and arm.busy == []
+    assert (cleared.status_code, unlatched.status_code) == (200, 200)
+    assert moved.status_code == 200, moved.text
+
+
+def test_a_stop_sent_again_that_fails_is_not_held_against_the_actuator():
+    """The drive gets its stop again after the motion, and that second stop
+    fails. The failure is recorded, and motion through the drive is not
+    refused for it: the trip's own stop worked."""
+
+    class _SecondStopFails(Drive):
+        def execute(self, *, envelope, manifest_path, tier, config):
+            if envelope["tool_name"] == "drive.stop" and "drive.go" in self.log:
+                self.log.append("drive.stop")
+                return ActuatorOutcome(success=False, outcome_kind="error",
+                                       error_message="IO_ERROR")
+            return super().execute(envelope=envelope, manifest_path=manifest_path,
+                                   tier=tier, config=config)
+
+    drive, chain = _SecondStopFails(), AuditChain()
+    drive.hold = threading.Event()
+    app, _monitor, clock = _app(drive, chain, tool_allowlist=DRIVE_TOOLS)
+    box: dict = {}
+    with TestClient(app) as client:
+        _heartbeat(client)
+        _clear(client)
+        mover = threading.Thread(target=lambda: box.update(r=_invoke(client, "drive.go")))
+        mover.start()
+        assert drive.inside.wait(5)
+        clock.advance(STALE_S + 1)
+        app.state.safety_tick()
+        assert _stopped(app)
+        drive.hold.set()
+        mover.join(5)
+        assert _stopped(app, 2)                      # recorded, so marked done
+        _heartbeat(client)
+        assert _clear(client).status_code == 200
+        drive.hold = None
+        moved = _invoke(client, "drive.go")
+    assert "drive.stop was sent to drive again after it returned" in (
+        box["r"].json()["stopped_again"])
+    [again] = [r for r in _reasons(chain, "safety_stop:") if " again, because " in r]
+    assert again.endswith("it did not succeed: IO_ERROR; a stop sent again is not held "
+                          "against the actuator: the trip's own stop decides that")
+    assert moved.status_code == 200, moved.text
+
+
+# --------------------------------------------------------------------------- #
+# The fifth review's notes: a stop sent again that hangs holds the motion's
+# request at most STOP_TIMEOUT_S (N1), and one that never answers is held
+# against the actuator, as the trip's own would be (N2).
+# --------------------------------------------------------------------------- #
+
+
+class _HungRepeatDrive(Drive):
+    """The trip's own stop answers at once; the stop that follows the goal,
+    the one sent again, hangs until `stop_hold` is set. Records the thread
+    each stop ran on."""
+
+    def __init__(self):
+        super().__init__()
+        self.hold, self.stop_hold = threading.Event(), threading.Event()
+        self.stop_threads: list[str] = []
+
+    def execute(self, *, envelope, manifest_path, tier, config):
+        if envelope["tool_name"] == "drive.stop":
+            self.stop_threads.append(threading.current_thread().name)
+        return super().execute(envelope=envelope, manifest_path=manifest_path,
+                               tier=tier, config=config)
+
+
+def _motion_whose_stop_again_hangs(app, clock, client, drive, box):
+    """Trip during a drive.go, let the goal land, and return once the stop
+    sent again is hung inside the drive."""
+    _heartbeat(client)
+    _clear(client)
+    mover = threading.Thread(target=lambda: box.update(r=_invoke(client, "drive.go")))
+    mover.start()
+    assert drive.inside.wait(5)
+    clock.advance(STALE_S + 1)
+    app.state.safety_tick()
+    assert _stopped(app)                             # the trip's own stop has answered
+    drive.hold.set()                                 # the goal lands; the stop again hangs
+    assert drive.stop_held.wait(5)
+    return mover
+
+
+def test_a_stop_sent_again_that_hangs_holds_the_motions_request_at_most_the_timeout(
+        monkeypatch):
+    """The fifth review's N1. Round 5 sent the stop again on the request's own
+    thread, with no limit, so a stop that hung held the motion's request (and
+    a thread of the default pool) for as long as it hung. Now it runs on a
+    thread of its own, and the request waits for it at most STOP_TIMEOUT_S."""
+    monkeypatch.setattr(receiver_mod, "STOP_TIMEOUT_S", 0.5)
+    drive = _HungRepeatDrive()
+    app, _monitor, clock = _app(drive, AuditChain(), tool_allowlist=DRIVE_TOOLS)
+    box: dict = {}
+    try:
+        with TestClient(app) as client:
+            mover = _motion_whose_stop_again_hangs(app, clock, client, drive, box)
+            mover.join(5)
+            answered_while_hung = not mover.is_alive() and not drive.stop_hold.is_set()
+            drive.stop_hold.set()
+            assert _stopped(app, 2)
+    finally:
+        drive.stop_hold.set()
+    assert answered_while_hung
+    assert box["r"].status_code == 200
+    assert box["r"].json()["stopped_again"] == (
+        "the gateway tripped (trip 1) while drive.go was being dispatched, so drive.stop was "
+        "sent to drive again after it returned, once the trip's own stop had answered; it "
+        "had not answered within 0.5 s of the motion's return, and this answer did not wait "
+        "longer")
+    assert drive.stop_threads == ["robot-md-gateway-stop-drive"] * 2
+
+
+def test_a_stop_sent_again_that_never_answers_is_held_against_the_actuator(monkeypatch):
+    """The fifth review's N2. The trip's own stop answered; the stop sent
+    again never did. Round 5 recorded the timeout and then allowed the clear
+    and the next drive.go. A timeout is not a refusal, so it now counts as
+    the trip's own stop's would: motion through the drive is refused until
+    the gateway restarts. A refusal still does not count (the test above)."""
+    monkeypatch.setattr(receiver_mod, "STOP_TIMEOUT_S", 0.5)
+    drive, chain = _HungRepeatDrive(), AuditChain()
+    app, _monitor, clock = _app(drive, chain, tool_allowlist=DRIVE_TOOLS)
+    box: dict = {}
+    try:
+        with TestClient(app) as client:
+            mover = _motion_whose_stop_again_hangs(app, clock, client, drive, box)
+            mover.join(5)
+            clock.advance(1.0)                       # past STOP_TIMEOUT_S on the app's clock
+            app.state.safety_tick()                  # the gateway stops waiting for it
+            _heartbeat(client)
+            cleared = _clear(client)
+            moved = _invoke(client, "drive.go")
+            heard = list(drive.log)
+    finally:
+        drive.stop_hold.set()
+    [timeout] = _reasons(chain, "safety_stop_timeout:")
+    assert timeout == ("safety_stop_timeout: trip 1: drive.stop to drive (sent again) did not "
+                       "answer within 0.5 s; the gateway stopped waiting for it; motion "
+                       "through it is refused from now on")
+    assert cleared.status_code == 200, cleared.text
+    assert moved.status_code == 403
+    detail = moved.json()["detail"]
+    assert detail["deny"] == "stop_unreachable"
+    assert detail["reason"].startswith(
+        "actuator 'drive' did not answer the gateway's stop sent again (drive.stop at tier ")
+    assert heard == ["drive.stop", "drive.go"]       # the second drive.go never arrived

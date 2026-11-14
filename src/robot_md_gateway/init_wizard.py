@@ -373,6 +373,15 @@ def _print_next_steps(
         "  robot-md-gateway serve --bearers ./bearers.yaml "
         "--robot-md ./ROBOT.md"
     )
+    # A served gateway starts held, and this bearers.yaml cannot arm it yet:
+    # without this, a first run looks like a gateway that refuses everything.
+    print("  It starts held (safe_stop) and refuses everything but a stop until a")
+    print("  supervisor's heartbeats arrive and a commission bearer clears it")
+    print("  (POST /v1/safety/clear), so that a restart never resumes a robot by itself.")
+    print("  ./bearers.yaml has neither entry yet. Add a `role: supervisor` entry for the")
+    print("  supervising person's device and a `tier: commission` entry for the operator,")
+    print("  each with a token of its own, at least 32 characters:")
+    print("    python3 -c 'import secrets; print(secrets.token_urlsafe(32))'")
 
     if cfg.systemd_print:
         print()

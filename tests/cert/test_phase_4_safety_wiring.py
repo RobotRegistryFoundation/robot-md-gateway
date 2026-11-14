@@ -5,9 +5,11 @@ test_sf_002_network_loss.py. These tests verify the receiver path:
 opt-in via make_app(safety_monitor=...), per-request tick, and
 can_actuate gating before any other policy check.
 
-ESTOP and heartbeat are exposed via app.state.safety_monitor — there
-are no HTTP routes for these signals because SF-001 is conceptually
-a hardware wire, not an HTTP layer.
+ESTOP is exposed via app.state.safety_monitor only — there is no HTTP
+route for it because SF-001 is conceptually a hardware wire, not an HTTP
+layer. The heartbeat and the operator's clear do have routes
+(/v1/safety/heartbeat, /v1/safety/clear); see
+test_safe_stop_holds_the_machine.py.
 """
 
 from __future__ import annotations
